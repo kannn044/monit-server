@@ -1,0 +1,16 @@
+# /etc/monit/agent.conf   (chown root:monit, chmod 0640)
+MONIT_API_URL=https://monitor.example.com
+MONIT_SERVER_ID=web-prod-01
+MONIT_API_KEY=sk_agent_xxxxxxxxxxxxxxxx      # from dashboard: Servers → Register / Rotate key
+MONIT_INTERVAL=10
+MONIT_TIMEOUT=5
+MONIT_CONNECT_TIMEOUT=2
+MONIT_BUFFER_DIR=/var/lib/monit-agent/buffer
+MONIT_BUFFER_MAX=50
+MONIT_NET_IFACES="eth0"
+MONIT_GPU=auto
+MONIT_HTTP_CHECKS="http://127.0.0.1:3000/health"
+MONIT_DOCKER_MAX=100
+# Optional database monitoring (needs a read-only local DB user; see docs)
+MONIT_MYSQL=0
+MONIT_PG=0

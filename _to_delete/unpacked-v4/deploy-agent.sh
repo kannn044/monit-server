@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+#
+# deploy-agent.sh — push the agent to a target host and install it, from here.
+#
+#   ./deploy-agent.sh root@10.1.0.101
+#   ./deploy-agent.sh root@10.1.0.101 -i gpu-node-01 -k sk_agent_xxx -y
+#   ./deploy-agent.sh root@10.1.0.101 -u                 # update the agent only
+#
+#   -i ID     server ID to register/use (default: the target's hostname)
+#   -k KEY    API key; omit to be prompted, or use -a to create one for you
+#   -a        register the server on the dashboard and take the key from it,
+#             so there is no key to copy by hand (needs a dashboard admin)
+#   -e EMAIL  admin email for -a; the password comes from $MONIT_ADMIN_PASSWORD
+#             or is prompted for. Set both to deploy without any typing.
+#   -U URL    central server URL as the TARGET sees it
+#             (default: read from .env / guessed from this host's IP)
+#   -m MODE   loop (default) or cron
+#   -u        upload the new agent files and restart; leave config alone
+#   -y        no prompts on the target
+#
+# rsync + ssh only — nothing is installed on this machine.
+set -euo pipefail
+
+cd "$(dirname "$0")"
+TARGET=${1:-}; shift || true
+[ -n "$TARGET" ] || { sed -n '3,20p' "$0"; exit 2; }
+
+SERVER_ID=""; API_KEY=""; API_URL=""; MODE="loop"; UPDATE_ONLY=0; ASSUME_YES=0; AUTO_REG=0
+ADMIN_EMAIL=""
+
+while getopts "i:k:U:m:e:uayh" opt; do
+  case $opt in
+    i) SERVER_ID=$OPTARG ;; k) API_KEY=$OPTARG ;; U) API_URL=${OPTARG%/} ;;
+    m) MODE=$OPTARG ;;     u) UPDATE_ONLY=1 ;;  a) AUTO_REG=1 ;;
+    e) ADMIN_EMAIL=$OPTARG ;;
+    y) ASSUME_YES=1 ;;
+    h) sed -n '3,20p' "$0"; exit 0 ;;
+    *) exit 2 ;;
+  esac
+done
+
+info() { printf '\033[36m▸\033[0m %s\n' "$*"; }
+ok()   { printf '\033[32m✓\033[0m %s\n' "$*"; }
+warn() { printf '\033[33m!\033[0m %s\n' "$*"; }
+die()  { printf '\033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
+
+command -v rsync >/dev/null 2>&1 || die "rsync is not installed on this host"
+command -v ssh   >/dev/null 2>&1 || die "ssh is not installed on this host"
+[ -d agent ] || die "run this from the monit-server directory (no ./agent here)"
+
+SSH="ssh -o BatchMode=no -o ConnectTimeout=10"
+$SSH "$TARGET" true 2>/dev/null || die "cannot ssh to $TARGET — check the host, user and your key"
+ok "ssh to $TARGET works"
+
+# --- where should the agent send data? ---------------------------------------
+if [ -z "$API_URL" ]; then
+  # VITE_BASE tells us the sub-path nginx serves the dashboard under.
+  BASE=""
+  [ -f .env ] && BASE=$(grep -E '^VITE_BASE=' .env | head -1 | cut -d= -f2- | sed 's#/$##')
+  PORT=$(grep -E '^APP_PORT=' .env 2>/dev/null | head -1 | cut -d= -f2- | awk -F: '{print $NF}')
+  MYIP=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}')
+  [ -z "$MYIP" ] && MYIP=$(hostname -I 2>/dev/null | awk '{print $1}')
+  if [ -n "$BASE" ]; then
+    API_URL="http://${MYIP}${BASE}"          # behind nginx on :80
+  else
+    API_URL="http://${MYIP}:${PORT:-8080}"   # straight to the app
+  fi
+  info "central URL for the target: $API_URL  (override with -U)"
+fi
+
+# --- server ID ---------------------------------------------------------------
+[ -z "$SERVER_ID" ] && SERVER_ID=$($SSH "$TARGET" 'hostname -s 2>/dev/null || hostname' | tr -d '\r')
+[[ $SERVER_ID =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid server ID '$SERVER_ID' — pass a clean one with -i"
+
+# --- optionally register it on the dashboard and grab the key ----------------
+if [ "$AUTO_REG" = 1 ] && [ -z "$API_KEY" ]; then
+  # APP_PORT may be "8080" or "127.0.0.1:8080" — take whatever follows the colon.
+  APP_PORT_RAW=$(grep -E '^APP_PORT=' .env 2>/dev/null | head -1 | cut -d= -f2- || true)
+  LOCAL_PORT=${APP_PORT_RAW##*:}
+  [[ $LOCAL_PORT =~ ^[0-9]+$ ]] || LOCAL_PORT=8080
+  LOCAL_URL="http://127.0.0.1:${LOCAL_PORT}"
+
+  ADM=$ADMIN_EMAIL
+  [ -z "$ADM" ] && { read -r -p "  dashboard admin email: " ADM </dev/tty; }
+  ADMPW=${MONIT_ADMIN_PASSWORD:-}
+  [ -z "$ADMPW" ] && { read -r -s -p "  password: " ADMPW </dev/tty; echo; }
+  [ -n "$ADM" ] && [ -n "$ADMPW" ] || die "admin email and password are required for -a"
+  TOK=$(curl -s -X POST "$LOCAL_URL/api/v1/auth/login" -H 'Content-Type: application/json' \
+        -d "{\"email\":\"$ADM\",\"password\":\"$ADMPW\"}" \
+        | sed -n 's/.*"access_token":"\([^"]*\)".*/\1/p')
+  [ -n "$TOK" ] || die "could not sign in to $LOCAL_URL as '$ADM' — check the credentials, or that the app is on port $LOCAL_PORT"
+  RESP=$(curl -s -X POST "$LOCAL_URL/api/v1/servers" -H "Authorization: Bearer $TOK" \
+         -H 'Content-Type: application/json' \
+         -d "{\"id\":\"$SERVER_ID\",\"name\":\"$SERVER_ID\"}")
+  API_KEY=$(printf '%s' "$RESP" | sed -n 's/.*"api_key":"\([^"]*\)".*/\1/p')
+  if [ -z "$API_KEY" ]; then
+    # already registered — rotating gives us a usable key again
+    warn "'$SERVER_ID' is already registered; rotating its key"
+    API_KEY=$(curl -s -X POST "$LOCAL_URL/api/v1/servers/$SERVER_ID/keys/rotate" \
+              -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' -d '{}' \
+              | sed -n 's/.*"api_key":"\([^"]*\)".*/\1/p')
+    [ -n "$API_KEY" ] || die "could not obtain a key for '$SERVER_ID'"
+  fi
+  ok "registered '$SERVER_ID' and obtained a key"
+fi
+
+# --- copy the agent ----------------------------------------------------------
+info "copying agent → $TARGET:/opt/monit-agent/"
+$SSH "$TARGET" 'mkdir -p /opt/monit-agent'
+rsync -az --delete -e "$SSH" \
+  agent/monit-agent.sh agent/monit-agent.service agent/install.sh \
+  agent/monit-config.sh agent/agent.conf.example \
+  "$TARGET:/opt/monit-agent/"
+$SSH "$TARGET" 'chmod +x /opt/monit-agent/*.sh'
+ok "files copied"
+
+# --- update-only: swap the binary and restart --------------------------------
+if [ "$UPDATE_ONLY" = 1 ]; then
+  $SSH "$TARGET" '
+    install -m 0755 /opt/monit-agent/monit-agent.sh /opt/monit/monit-agent.sh
+    install -m 0755 /opt/monit-agent/monit-config.sh /opt/monit/monit-config.sh 2>/dev/null || true
+    if systemctl list-unit-files monit-agent.service >/dev/null 2>&1; then
+      systemctl restart monit-agent && systemctl is-active --quiet monit-agent \
+        && echo "restarted" || { echo "FAILED"; exit 1; }
+    else echo "cron mode — next run uses the new agent"; fi'
+  ok "agent updated on $TARGET (config untouched)"
+  exit 0
+fi
+
+# --- install -----------------------------------------------------------------
+if [ -z "$API_KEY" ]; then
+  echo
+  echo "  Register '$SERVER_ID' in the dashboard (Projects → Register a server)"
+  echo "  and paste the API key here. Or re-run with -a to do it automatically."
+  read -r -p "  API key: " API_KEY </dev/tty
+  [ -n "$API_KEY" ] || die "no API key given"
+fi
+
+info "installing on $TARGET …"
+$SSH -t "$TARGET" "cd /opt/monit-agent && ./install.sh '$API_URL' '$SERVER_ID' '$API_KEY' '$MODE'"
+
+echo
+ok "'$SERVER_ID' deployed"
+cat <<EOF
+
+  change settings later:  ssh $TARGET 'sudo /opt/monit/monit-config.sh'
+  update the agent only:  ./deploy-agent.sh $TARGET -u
+  logs:                   ssh $TARGET 'journalctl -u monit-agent -f'
+
+EOF

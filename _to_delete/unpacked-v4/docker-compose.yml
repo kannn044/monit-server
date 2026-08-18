@@ -1,0 +1,53 @@
+# Everything in one: app + its own TimescaleDB. For a brand-new server.
+#
+#   docker compose up -d --build
+#   docker compose logs -f app        # the admin password is printed here, once
+#
+# No .env and no editing required. Secrets are generated on first boot and kept
+# in the database, so nothing here ships a known default password.
+#
+# Already have a PostgreSQL? Use ./setup-db.sh instead — see README.
+
+services:
+  db:
+    image: timescale/timescaledb:latest-pg15
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: monit
+      POSTGRES_USER: monit
+      # Internal to this compose network; the port is never published.
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-monit_internal_pw}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U monit -d monit"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  app:
+    build:
+      context: .
+      args:
+        VITE_BASE: ${VITE_BASE:-/}
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 8080
+      DATABASE_URL: postgres://monit:${DB_PASSWORD:-monit_internal_pw}@db:5432/monit
+      # Optional overrides — all have safe auto-generated defaults.
+      JWT_SECRET: ${JWT_SECRET:-}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@example.com}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      SAMPLE_INTERVAL_S: ${SAMPLE_INTERVAL_S:-10}
+      ALERT_TICK_S: ${ALERT_TICK_S:-30}
+    ports:
+      # APP_PORT may include an interface, e.g. 127.0.0.1:8080 to bind
+      # only to localhost once nginx is terminating TLS in front.
+      - "${APP_PORT:-8080}:8080"
+
+volumes:
+  db-data:

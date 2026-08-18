@@ -16,6 +16,9 @@
 #             (default: read from .env / guessed from this host's IP)
 #   -m MODE   loop (default) or cron
 #   -u        upload the new agent files and restart; leave config alone
+#   -S        stop and disable the agent (config and files stay in place)
+#   -E        start it again after -S
+#   -X        remove the agent completely (service, files, config, user)
 #   -y        no prompts on the target
 #
 # rsync + ssh only — nothing is installed on this machine.
@@ -26,15 +29,16 @@ TARGET=${1:-}; shift || true
 [ -n "$TARGET" ] || { sed -n '3,20p' "$0"; exit 2; }
 
 SERVER_ID=""; API_KEY=""; API_URL=""; MODE="loop"; UPDATE_ONLY=0; ASSUME_YES=0; AUTO_REG=0
-ADMIN_EMAIL=""
+ADMIN_EMAIL=""; ACTION=""
 
-while getopts "i:k:U:m:e:uayh" opt; do
+while getopts "i:k:U:m:e:uaySEXh" opt; do
   case $opt in
     i) SERVER_ID=$OPTARG ;; k) API_KEY=$OPTARG ;; U) API_URL=${OPTARG%/} ;;
     m) MODE=$OPTARG ;;     u) UPDATE_ONLY=1 ;;  a) AUTO_REG=1 ;;
     e) ADMIN_EMAIL=$OPTARG ;;
+    S) ACTION=stop ;;      E) ACTION=start ;;   X) ACTION=remove ;;
     y) ASSUME_YES=1 ;;
-    h) sed -n '3,20p' "$0"; exit 0 ;;
+    h) sed -n '3,24p' "$0"; exit 0 ;;
     *) exit 2 ;;
   esac
 done
@@ -52,12 +56,62 @@ SSH="ssh -o BatchMode=no -o ConnectTimeout=10"
 $SSH "$TARGET" true 2>/dev/null || die "cannot ssh to $TARGET — check the host, user and your key"
 ok "ssh to $TARGET works"
 
+# --- stop / start / remove ---------------------------------------------------
+if [ -n "$ACTION" ]; then
+  case $ACTION in
+    stop)
+      $SSH "$TARGET" '
+        if systemctl list-unit-files monit-agent.service >/dev/null 2>&1; then
+          systemctl disable --now monit-agent 2>/dev/null || true
+        fi
+        [ -f /etc/cron.d/monit-agent ] && mv /etc/cron.d/monit-agent /etc/monit/cron.disabled 2>/dev/null || true
+        pkill -f "[/]opt/monit/monit-agent[.]sh" 2>/dev/null || true
+        sleep 1
+        if pgrep -f "[/]opt/monit/monit-agent[.]sh" >/dev/null; then echo "STILL RUNNING"; exit 1; fi
+        echo stopped'
+      ok "agent stopped and disabled on $TARGET (files and config kept)"
+      echo "  start it again with:  $0 $TARGET -E"
+      ;;
+    start)
+      $SSH "$TARGET" '
+        if [ -f /etc/monit/cron.disabled ]; then
+          mv /etc/monit/cron.disabled /etc/cron.d/monit-agent; echo "cron re-enabled"
+        elif systemctl list-unit-files monit-agent.service >/dev/null 2>&1; then
+          systemctl enable --now monit-agent
+          sleep 2; systemctl is-active --quiet monit-agent || { echo FAILED; exit 1; }
+          echo started
+        else echo "nothing installed to start"; exit 1; fi'
+      ok "agent started on $TARGET"
+      ;;
+    remove)
+      if [ "$ASSUME_YES" = 0 ] && [ -t 0 ]; then
+        read -r -p "  Remove the agent completely from $TARGET? [y/N]: " yn </dev/tty || yn=""
+        case "${yn:-n}" in [Yy]*) ;; *) echo "  cancelled"; exit 0 ;; esac
+      fi
+      $SSH "$TARGET" '
+        systemctl disable --now monit-agent 2>/dev/null || true
+        rm -f /etc/systemd/system/monit-agent.service /etc/cron.d/monit-agent /etc/monit/cron.disabled
+        systemctl daemon-reload 2>/dev/null || true
+        pkill -f "[/]opt/monit/monit-agent[.]sh" 2>/dev/null || true
+        rm -rf /opt/monit /opt/monit-agent /etc/monit /var/lib/monit-agent
+        userdel monit 2>/dev/null || true
+        echo removed'
+      ok "agent removed from $TARGET"
+      warn "the server still exists in the dashboard — delete it there to stop 'offline' alerts"
+      ;;
+  esac
+  exit 0
+fi
+
+
 # --- where should the agent send data? ---------------------------------------
 if [ -z "$API_URL" ]; then
   # VITE_BASE tells us the sub-path nginx serves the dashboard under.
   BASE=""
-  [ -f .env ] && BASE=$(grep -E '^VITE_BASE=' .env | head -1 | cut -d= -f2- | sed 's#/$##')
-  PORT=$(grep -E '^APP_PORT=' .env 2>/dev/null | head -1 | cut -d= -f2- | awk -F: '{print $NF}')
+  # `|| true` on each: with `set -o pipefail` a grep that matches nothing fails
+  # the whole pipeline, and `set -e` would kill the script on the assignment.
+  [ -f .env ] && BASE=$(grep -E '^VITE_BASE=' .env | head -1 | cut -d= -f2- | sed 's#/$##' || true)
+  PORT=$(grep -E '^APP_PORT=' .env 2>/dev/null | head -1 | cut -d= -f2- | awk -F: '{print $NF}' || true)
   MYIP=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}')
   [ -z "$MYIP" ] && MYIP=$(hostname -I 2>/dev/null | awk '{print $1}')
   if [ -n "$BASE" ]; then
@@ -76,6 +130,7 @@ fi
 if [ "$AUTO_REG" = 1 ] && [ -z "$API_KEY" ]; then
   # APP_PORT may be "8080" or "127.0.0.1:8080" — take whatever follows the colon.
   APP_PORT_RAW=$(grep -E '^APP_PORT=' .env 2>/dev/null | head -1 | cut -d= -f2- || true)
+  APP_PORT_RAW=${APP_PORT_RAW:-}
   LOCAL_PORT=${APP_PORT_RAW##*:}
   [[ $LOCAL_PORT =~ ^[0-9]+$ ]] || LOCAL_PORT=8080
   LOCAL_URL="http://127.0.0.1:${LOCAL_PORT}"

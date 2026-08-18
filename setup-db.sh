@@ -38,6 +38,17 @@ while getopts "c:u:d:w:n:p:yh" opt; do
   esac
 done
 
+# Percent-encode everything that is not unreserved, so any password is safe
+# inside a connection string.
+urlencode() {
+  local s=$1 out="" i c
+  for (( i=0; i<${#s}; i++ )); do
+    c=${s:i:1}
+    case $c in [a-zA-Z0-9.~_-]) out+=$c ;; *) out+=$(printf '%%%02X' "'$c") ;; esac
+  done
+  printf '%s' "$out"
+}
+
 info()  { printf '\033[36m▸\033[0m %s\n' "$*"; }
 ok()    { printf '\033[32m✓\033[0m %s\n' "$*"; }
 warn()  { printf '\033[33m!\033[0m %s\n' "$*"; }
@@ -94,15 +105,11 @@ ok "PostgreSQL $PGVER"
 [ "$PGVER" -lt 13 ] 2>/dev/null && warn "PostgreSQL < 13: the pgcrypto extension must be installable for gen_random_uuid()"
 
 # --- 3. create the role and database ----------------------------------------
-if [ -z "$DBPASS" ]; then
-  EXISTING_URL=$(grep -E '^DATABASE_URL=' .env 2>/dev/null | head -1 | cut -d= -f2- || true)
-  if [ -n "$EXISTING_URL" ]; then
-    DBPASS=$(printf '%s' "$EXISTING_URL" | sed -E 's|^postgres(ql)?://[^:]+:([^@]+)@.*|\2|')
-    [ -n "$DBPASS" ] && info "reusing the password already in .env"
-  fi
-  # hex keeps the password safe to embed in a URL without escaping
-  [ -z "$DBPASS" ] && DBPASS=$(openssl rand -hex 20)
-fi
+# A fresh password every run, unless one was passed with -w. We reset the role's
+# password below anyway, so there is nothing to preserve — and picking it apart
+# from an existing DATABASE_URL with a regex was fragile enough to corrupt the
+# connection string. Hex only, so it never needs escaping inside a URL.
+[ -z "$DBPASS" ] && DBPASS=$(openssl rand -hex 20)
 
 info "creating role '$DBUSER' and database '$DBNAME' in $CONTAINER…"
 psql_super >/dev/null <<SQL
@@ -128,7 +135,18 @@ fi
 # The container name is not always the right DNS name: Compose registers the
 # *service* name as the network alias, and a container renamed with
 # `container_name:` will not match it. So collect every candidate and test them.
-PGPORT=$(psql_super -tAc 'SHOW port;' 2>/dev/null | tr -d '[:space:]'); PGPORT=${PGPORT:-5432}
+# Read the port, then REJECT anything that is not purely numeric. Do not try to
+# salvage digits out of a bad value: "1HiRA3yIfNitr2dQ" would become "132", a
+# plausible-looking port that is simply wrong. A junk value here lands in the
+# port slot of the connection string and surfaces as psql's confusing
+# "invalid integer value … for connection option port".
+PGPORT_RAW=$(psql_super -tAc 'SHOW port;' 2>/dev/null | head -1 | tr -d '[:space:]')
+if [[ $PGPORT_RAW =~ ^[0-9]+$ ]]; then
+  PGPORT=$PGPORT_RAW
+else
+  [ -n "$PGPORT_RAW" ] && warn "unexpected value when reading the port ('$PGPORT_RAW') — using 5432"
+  PGPORT=5432
+fi
 [ "$PGPORT" != "5432" ] && info "database listens on port $PGPORT inside the network"
 
 mapfile -t ALIASES < <(docker inspect "$CONTAINER" \
@@ -147,12 +165,13 @@ done
 CLIENT_IMAGE=$(docker inspect "$CONTAINER" -f '{{.Config.Image}}' 2>/dev/null)
 docker image inspect "$CLIENT_IMAGE" >/dev/null 2>&1 || CLIENT_IMAGE="postgres:16-alpine"
 
-info "testing the connection from inside network '$NETWORK'…"
+info "testing the connection from inside network '$NETWORK' (user=$DBUSER db=$DBNAME port=$PGPORT)…"
 DBHOST=""; LAST_ERR=""
 for h in "${CANDIDATES[@]}"; do
-  url="postgres://$DBUSER:$DBPASS@$h:$PGPORT/$DBNAME"
-  if out=$(docker run --rm --network "$NETWORK" "$CLIENT_IMAGE" \
-             psql "$url" -tAc 'SELECT 1' 2>&1); then
+  # Discrete flags rather than a URI: nothing here can be mis-parsed, whatever
+  # characters the password happens to contain.
+  if out=$(docker run --rm --network "$NETWORK" -e PGPASSWORD="$DBPASS" "$CLIENT_IMAGE" \
+             psql -h "$h" -p "$PGPORT" -U "$DBUSER" -d "$DBNAME" -tAc 'SELECT 1' 2>&1); then
     DBHOST=$h; ok "reachable as '$h:$PGPORT'"; break
   fi
   LAST_ERR=$out
@@ -187,7 +206,7 @@ if [ -z "$DBHOST" ]; then
   exit 1
 fi
 
-DATABASE_URL="postgres://$DBUSER:$DBPASS@$DBHOST:$PGPORT/$DBNAME"
+DATABASE_URL="postgres://$(urlencode "$DBUSER"):$(urlencode "$DBPASS")@$DBHOST:$PGPORT/$DBNAME"
 
 # --- 5. write .env (keeping anything already set) ---------------------------
 touch .env; chmod 600 .env
@@ -205,7 +224,7 @@ set_env() {
 set_env DATABASE_URL "$DATABASE_URL"
 set_env PG_NETWORK   "$NETWORK"
 set_env APP_PORT     "$APP_PORT"
-ok "wrote .env"
+ok "wrote .env  (DATABASE_URL=postgres://$DBUSER:****@$DBHOST:$PGPORT/$DBNAME)"
 
 # --- 6. run the migrations --------------------------------------------------
 info "building the image and running migrations…"

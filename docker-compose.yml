@@ -1,0 +1,43 @@
+version: "3.9"
+
+services:
+  db:
+    image: timescale/timescaledb:latest-pg15
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: monit
+      POSTGRES_USER: monit
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-monit_dev_password}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U monit -d monit"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    # Expose only on localhost of the host machine (optional, for debugging)
+    ports:
+      - "127.0.0.1:5432:5432"
+
+  app:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 8080
+      DATABASE_URL: postgres://monit:${DB_PASSWORD:-monit_dev_password}@db:5432/monit
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@example.com}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-changeme-now}
+      # Health/offline computation
+      SAMPLE_INTERVAL_S: ${SAMPLE_INTERVAL_S:-10}
+      # Alert engine tick
+      ALERT_TICK_S: ${ALERT_TICK_S:-30}
+    ports:
+      - "8080:8080"
+
+volumes:
+  db-data:

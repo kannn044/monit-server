@@ -1,0 +1,169 @@
+# API reference
+
+Base path `/api/v1`. JSON in, JSON out. Times are UTC ISO-8601.
+Errors use `application/problem+json`: `{ "title", "status", "detail" }`.
+
+Auth: dashboard routes take `Authorization: Bearer <JWT>`; the ingest route
+takes a per-server agent key in the same header. Roles are hierarchical —
+admin ⊃ operator ⊃ viewer.
+
+---
+
+## Ingestion
+
+### `POST /api/v1/ingest` — agent key
+
+Body: the agent payload (§4.4 of the spec). Required: `server_id`, `timestamp`.
+The `server_id` must belong to the presented key.
+
+```bash
+curl -X POST https://monitor.example.com/api/v1/ingest \
+  -H "Authorization: Bearer sk_agent_9f8e7d6c5b4a" \
+  -H "Content-Type: application/json" \
+  -d '{"server_id":"web-prod-01","timestamp":"2026-08-17T10:00:00Z",
+       "cpu":{"total":42.5,"cores":[{"id":"0","used":30.1}]},
+       "ram":{"total_kb":16777216,"used_kb":8388608,"used_pct":50.0},
+       "disk":[{"mount":"/","device":"/dev/sda1","size_kb":104857600,
+                "used_kb":52428800,"avail_kb":52428800,"used_pct":50.0}],
+       "network":[{"iface":"eth0","rx_bytes":987654321,"tx_bytes":123456789}],
+       "load":{"1m":2.15,"5m":1.8,"15m":1.4,"cores":8},
+       "gpu":[],"docker":{"present":false},"pm2":{"present":false},"http":[]}'
+# → 202 {"accepted":true}
+```
+
+| Status | Meaning |
+|---|---|
+| 202 | stored |
+| 400 | schema violation or unusable timestamp |
+| 401 | unknown / revoked key |
+| 403 | `server_id` does not match the key |
+| 429 | per-server rate limit exceeded |
+
+Old timestamps are accepted (buffered backlog); `last_seen` only moves forward.
+
+---
+
+## Auth
+
+| Method | Path | Role | Notes |
+|---|---|---|---|
+| POST | `/auth/login` | — | `{email,password}` → access + refresh token |
+| POST | `/auth/refresh` | — | `{refresh_token}` → new access token |
+| GET | `/auth/me` | viewer | current identity |
+| GET | `/users` | admin | list |
+| POST | `/users` | admin | `{email,password,name,role}` |
+| PATCH | `/users/:id` | admin | `{name?,role?,disabled?,password?}` |
+
+## Servers
+
+| Method | Path | Role | Notes |
+|---|---|---|---|
+| GET | `/servers` | viewer | `?project=&env=&status=` — includes computed `health` |
+| POST | `/servers` | admin | `{id,name,ip?,project_ids?}` → **returns `api_key` once** |
+| GET | `/servers/:id` | viewer | detail + latest sample + expected services |
+| GET | `/servers/:id/summary` | viewer | latest values + derived net rate |
+| PATCH | `/servers/:id` | admin | `{name?,ip?,project_ids?}` |
+| DELETE | `/servers/:id` | admin | archive (soft) + revoke keys |
+| POST | `/servers/:id/keys/rotate` | admin | revoke old, return new key once |
+| POST | `/servers/:id/expected-services` | admin | `{kind:"docker"\|"pm2", name}` |
+| DELETE | `/servers/:id/expected-services/:esId` | admin | |
+
+`health` is `online` · `warning` · `critical` · `offline`, where offline means no
+sample for more than `SAMPLE_INTERVAL_S × 3`.
+
+## Projects
+
+`GET /projects` (viewer) · `POST /projects` · `PUT /projects/:id` ·
+`DELETE /projects/:id` (admin, archives) · `GET /projects/:id/overview` (viewer —
+member servers, health counts, 15-minute average CPU/RAM).
+
+## Metrics
+
+### `GET /servers/:id/metrics` — single series
+
+`metric` · `from` · `to` · `agg=avg|max|min` · `bucket=raw|1m|1h`
+(bucket auto-selects from the span: ≤1 h raw, ≤48 h 1m, else 1h).
+
+```bash
+curl -G https://monitor.example.com/api/v1/servers/web-prod-01/metrics \
+  -H "Authorization: Bearer <JWT>" \
+  --data-urlencode "metric=cpu.total" \
+  --data-urlencode "from=2026-08-17T00:00:00Z" \
+  --data-urlencode "to=2026-08-17T10:00:00Z"
+```
+
+```json
+{ "server_id":"web-prod-01","metric":"cpu.total","unit":"percent",
+  "bucket":"1m","agg":"avg",
+  "points":[{"t":"2026-08-17T09:59:00Z","v":43.8},{"t":"2026-08-17T10:00:00Z","v":42.5}] }
+```
+
+Metric paths: `cpu.total`, `ram.used_pct`, `ram.free_kb`, `ram.available_kb`,
+`disk.used_pct` (worst mount), `disk.avail_kb` (tightest mount), `load.1m|5m|15m`,
+`uptime_s`, `gpu.util_pct`, `gpu.mem_used_pct`, `net.rx_bps`, `net.tx_bps`,
+`docker.running`, `pm2.online`, `http.status_code`, `http.latency_ms`,
+`db.active`, `db.active_pct`, `service_down`, `no_sample`.
+
+A `null` point is a real gap (missing sample, counter reset, or a span too long
+to interpolate) — plot it as a break, not as zero.
+
+### `GET /servers/:id/series` — multi-series for charts
+
+`kind=cpu|ram|disk|net|load|gpu|gpuvram`, plus `from`/`to`. Returns
+`{ series: { name: [{t,v}] } }`. Every series inside one `kind` shares one unit.
+Spans ≤3 h return per-core / per-mount / per-interface / per-GPU detail; longer
+spans return aggregated series.
+
+### `GET /fleet/health`
+
+KPI counts, all servers with health, top-5 by CPU/RAM/disk/load, a 24-hour
+30-minute-bucket fleet sparkline, the 10 most recent incidents, and per-project
+rollups.
+
+## Alerting
+
+| Method | Path | Role | Notes |
+|---|---|---|---|
+| GET | `/alerts` | viewer | active incidents; `?severity=&project=` |
+| GET | `/incidents` | viewer | history; `?status=&severity=&server=&project=&from=&to=&page=&limit=` |
+| POST | `/alerts/:id/ack` | operator | `{notes?}` |
+| POST | `/alerts/:id/resolve` | operator | `{notes?}` |
+| POST | `/alerts/:id/silence` | operator | `{minutes}` — auto-expires |
+| GET | `/alert-rules` | viewer | |
+| POST | `/alert-rules` | admin | |
+| PUT | `/alert-rules/:id` | admin | |
+| DELETE | `/alert-rules/:id` | admin | |
+| GET | `/channels` | viewer | secrets omitted for non-admins |
+| POST/PUT/DELETE | `/channels[/:id]` | admin | |
+| POST | `/webhooks/test` | admin | `{channel}` — sends a test message |
+| GET | `/notification-log` | viewer | last 200 deliveries |
+
+Rule body:
+
+```json
+{ "name":"High RAM", "metric":"ram.used_pct", "comparator":">", "threshold":90,
+  "duration_min":3, "recover_threshold":85, "severity":"critical",
+  "scope_type":"project", "scope_ids":["<uuid>"],
+  "channels":["oncall-telegram"], "enabled":true,
+  "flap_limit":5, "flap_window_min":30 }
+```
+
+Channel config by type — `telegram`: `{bot_token, chat_id}` ·
+`slack`: `{webhook_url}` · `webhook`: `{url, headers?}`.
+
+Outgoing notification payload:
+
+```json
+{ "event":"alert.fired", "incident_id":"inc_20260817_a3f9c1", "rule_name":"High RAM",
+  "severity":"critical", "server_id":"web-prod-01", "project":"Checkout Service",
+  "environment":"Prod", "metric":"ram.used_pct", "comparator":">",
+  "value":93.4, "threshold":90, "duration_min":3,
+  "started_at":"2026-08-17T10:03:00Z",
+  "message":"High RAM: ram.used_pct = 93.40 (> 90) on Web Prod 01 for 3 min" }
+```
+
+`event` is `alert.fired` · `alert.resolved` · `alert.reminder` · `alert.flapping` · `test`.
+
+## System
+
+`GET /api/v1/health` — unauthenticated liveness probe.

@@ -165,3 +165,108 @@ WHERE NOT success AND created_at > now() - INTERVAL '1 hour' GROUP BY 1;
 SELECT hypertable_name, pg_size_pretty(hypertable_size(format('%I', hypertable_name)::regclass))
 FROM timescaledb_information.hypertables;
 ```
+
+---
+
+## Using an existing PostgreSQL
+
+The bundled `db` container is a convenience, not a requirement. To point at a
+PostgreSQL you already run:
+
+### 1. Create the database and role
+
+```sql
+CREATE ROLE monit LOGIN PASSWORD 'a-strong-password';
+CREATE DATABASE monit OWNER monit;
+```
+
+Ownership matters: the app creates its own tables and pg_boss creates a
+`pgboss` schema, so the role needs `CREATE` on the database. Superuser is not
+required — verified against a plain `LOGIN` role that owns its database.
+
+### 2. Point the app at it
+
+```bash
+# .env
+DATABASE_URL=postgres://monit:a-strong-password@host.docker.internal:5432/monit
+JWT_SECRET=...
+ADMIN_EMAIL=you@company.com
+ADMIN_PASSWORD=...
+
+docker compose -f docker-compose.external-db.yml up -d --build
+```
+
+Use `host.docker.internal` when PostgreSQL runs on the Docker host, or the
+server's IP when it runs elsewhere. Not using Docker at all works too:
+
+```bash
+cd server && npm ci && DATABASE_URL=... npm start
+```
+
+Migrations run on every boot and are idempotent, so there is no separate step.
+To apply them without starting the app: `npm run migrate`.
+
+### 3. Let the container reach the host database
+
+PostgreSQL on the host must accept connections from Docker's bridge network:
+
+```conf
+# postgresql.conf
+listen_addresses = '*'
+
+# pg_hba.conf — Docker's default bridge subnet
+host    monit    monit    172.16.0.0/12    scram-sha-256
+```
+
+Then `sudo systemctl reload postgresql`. Verify before starting the app:
+
+```bash
+docker run --rm --add-host host.docker.internal:host-gateway postgres:16-alpine \
+  psql "postgres://monit:a-strong-password@host.docker.internal:5432/monit" -c 'SELECT 1'
+```
+
+### TimescaleDB on an existing server
+
+The runner probes what actually works rather than trusting
+`pg_available_extensions`, because the package is often installed while
+`CREATE EXTENSION` still fails. Expect one of:
+
+| Log line | Meaning |
+|---|---|
+| `timescaledb enabled` | full path — hypertable, continuous aggregates, compression, retention |
+| `timescaledb is not installed on this server` | package absent; fallback views used |
+| `timescaledb is installed but could not be enabled: …` | usually missing from `shared_preload_libraries` |
+
+The fallback keeps every feature of the app working — `metrics_1m` /
+`metrics_1h` become plain views computed on read instead of materialised
+rollups. What you lose is automatic compression and retention, so
+`system_metrics` grows until you prune it (~30 MB per server per day at a 10 s
+interval):
+
+```sql
+DELETE FROM system_metrics WHERE time < now() - INTERVAL '14 days';
+```
+
+Queries also get slower on long ranges once the table is large, since the views
+aggregate on demand.
+
+To enable TimescaleDB on an existing server:
+
+```bash
+# after installing the package for your PG major version
+sudo timescaledb-tune --quiet --yes     # adds it to shared_preload_libraries
+sudo systemctl restart postgresql       # a restart is required, not a reload
+```
+
+Then restart the app. Already-migrated databases keep the fallback views —
+`004_caggs.sql` is recorded as applied. To switch a live database over, drop the
+two views and re-run that migration:
+
+```sql
+DROP VIEW metrics_1m, metrics_1h;
+DELETE FROM schema_migrations WHERE filename IN ('004_caggs.sql','005_retention.sql');
+```
+
+Existing rows in `system_metrics` stay put, but the table is not retroactively
+converted to a hypertable — see Timescale's `create_hypertable(...,
+migrate_data => true)` if you need that.

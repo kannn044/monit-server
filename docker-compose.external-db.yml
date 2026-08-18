@@ -1,0 +1,30 @@
+# Use this instead of docker-compose.yml when you already run PostgreSQL and do
+# not want the bundled database container:
+#
+#   docker compose -f docker-compose.external-db.yml up -d --build
+#
+# Set DATABASE_URL in .env, e.g.
+#   DATABASE_URL=postgres://monit:secret@host.docker.internal:5432/monit   # same host
+#   DATABASE_URL=postgres://monit:secret@10.1.0.99:5432/monit              # another host
+#
+# `host.docker.internal` resolves out of the box on Docker Desktop (macOS /
+# Windows). On Linux it only works because of the extra_hosts line below, which
+# needs Docker 20.10+; otherwise use the host's real IP.
+
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 8080
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env}
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@example.com}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-changeme-now}
+      SAMPLE_INTERVAL_S: ${SAMPLE_INTERVAL_S:-10}
+      ALERT_TICK_S: ${ALERT_TICK_S:-30}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "8080:8080"

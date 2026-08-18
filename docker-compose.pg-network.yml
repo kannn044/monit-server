@@ -1,0 +1,42 @@
+# Use this when your PostgreSQL already runs as a Docker container and you do
+# not want to touch it:
+#
+#   docker compose -f docker-compose.pg-network.yml up -d --build
+#
+# The app joins your database's existing Docker network and connects to it by
+# CONTAINER NAME on the internal port 5432. Nothing new is published on the
+# host, so there is no port conflict with the database you already run, and its
+# pg_hba does not need editing (container-to-container traffic looks like any
+# other client on that network).
+#
+# .env must set PG_NETWORK and DATABASE_URL, e.g.
+#   PG_NETWORK=myapp_default
+#   DATABASE_URL=postgres://monit:secret@my-postgres:5432/monit
+#                                        ^ container name, not localhost
+#
+# Find both with:
+#   docker ps --filter publish=5432 --format '{{.Names}}'
+#   docker inspect <container> -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{"\n"}}{{end}}'
+
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 8080
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env}
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@example.com}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-changeme-now}
+      SAMPLE_INTERVAL_S: ${SAMPLE_INTERVAL_S:-10}
+      ALERT_TICK_S: ${ALERT_TICK_S:-30}
+    networks:
+      - pgnet
+    ports:
+      - "8080:8080"
+
+networks:
+  pgnet:
+    external: true
+    name: ${PG_NETWORK:?set PG_NETWORK in .env to your database container's network}

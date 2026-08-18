@@ -26,6 +26,17 @@ open http://localhost:8080    # sign in with ADMIN_EMAIL / ADMIN_PASSWORD
 
 Migrations run automatically on boot; the first admin user is seeded from `.env`.
 
+**Already have a PostgreSQL?** Skip the bundled database container:
+
+```bash
+# .env → DATABASE_URL=postgres://monit:secret@host.docker.internal:5432/monit
+docker compose -f docker-compose.external-db.yml up -d --build
+```
+
+Superuser is not required. TimescaleDB is used when it can actually be enabled
+and falls back to plain PostgreSQL otherwise — see
+[docs/OPERATIONS.md](docs/OPERATIONS.md#using-an-existing-postgresql).
+
 ### Add a server
 
 1. Dashboard → **Projects** → *Register a server*. `server_id` must match the

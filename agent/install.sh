@@ -213,18 +213,31 @@ case "$CODE" in
 esac
 
 # --- 7. enable ---------------------------------------------------------------
+# Each mode disables the other. Leaving both enabled would report the host
+# twice — double the traffic, and rate-limit rejections on the central server.
 if [ "$MODE" = "cron" ]; then
+  if systemctl list-unit-files monit-agent.service >/dev/null 2>&1; then
+    systemctl disable --now monit-agent 2>/dev/null || true
+    rm -f /etc/systemd/system/monit-agent.service
+    systemctl daemon-reload 2>/dev/null || true
+    warn "switched from the systemd loop to cron — the service was removed"
+  fi
   printf '* * * * * monit /opt/monit/monit-agent.sh >> /var/log/monit-agent.log 2>&1\n' \
     > /etc/cron.d/monit-agent
   chmod 0644 /etc/cron.d/monit-agent
-  ok "installed cron job (one sample per minute)"
+  ok "installed cron job (one sample per minute — MONIT_INTERVAL does not apply)"
 elif command -v systemctl >/dev/null 2>&1; then
+  if [ -f /etc/cron.d/monit-agent ]; then
+    rm -f /etc/cron.d/monit-agent
+    warn "switched from cron to the systemd loop — the cron job was removed"
+  fi
+  rm -f /etc/monit/cron.disabled
   install -m 0644 "$DIR/monit-agent.service" /etc/systemd/system/monit-agent.service
   systemctl daemon-reload
   systemctl enable --now monit-agent.service
   sleep 3
   if systemctl is-active --quiet monit-agent; then
-    ok "monit-agent running (a sample every 10 s)"
+    ok "monit-agent running (a sample every ${INTERVAL}s)"
   else
     systemctl status monit-agent --no-pager -l | tail -15
     die "the service failed to start — see the status above"

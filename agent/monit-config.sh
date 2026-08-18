@@ -95,6 +95,11 @@ if [ -n "${SET[MONIT_INTERVAL]:-}" ]; then
   # The dashboard marks a server offline after 3 × SAMPLE_INTERVAL_S (10 s by
   # default), so a slower agent looks permanently down until the central server
   # is told about it too.
+  # In cron mode the loop never runs, so the interval is inert.
+  if [ -f /etc/cron.d/monit-agent ] && ! systemctl is-active --quiet monit-agent 2>/dev/null; then
+    warn "this host runs in cron mode — samples are sent once a minute and MONIT_INTERVAL is ignored."
+    warn "  To sample faster, reinstall in loop mode:  sudo ./install.sh <URL> <ID> <KEY> loop"
+  fi
   if [ "${SET[MONIT_INTERVAL]}" -gt 10 ]; then
     warn "interval ${SET[MONIT_INTERVAL]}s is slower than the dashboard's default expectation (10 s)."
     warn "  On the central server set SAMPLE_INTERVAL_S=${SET[MONIT_INTERVAL]} in .env and restart,"

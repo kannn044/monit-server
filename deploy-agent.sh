@@ -152,21 +152,47 @@ if [ -n "$ACTION" ]; then
 fi
 
 # --- where should the agent send data? ---------------------------------------
-if [ -z "$API_URL" ]; then
-  BASE=""
-  # `|| true` on each: with `set -o pipefail` a grep that matches nothing fails
-  # the whole pipeline, and `set -e` would kill the script on the assignment.
-  [ -f .env ] && BASE=$(grep -E '^VITE_BASE=' .env | head -1 | cut -d= -f2- | sed 's#/$##' || true)
-  PORT=$(grep -E '^APP_PORT=' .env 2>/dev/null | head -1 | cut -d= -f2- | awk -F: '{print $NF}' || true)
-  MYIP=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}')
-  [ -z "$MYIP" ] && MYIP=$(hostname -I 2>/dev/null | awk '{print $1}')
-  if [ -n "$BASE" ]; then
-    API_URL="http://${MYIP}${BASE}"          # behind nginx on :80
-  else
-    API_URL="http://${MYIP}:${PORT:-8080}"   # straight to the app
-  fi
-  info "central URL for the target: $API_URL  (override with -U)"
+# `|| true` on each: with `set -o pipefail` a grep that matches nothing fails
+# the whole pipeline, and `set -e` would kill the script on the assignment.
+BASE=""
+[ -f .env ] && BASE=$(grep -E '^VITE_BASE=' .env | head -1 | cut -d= -f2- | sed 's#/$##' || true)
+PORT=$(grep -E '^APP_PORT=' .env 2>/dev/null | head -1 | cut -d= -f2- | awk -F: '{print $NF}' || true)
+[[ $PORT =~ ^[0-9]+$ ]] || PORT=8080
+MYIP=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}')
+[ -z "$MYIP" ] && MYIP=$(hostname -I 2>/dev/null | awk '{print $1}')
+
+# Ask the TARGET whether it can actually reach a candidate — its view of the
+# network is the only one that matters, and finding out here beats discovering
+# it half-way through the install.
+probe_url() {
+  rsh "curl -s -o /dev/null -w '%{http_code}' --max-time 8 '$1/api/v1/health'" 2>/dev/null | tr -dc '0-9' || true
+}
+
+if [ -n "$API_URL" ]; then
+  CANDIDATES=("$API_URL")            # -U given: use it or fail, no guessing
+else
+  CANDIDATES=()
+  [ -n "$BASE" ] && CANDIDATES+=("http://${MYIP}${BASE}")   # behind nginx on :80
+  CANDIDATES+=("http://${MYIP}:${PORT}")                    # straight to the app
 fi
+
+info "checking which URL $TARGET can reach…"
+REACHABLE=""
+for u in "${CANDIDATES[@]}"; do
+  code=$(probe_url "$u")
+  if [ "$code" = "200" ]; then REACHABLE=$u; ok "reachable: $u"; break; fi
+  printf '  · %s — HTTP %s\n' "$u" "${code:-000}"
+done
+
+if [ -z "$REACHABLE" ]; then
+  die "$TARGET cannot reach the central server on any of: ${CANDIDATES[*]}
+   HTTP 000 = nothing answered — firewall, or the wrong address
+   HTTP 404 = something answered but not monit; the nginx location for
+              '${BASE:-/}' is missing from the server block that serves this IP.
+              Check on the central server:  sudo nginx -T | grep -n 'location /monit'
+   Override the address with -U once you know which one works."
+fi
+API_URL=$REACHABLE
 
 # --- server ID ---------------------------------------------------------------
 [ -z "$SERVER_ID" ] && SERVER_ID=$(rsh 'hostname -s 2>/dev/null || hostname' | tr -d '\r')

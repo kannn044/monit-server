@@ -107,6 +107,35 @@ Each change backs up `agent.conf`, sends a test sample, and restarts the
 service. **If the sample is rejected the config is rolled back**, so a mistyped
 key cannot leave a host silently not reporting.
 
+### Sampling faster
+
+```bash
+ssh gdata@10.1.1.175 'sudo /opt/monit/monit-config.sh -i 5'
+```
+
+Lowering the interval is safe on its own — the offline threshold is
+`3 × SAMPLE_INTERVAL_S`, so a faster agent simply has more margin. Two things
+are worth knowing:
+
+- **cron mode ignores it.** Cron can only fire once a minute. `monit-config.sh -s`
+  shows the mode; if it reads `cron (once a minute)`, reinstall in loop mode
+  (`sudo ./install.sh <URL> <ID> <KEY> loop`) to sample faster. Installing in
+  one mode now removes the other, so a host never reports twice.
+- **Storage doubles when the interval halves.** At 5 s a host writes ~60 MB a
+  day without TimescaleDB. Adjust `prune-metrics.sh -d` accordingly.
+
+Below about 5 s there is little to gain: the agent spends 1 s measuring CPU
+deltas, and the dashboard refreshes every 10 s anyway. The ingest rate limit
+(`INGEST_RATE_MAX`, 12 requests per 10 s per server) allows down to 1 s, but
+`monit-config.sh` refuses anything under 5 s.
+
+For faster *offline* detection, match the central server to the new interval:
+
+```bash
+echo 'SAMPLE_INTERVAL_S=5' >> /opt/monit-server/.env   # offline after 15 s
+docker compose -f docker-compose.app-only.yml up -d
+```
+
 ### Interval and the offline threshold
 
 The dashboard marks a server offline after `3 × SAMPLE_INTERVAL_S` (30 s by

@@ -84,6 +84,19 @@ fails during setup rather than silently later.
 
 ## Changing settings later
 
+The tool lives at **`/opt/monit/monit-config.sh`** on the target.
+(`~/.monit-agent-deploy/` is only the staging copy `deploy-agent.sh` leaves
+behind; editing it changes nothing.)
+
+Over ssh, use **`ssh -t`** — sudo cannot prompt for a password without a
+terminal and fails with *"a terminal is required to read the password"*:
+
+```bash
+ssh -t gdata@10.1.1.175 'sudo /opt/monit/monit-config.sh -s'
+```
+
+On the host itself:
+
 ```bash
 sudo /opt/monit/monit-config.sh          # show, then edit interactively
 sudo /opt/monit/monit-config.sh -s       # show only
@@ -110,7 +123,7 @@ key cannot leave a host silently not reporting.
 ### Sampling faster
 
 ```bash
-ssh gdata@10.1.1.175 'sudo /opt/monit/monit-config.sh -i 5'
+ssh -t gdata@10.1.1.175 'sudo /opt/monit/monit-config.sh -i 5'
 ```
 
 Lowering the interval is safe on its own — the offline threshold is

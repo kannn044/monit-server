@@ -270,7 +270,7 @@ echo
 ok "'$SERVER_ID' deployed"
 cat <<EOF
 
-  change settings later:  ssh $TARGET '${SUDO:+sudo }/opt/monit/monit-config.sh'
+  change settings later:  ssh -t $TARGET '${SUDO:+sudo }/opt/monit/monit-config.sh'
   update the agent only:  $0 $TARGET -u
   stop it:                $0 $TARGET -S
   logs:                   ssh $TARGET 'journalctl -u monit-agent -f'

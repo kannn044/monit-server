@@ -1,0 +1,10 @@
+# Keep the build context small and never ship host-built artifacts into the image.
+**/node_modules
+**/dist
+server/public
+.env
+*.log
+.git
+_to_delete
+docs/screenshots
+SYSTEM-REQUIREMENTS-AND-ARCHITECTURE.md

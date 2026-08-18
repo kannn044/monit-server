@@ -1,0 +1,31 @@
+# App only — connects to a PostgreSQL you already run.
+#
+# Do not use this file directly; run ./setup-db.sh first. It creates the
+# database, writes .env, runs the migrations, and then tells you to run:
+#
+#   docker compose -f docker-compose.app-only.yml up -d --build
+#
+# .env values setup-db.sh writes: DATABASE_URL, PG_NETWORK, APP_PORT.
+
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 8080
+      DATABASE_URL: ${DATABASE_URL:?run ./setup-db.sh first — it writes this into .env}
+      JWT_SECRET: ${JWT_SECRET:-}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@example.com}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      SAMPLE_INTERVAL_S: ${SAMPLE_INTERVAL_S:-10}
+      ALERT_TICK_S: ${ALERT_TICK_S:-30}
+    networks:
+      - pgnet
+    ports:
+      - "${APP_PORT:-8080}:8080"
+
+networks:
+  pgnet:
+    external: true
+    name: ${PG_NETWORK:?run ./setup-db.sh first — it detects your database's network}

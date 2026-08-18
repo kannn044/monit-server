@@ -1,0 +1,26 @@
+# /etc/systemd/system/monit-agent.service
+[Unit]
+Description=monit-agent metrics shipper
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=monit
+Group=monit
+EnvironmentFile=/etc/monit/agent.conf
+ExecStart=/usr/bin/env bash /opt/monit/monit-agent.sh --loop
+Restart=always
+RestartSec=15
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/var/lib/monit-agent
+# Resource caps (defense in depth)
+MemoryMax=32M
+CPUQuota=20%
+LimitNOFILE=256
+
+[Install]
+WantedBy=multi-user.target

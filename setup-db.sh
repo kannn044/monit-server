@@ -124,9 +124,72 @@ else
   ok "database '$DBNAME' created"
 fi
 
-DATABASE_URL="postgres://$DBUSER:$DBPASS@$CONTAINER:5432/$DBNAME"
+# --- 4. find a hostname the app container can actually reach ----------------
+# The container name is not always the right DNS name: Compose registers the
+# *service* name as the network alias, and a container renamed with
+# `container_name:` will not match it. So collect every candidate and test them.
+PGPORT=$(psql_super -tAc 'SHOW port;' 2>/dev/null | tr -d '[:space:]'); PGPORT=${PGPORT:-5432}
+[ "$PGPORT" != "5432" ] && info "database listens on port $PGPORT inside the network"
 
-# --- 4. write .env (keeping anything already set) ---------------------------
+mapfile -t ALIASES < <(docker inspect "$CONTAINER" \
+  -f "{{with index .NetworkSettings.Networks \"$NETWORK\"}}{{range .Aliases}}{{.}}{{\"\n\"}}{{end}}{{end}}" 2>/dev/null | sed '/^$/d')
+PGIP=$(docker inspect "$CONTAINER" \
+  -f "{{with index .NetworkSettings.Networks \"$NETWORK\"}}{{.IPAddress}}{{end}}" 2>/dev/null)
+
+CANDIDATES=()
+for h in "$CONTAINER" "${ALIASES[@]}" "$PGIP"; do
+  [ -z "$h" ] && continue
+  case " ${CANDIDATES[*]} " in *" $h "*) ;; *) CANDIDATES+=("$h") ;; esac
+done
+
+# Use the database's own image as the psql client: it is already pulled, so this
+# works on a host with no registry access.
+CLIENT_IMAGE=$(docker inspect "$CONTAINER" -f '{{.Config.Image}}' 2>/dev/null)
+docker image inspect "$CLIENT_IMAGE" >/dev/null 2>&1 || CLIENT_IMAGE="postgres:16-alpine"
+
+info "testing the connection from inside network '$NETWORK'…"
+DBHOST=""; LAST_ERR=""
+for h in "${CANDIDATES[@]}"; do
+  url="postgres://$DBUSER:$DBPASS@$h:$PGPORT/$DBNAME"
+  if out=$(docker run --rm --network "$NETWORK" "$CLIENT_IMAGE" \
+             psql "$url" -tAc 'SELECT 1' 2>&1); then
+    DBHOST=$h; ok "reachable as '$h:$PGPORT'"; break
+  fi
+  LAST_ERR=$out
+  printf '  · %s — %s\n' "$h" "$(printf '%s' "$out" | grep -iE 'error|fatal|could not' | head -1)"
+done
+
+if [ -z "$DBHOST" ]; then
+  echo
+  echo "Full error from the last attempt:" >&2
+  printf '%s\n' "$LAST_ERR" | sed 's/^/    /' >&2
+  echo >&2
+  case "$LAST_ERR" in
+    *"could not translate host name"*|*"Name or service not known"*|*"Temporary failure in name resolution"*)
+      echo "  → DNS: none of these names resolve on '$NETWORK': ${CANDIDATES[*]}" >&2
+      echo "    Check the network is right:  docker inspect $CONTAINER -f '{{json .NetworkSettings.Networks}}'" >&2 ;;
+    *"Connection refused"*)
+      echo "  → Reached the host but nothing is listening on port $PGPORT." >&2
+      echo "    Check listen_addresses:  docker exec $CONTAINER psql -U $PGSUPER -c 'SHOW listen_addresses'" >&2 ;;
+    *"no pg_hba.conf entry"*)
+      echo "  → pg_hba.conf has no rule for this client. Add inside the database container:" >&2
+      echo "      host  $DBNAME  $DBUSER  0.0.0.0/0  scram-sha-256" >&2
+      echo "    then:  docker exec $CONTAINER psql -U $PGSUPER -c 'SELECT pg_reload_conf()'" >&2 ;;
+    *"password authentication failed"*)
+      echo "  → The password was rejected. Re-run with an explicit one:  $0 -c $CONTAINER -w '<password>'" >&2 ;;
+    *"does not exist"*)
+      echo "  → The role or database is missing — unexpected here; re-run the script." >&2 ;;
+    *"Unable to find image"*|*"pull access denied"*|*"manifest unknown"*)
+      echo "  → Could not get a psql client image ('$CLIENT_IMAGE'). Pull one, or pass -w to skip." >&2 ;;
+    *)
+      echo "  → See the error above; it came straight from psql." >&2 ;;
+  esac
+  exit 1
+fi
+
+DATABASE_URL="postgres://$DBUSER:$DBPASS@$DBHOST:$PGPORT/$DBNAME"
+
+# --- 5. write .env (keeping anything already set) ---------------------------
 touch .env; chmod 600 .env
 set_env() {
   local key=$1 val=$2
@@ -143,14 +206,6 @@ set_env DATABASE_URL "$DATABASE_URL"
 set_env PG_NETWORK   "$NETWORK"
 set_env APP_PORT     "$APP_PORT"
 ok "wrote .env"
-
-# --- 5. verify connectivity the way the app will see it ---------------------
-info "testing the connection from inside the network…"
-docker run --rm --network "$NETWORK" postgres:16-alpine \
-  psql "$DATABASE_URL" -tAc 'SELECT 1' >/dev/null 2>&1 \
-  || die "the app's network cannot reach $CONTAINER:5432 as '$DBUSER'.
-   Check that '$CONTAINER' is on network '$NETWORK' and its pg_hba allows password auth."
-ok "connection works"
 
 # --- 6. run the migrations --------------------------------------------------
 info "building the image and running migrations…"

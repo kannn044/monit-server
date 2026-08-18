@@ -161,7 +161,7 @@ fi
 
 # --- copy the agent ----------------------------------------------------------
 info "copying agent → $TARGET:/opt/monit-agent/"
-$SSH "$TARGET" 'sudo mkdir -p /opt/monit-agent'
+$SSH "$TARGET" 'mkdir -p /opt/monit-agent'
 rsync -az --delete -e "$SSH" \
   agent/monit-agent.sh agent/monit-agent.service agent/install.sh \
   agent/monit-config.sh agent/agent.conf.example \

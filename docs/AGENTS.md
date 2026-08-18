@@ -38,6 +38,23 @@ Without `-a` you paste a key you created in the dashboard yourself:
 Re-running on a host that already exists rotates its key and reinstalls — safe
 to repeat.
 
+**Values go in flags, never positionally.** `./deploy-agent.sh host api-server sk_…`
+is rejected rather than quietly ignoring the ID and key.
+
+### Deploying as an ordinary user
+
+The remote account does not have to be root. Files are staged in that account's
+own home (`~/.monit-agent-deploy`) — writing straight into root-owned `/opt`
+would fail — and only the install step runs through `sudo`:
+
+```bash
+./deploy-agent.sh gdata@10.1.1.175 -i api-server -k sk_agent_xxx
+```
+
+The account needs sudo rights; the script checks before touching anything and
+says so plainly if they are missing. One ssh connection is shared for the whole
+run, so a password-only account is asked once instead of five or six times.
+
 ## Installing directly on the target
 
 Copy `agent/` over and run it with no arguments to be asked for each value:
@@ -111,6 +128,47 @@ done
 ```
 
 `-u` replaces the script and restarts; configuration and API keys are untouched.
+
+## Turning an agent off
+
+```bash
+# from the central server
+./deploy-agent.sh root@10.1.0.101 -S     # stop + disable, keep everything
+./deploy-agent.sh root@10.1.0.101 -E     # start it again
+./deploy-agent.sh root@10.1.0.101 -X     # remove completely
+```
+
+Or on the host itself:
+
+```bash
+sudo systemctl disable --now monit-agent   # loop mode
+sudo rm -f /etc/cron.d/monit-agent         # cron mode
+pgrep -af monit-agent                      # confirm nothing is left
+```
+
+`-S` keeps the files, config and API key, so `-E` brings it straight back.
+`-X` deletes the service, `/opt/monit`, `/etc/monit`, the buffer and the `monit`
+user — the host is left as it was before installation.
+
+A stopped host keeps its entry in the dashboard and will start firing
+**Server Offline** after 30 s. Either delete the server there (Projects →
+Archive), or silence the incident, or disable the *Server Offline* rule for it.
+
+### How much traffic does an agent actually use?
+
+One sample is roughly 2–5 KB — around **30 MB per host per day** at a 10 s
+interval, or 250 bytes/s. If a link looks saturated, the agent is almost
+certainly not the cause; check for two agents sharing one `server_id`, an open
+dashboard (it polls every 10 s and the fleet endpoint returns every server), or
+simply the traffic the monitored service itself is doing — which is what the
+network chart on the server page is showing you.
+
+To cut it anyway without going dark, slow the agent down rather than stopping it:
+
+```bash
+sudo /opt/monit/monit-config.sh -i 60
+# then on the central server:  SAMPLE_INTERVAL_S=60 in .env, and restart
+```
 
 ## Useful on the target
 

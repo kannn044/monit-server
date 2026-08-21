@@ -4,7 +4,11 @@ import { API_BASE } from './base.js';
 
 export async function api(path, { method = 'GET', body, retry = true } = {}) {
   const auth = useAuth();
-  const headers = { 'Content-Type': 'application/json' };
+  // Only declare a JSON body when there is one. Announcing application/json on
+  // a bodyless POST (key rotate, restore, ack…) makes Fastify's parser reject
+  // the request with 400 "Body cannot be empty" before the route ever runs.
+  const headers = {};
+  if (body !== undefined) headers['Content-Type'] = 'application/json';
   if (auth.accessToken) headers.Authorization = `Bearer ${auth.accessToken}`;
   const res = await fetch(API_BASE + path, { method, headers, body: body ? JSON.stringify(body) : undefined });
   if (res.status === 401 && retry && auth.refreshToken) {

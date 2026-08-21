@@ -58,18 +58,30 @@ Old timestamps are accepted (buffered backlog); `last_seen` only moves forward.
 
 | Method | Path | Role | Notes |
 |---|---|---|---|
-| GET | `/servers` | viewer | `?project=&env=&status=` — includes computed `health` |
-| POST | `/servers` | admin | `{id,name,ip?,project_ids?}` → **returns `api_key` once** |
+| GET | `/servers` | viewer | `?project=&env=&status=` — includes computed `health`. `?archived=only` lists deleted servers, `?archived=all` lists both |
+| POST | `/servers` | admin | `{id,name,ip?,project_ids?}` → **returns `api_key` once**. An id belonging to a *deleted* server is restored (`revived: true`); only a live id is a 409 |
 | GET | `/servers/:id` | viewer | detail + latest sample + expected services |
 | GET | `/servers/:id/summary` | viewer | latest values + derived net rate |
 | PATCH | `/servers/:id` | admin | `{name?,ip?,project_ids?}` |
-| DELETE | `/servers/:id` | admin | archive (soft) + revoke keys |
+| DELETE | `/servers/:id` | admin | archive: revoke keys, close alerts, hide it — history kept, id restorable |
+| DELETE | `/servers/:id?purge=1` | admin | erase: row, keys, alerts and every stored sample are deleted; the id is free |
+| POST | `/servers/:id/restore` | admin | un-archive an archived server, return a new key once |
 | POST | `/servers/:id/keys/rotate` | admin | revoke old, return new key once |
 | POST | `/servers/:id/expected-services` | admin | `{kind:"docker"\|"pm2", name}` |
 | DELETE | `/servers/:id/expected-services/:esId` | admin | |
 
 `health` is `online` · `warning` · `critical` · `offline`, where offline means no
-sample for more than `SAMPLE_INTERVAL_S × 3`.
+sample for more than `SAMPLE_INTERVAL_S × 3`. Deleted servers report `archived`
+and are excluded from every dashboard query.
+
+### Agent keys cannot be read back
+
+Only the SHA-256 hash of a key is stored, so there is no endpoint — and no
+screen — that can show an existing key again. A lost key is *replaced*, never
+recovered: `POST /servers/:id/keys/rotate` (**New key** in the dashboard) issues
+a new one and revokes the old immediately. Deleting a server and re-registering
+it under the same id also issues a new key, which is the path a forgotten key
+used to be worked around with.
 
 ## Projects
 

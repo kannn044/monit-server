@@ -4,12 +4,19 @@ import { computeHealth } from '../lib/health.js';
 import { extractMetric } from '../lib/metrics.js';
 
 async function serversWithHealth(filters = {}) {
-  const { project, env, status } = filters;
-  const vals = []; let where = 'WHERE s.archived_at IS NULL'; let i = 1;
+  const { project, env, status, archived } = filters;
+  const vals = [];
+  // `archived=only` is how the UI surfaces deleted servers so they can be
+  // restored or purged — without it a soft-deleted row is invisible yet still
+  // holds its primary key, which is what produced "Server ID already exists".
+  let where = archived === 'only' ? 'WHERE s.archived_at IS NOT NULL'
+    : archived === 'all' ? 'WHERE true'
+      : 'WHERE s.archived_at IS NULL';
+  let i = 1;
   if (project) { where += ` AND sp.project_id = $${i++}`; vals.push(project); }
   if (env) { where += ` AND p.environment = $${i++}`; vals.push(env); }
   const { rows } = await q(
-    `SELECT DISTINCT s.id, s.name, s.ip, s.os, s.last_seen, s.created_at,
+    `SELECT DISTINCT s.id, s.name, s.ip, s.os, s.last_seen, s.created_at, s.archived_at,
        COALESCE((SELECT jsonb_agg(jsonb_build_object('id', p2.id, 'name', p2.name, 'environment', p2.environment))
          FROM server_projects sp2 JOIN projects p2 ON p2.id = sp2.project_id
          WHERE sp2.server_id = s.id AND p2.archived_at IS NULL), '[]') AS projects,
@@ -22,7 +29,9 @@ async function serversWithHealth(filters = {}) {
      ORDER BY s.name`, vals);
   let out = rows.map((r) => ({
     ...r,
-    health: computeHealth({ last_seen: r.last_seen, activeSeverities: r.active_severities }),
+    health: r.archived_at
+      ? 'archived'
+      : computeHealth({ last_seen: r.last_seen, activeSeverities: r.active_severities }),
   }));
   if (status) out = out.filter((s) => s.health === status);
   return out;
@@ -52,16 +61,48 @@ export default async function serverRoutes(app) {
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
-      await client.query('INSERT INTO servers (id, name, ip) VALUES ($1,$2,$3)', [id, name, ip || null]);
+      // Deleting a server archives it, so the primary key survives. Registering
+      // the same id again used to hit that hidden row and fail with "Server ID
+      // already exists" — which is nonsense from the operator's side, since the
+      // server is gone from every screen. Re-registering now revives the row and
+      // issues a fresh key. Only a *live* id is a real conflict.
+      const { rows: prior } = await client.query(
+        'SELECT id, archived_at FROM servers WHERE id = $1 FOR UPDATE', [id]);
+      const revived = !!prior[0];
+      if (revived && !prior[0].archived_at) {
+        await client.query('ROLLBACK');
+        return reply.code(409).send({
+          title: 'Server ID already exists',
+          status: 409,
+          detail: `"${id}" is already registered and active. Use "New key" on that server to issue a replacement key — the old key stops working immediately.`,
+        });
+      }
+      if (revived) {
+        // Start clean: the previous life's key, alerts and evaluation state must
+        // not leak into the new registration. Metrics history is kept (use
+        // DELETE ?purge=1 to erase a server outright).
+        await client.query(
+          `UPDATE servers SET archived_at = NULL, name = $2, ip = $3::inet, last_seen = NULL WHERE id = $1`,
+          [id, name, ip || null]);
+        await client.query('DELETE FROM server_projects WHERE server_id = $1', [id]);
+        await client.query('UPDATE api_keys SET revoked_at = now() WHERE server_id = $1 AND revoked_at IS NULL', [id]);
+        await client.query(
+          `UPDATE incidents SET status = 'resolved', resolved_at = now(),
+             notes = COALESCE(notes || ' | ', '') || 'auto-resolved: server re-registered'
+           WHERE server_id = $1 AND status IN ('firing','acknowledged','flapping','silenced')`, [id]);
+        await client.query('DELETE FROM rule_state WHERE server_id = $1', [id]);
+      } else {
+        await client.query('INSERT INTO servers (id, name, ip) VALUES ($1,$2,$3)', [id, name, ip || null]);
+      }
       for (const pid of project_ids) {
         await client.query('INSERT INTO server_projects (server_id, project_id) VALUES ($1,$2)', [id, pid]);
       }
       const apiKey = generateAgentKey();
       await client.query('INSERT INTO api_keys (server_id, key_hash) VALUES ($1,$2)', [id, sha256(apiKey)]);
       await client.query('COMMIT');
-      await audit(req, 'server.create', 'server', id, { name });
+      await audit(req, revived ? 'server.restore' : 'server.create', 'server', id, { name, revived });
       // The plaintext key is returned ONCE — store it in the agent config now.
-      return reply.code(201).send({ server: { id, name, ip }, api_key: apiKey });
+      return reply.code(201).send({ server: { id, name, ip }, api_key: apiKey, revived });
     } catch (e) {
       await client.query('ROLLBACK');
       if (e.code === '23505') return reply.code(409).send({ title: 'Server ID already exists', status: 409 });
@@ -164,12 +205,76 @@ export default async function serverRoutes(app) {
     return { ok: true };
   });
 
+  // DELETE            -> archive: hidden everywhere, key revoked, history kept,
+  //                      and the id can be registered again (see POST above).
+  // DELETE ?purge=1   -> erase: the row, its keys, projects links, expected
+  //                      services, incidents and every stored sample are gone.
   app.delete('/api/v1/servers/:id', { preHandler: requireRole('admin') }, async (req, reply) => {
-    const { rowCount } = await q('UPDATE servers SET archived_at = now() WHERE id = $1 AND archived_at IS NULL', [req.params.id]);
+    const id = req.params.id;
+    const purge = ['1', 'true', 'yes'].includes(String(req.query.purge ?? '').toLowerCase());
+
+    if (purge) {
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        const { rows } = await client.query('SELECT id FROM servers WHERE id = $1 FOR UPDATE', [id]);
+        if (!rows[0]) { await client.query('ROLLBACK'); return reply.code(404).send({ title: 'Not found', status: 404 }); }
+        // system_metrics and rule_state carry server_id without a foreign key
+        // (the metrics table is a hypertable under TimescaleDB, which cannot
+        // take one), so they are cleared explicitly. Everything else cascades.
+        const { rowCount: samples } = await client.query('DELETE FROM system_metrics WHERE server_id = $1', [id]);
+        await client.query('DELETE FROM rule_state WHERE server_id = $1', [id]);
+        await client.query('DELETE FROM servers WHERE id = $1', [id]);
+        await client.query('COMMIT');
+        await audit(req, 'server.purge', 'server', id, { samples_deleted: samples });
+        return { ok: true, purged: true, samples_deleted: samples };
+      } catch (e) {
+        await client.query('ROLLBACK');
+        throw e;
+      } finally {
+        client.release();
+      }
+    }
+
+    const { rowCount } = await q('UPDATE servers SET archived_at = now() WHERE id = $1 AND archived_at IS NULL', [id]);
     if (!rowCount) return reply.code(404).send({ title: 'Not found', status: 404 });
-    await q('UPDATE api_keys SET revoked_at = now() WHERE server_id = $1 AND revoked_at IS NULL', [req.params.id]);
-    await audit(req, 'server.archive', 'server', req.params.id);
-    return { ok: true };
+    await q('UPDATE api_keys SET revoked_at = now() WHERE server_id = $1 AND revoked_at IS NULL', [id]);
+    await q(`UPDATE incidents SET status = 'resolved', resolved_at = now(),
+               notes = COALESCE(notes || ' | ', '') || 'auto-resolved: server archived'
+             WHERE server_id = $1 AND status IN ('firing','acknowledged','flapping','silenced')`, [id]);
+    await q('DELETE FROM rule_state WHERE server_id = $1', [id]);
+    await audit(req, 'server.archive', 'server', id);
+    return { ok: true, purged: false };
+  });
+
+  // Bring an archived server back without retyping its details. A new key is
+  // issued because the old one was revoked on archive and is unrecoverable.
+  app.post('/api/v1/servers/:id/restore', { preHandler: requireRole('admin') }, async (req, reply) => {
+    const id = req.params.id;
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const { rows } = await client.query(
+        'SELECT id, archived_at FROM servers WHERE id = $1 FOR UPDATE', [id]);
+      if (!rows[0]) { await client.query('ROLLBACK'); return reply.code(404).send({ title: 'Not found', status: 404 }); }
+      if (!rows[0].archived_at) {
+        await client.query('ROLLBACK');
+        return reply.code(409).send({ title: 'Server is not archived', status: 409 });
+      }
+      await client.query('UPDATE servers SET archived_at = NULL, last_seen = NULL WHERE id = $1', [id]);
+      await client.query('UPDATE api_keys SET revoked_at = now() WHERE server_id = $1 AND revoked_at IS NULL', [id]);
+      const apiKey = generateAgentKey();
+      await client.query('INSERT INTO api_keys (server_id, key_hash) VALUES ($1,$2)', [id, sha256(apiKey)]);
+      await client.query('DELETE FROM rule_state WHERE server_id = $1', [id]);
+      await client.query('COMMIT');
+      await audit(req, 'server.restore', 'server', id);
+      return { api_key: apiKey }; // shown once
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
+    } finally {
+      client.release();
+    }
   });
 
   app.post('/api/v1/servers/:id/keys/rotate', { preHandler: requireRole('admin') }, async (req, reply) => {

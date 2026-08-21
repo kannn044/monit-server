@@ -120,6 +120,21 @@ Each change backs up `agent.conf`, sends a test sample, and restarts the
 service. **If the sample is rejected the config is rolled back**, so a mistyped
 key cannot leave a host silently not reporting.
 
+### Lost the key?
+
+It cannot be looked up — the dashboard stores only its SHA-256 hash. Issue a
+replacement instead: **Projects → the server's row → New key**, copy it from the
+card (it is shown once), and install it with the command that card hands you:
+
+```bash
+ssh -t user@host 'sudo /opt/monit/monit-config.sh -k sk_agent_new…'
+```
+
+The host's own copy is also still on disk if the agent is running — `grep
+MONIT_API_KEY /etc/monit/agent.conf` as root. Deleting the server and
+registering the ID again works too (it restores the record and issues a new
+key), but rotating is one click and keeps the history.
+
 ### Sampling faster
 
 ```bash

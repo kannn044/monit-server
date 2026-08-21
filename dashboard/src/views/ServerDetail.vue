@@ -5,6 +5,7 @@ import { api } from '../api.js';
 import { fmt, fmtBytes, fmtDuration, ago, fmtTime, RANGES } from '../util.js';
 import { useAuth } from '../stores/auth.js';
 import TimeChart from '../components/TimeChart.vue';
+import AgentKey from '../components/AgentKey.vue';
 
 const route = useRoute();
 const auth = useAuth();
@@ -58,10 +59,14 @@ async function loadCharts() {
   loadingCharts.value = false;
 }
 
+// There is no "show me the key again" — only its SHA-256 hash is stored. A
+// forgotten key is replaced, not recovered.
 async function rotateKey() {
-  if (!confirm('Rotate the agent API key? The old key stops working immediately.')) return;
-  const r = await api(`/api/v1/servers/${id.value}/keys/rotate`, { method: 'POST' });
-  newKey.value = r.api_key;
+  if (!confirm('Issue a new agent key?\n\nThe current key stops working immediately — the agent will not report again until the new key is installed on that host.')) return;
+  try {
+    const r = await api(`/api/v1/servers/${id.value}/keys/rotate`, { method: 'POST' });
+    newKey.value = r.api_key;
+  } catch (e) { error.value = e.message; }
 }
 
 const hasGpu = computed(() => Object.keys(charts.value.gpu || {}).length > 0 || (summary.value?.gpu || []).length > 0);
@@ -97,13 +102,12 @@ watch(id, () => { info.value = null; charts.value = {}; loadInfo(); loadCharts()
         <div class="seg">
           <button v-for="r in RANGES" :key="r.label" :class="{ on: range.label === r.label }" @click="range = r">{{ r.label }}</button>
         </div>
-        <button v-if="auth.isAdmin" class="sm" @click="rotateKey">Rotate key</button>
+        <button v-if="auth.isAdmin" class="sm" title="Issue a replacement key — forgotten keys cannot be looked up" @click="rotateKey">New key</button>
       </div>
     </div>
 
-    <div v-if="newKey" class="card" style="margin-bottom: 12px; border-color: var(--warning)">
-      New agent key (shown once): <span class="mono">{{ newKey }}</span>
-    </div>
+    <AgentKey v-if="newKey" :server-id="info.server.id" :api-key="newKey" title="New agent key"
+              @dismiss="newKey = ''" />
 
     <div v-if="summary" class="kpis" style="margin-bottom: 12px">
       <div class="stat"><div class="v">{{ fmt(summary.cpu_total, 'percent') }}</div><div class="l">CPU</div></div>

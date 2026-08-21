@@ -92,13 +92,48 @@ distort one aggregate bucket.
 
 ## Day-2
 
-### Key rotation
+### Lost or rotated keys
 
-Dashboard → server → **Rotate key**, or `POST /servers/:id/keys/rotate`. The old
-key is revoked immediately — update `/etc/monit/agent.conf` and
-`systemctl restart monit-agent`. Samples buffer on disk meanwhile (up to
-`MONIT_BUFFER_MAX`) but will be rejected with the stale key; they drop once the
-buffer cap is hit.
+**A key can never be displayed twice.** Only its SHA-256 hash is stored, so the
+dashboard has no "show me the key" button and no support path can recover one.
+The card shown at registration is the single chance to copy it — it carries a
+**Copy key** button and the exact `monit-config.sh` command that installs it.
+
+Forgot a key? Issue a replacement: **Projects → server row → New key** (or
+server detail → **New key**, or `POST /servers/:id/keys/rotate`). The old key is
+revoked immediately — apply the new one on the host with
+
+```bash
+ssh -t user@host 'sudo /opt/monit/monit-config.sh -k sk_agent_new…'
+```
+
+Samples buffer on disk meanwhile (up to `MONIT_BUFFER_MAX`) but are rejected
+while the agent still holds the stale key; they drop once the buffer cap is hit.
+
+### Deleting a server, and reusing its ID
+
+**Delete** offers two outcomes, because they are not the same thing:
+
+| Choice | What happens | ID afterwards |
+|---|---|---|
+| Remove from the dashboard | keys revoked, open alerts closed, hidden everywhere; metric history kept | held — reusable, see below |
+| Erase permanently | registration, keys, alert history and **every stored sample** deleted | free |
+
+Removed servers are listed under **Deleted servers** on the Projects page with
+**Restore** and **Erase permanently**. Restoring issues a new key, since the old
+one was revoked on delete.
+
+Registering an ID that belongs to a removed server restores it rather than
+failing — that is what "Server ID already exists" used to mean when a deleted
+server was invisible but still held its primary key. Only an ID that is
+*currently live* is a genuine conflict, and the 409 now says so and points at
+**New key**.
+
+```bash
+# erase from the API instead of the UI
+curl -X DELETE 'https://monitor.example.com/api/v1/servers/web-prod-01?purge=1' \
+  -H "Authorization: Bearer $ADMIN_JWT"
+```
 
 ### Tuning alerts
 

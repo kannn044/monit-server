@@ -75,6 +75,7 @@ h2 { font-size: 15px; margin: 0 0 10px; color: var(--ink); }
 .badge.warning { color: var(--warning); background: color-mix(in oklab, var(--warning) 14%, transparent); }
 .badge.critical { color: var(--critical); background: color-mix(in oklab, var(--critical) 12%, transparent); }
 .badge.offline { color: var(--offline); background: color-mix(in oklab, var(--offline) 14%, transparent); }
+.badge.archived { color: var(--muted); background: color-mix(in oklab, var(--muted) 14%, transparent); }
 .badge.firing { color: var(--critical); background: color-mix(in oklab, var(--critical) 12%, transparent); }
 .badge.acknowledged { color: var(--warning); background: color-mix(in oklab, var(--warning) 14%, transparent); }
 .badge.resolved { color: var(--good); background: color-mix(in oklab, var(--good) 12%, transparent); }

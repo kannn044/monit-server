@@ -142,8 +142,22 @@ collect_gpu() {
 
 collect_docker() {
   if ! command -v docker >/dev/null 2>&1; then
-    printf '{"present":false,"total":0,"running":0,"exited":0,"containers":[]}'; return 0
+    printf '{"present":false,"accessible":true,"total":0,"running":0,"exited":0,"containers":[]}'; return 0
   fi
+  # Distinguish "no containers" from "cannot talk to the daemon". Both used to
+  # print running:0, which reads as an outage — and makes service_down fire.
+  local out err rc
+  err=$(mktemp 2>/dev/null || echo /tmp/monit-docker-err.$$)
+  out=$(docker ps -a --format '{{.Names}}\t{{.State}}\t{{.Status}}' 2>"$err"); rc=$?
+  if [ "$rc" -ne 0 ]; then
+    local why
+    why=$(head -c 200 "$err" 2>/dev/null | tr -d '\r' | head -1)
+    rm -f "$err"
+    printf '{"present":true,"accessible":false,"total":null,"running":null,"exited":null,"containers":[],"reason":"%s"}' \
+      "$(json_escape "${why:-docker ps failed}")"
+    return 0
+  fi
+  rm -f "$err"
   local total=0 running=0 exited=0 items="" name state status
   while IFS=$'\t' read -r name state status; do
     [ -z "$name" ] && continue
@@ -155,33 +169,125 @@ collect_docker() {
     if [ "$total" -le "$MONIT_DOCKER_MAX" ]; then
       items="${items}${items:+,}{\"name\":\"$(json_escape "$name")\",\"state\":\"$(json_escape "$state")\",\"status\":\"$(json_escape "$status")\"}"
     fi
-  done < <(docker ps -a --format '{{.Names}}\t{{.State}}\t{{.Status}}' 2>/dev/null)
-  printf '{"present":true,"total":%d,"running":%d,"exited":%d,"containers":[%s]}' \
+  done <<< "$out"
+  printf '{"present":true,"accessible":true,"total":%d,"running":%d,"exited":%d,"containers":[%s]}' \
     "$total" "$running" "$exited" "$items"
 }
 
-collect_pm2() {
-  if ! command -v pm2 >/dev/null 2>&1; then
-    printf '{"present":false,"online":0,"stopped":0,"processes":[]}'; return 0
+# --- PM2 -------------------------------------------------------------------
+# PM2 state lives in a per-user daemon, and PM2 refuses to talk to a socket it
+# does not own. The agent runs as the unprivileged 'monit' user, so a plain
+# `pm2 jlist` reaches a brand-new empty daemon of its own and honestly reports
+# nothing — which used to be published as "0 online / 0 stopped" and read as
+# "your apps are down". Never report a count we could not actually read.
+#
+# The God Daemon puts its PM2_HOME in its process title:
+#     PM2 v7.0.3: God Daemon (/root/.pm2)
+# which every user can see. That gives us discovery without privileges; reading
+# it still needs to run as the owner, via the sudo helper install.sh sets up.
+
+# Prints "user<TAB>pm2_home" per running daemon.
+pm2_daemons() {
+  ps -eo user:32,args 2>/dev/null | awk '
+    /God Daemon/ && !/awk/ {
+      if (match($0, /\(([^)]*\.pm2[^)]*)\)/)) {
+        home = substr($0, RSTART + 1, RLENGTH - 2)
+        printf "%s\t%s\n", $1, home
+      }
+    }' | sort -u
+}
+
+# pm2 is frequently installed under nvm, which is not on a system user's PATH.
+pm2_bin_for() {
+  local owner=$1 home_dir bin
+  if [ -n "${MONIT_PM2_BIN:-}" ] && [ -x "$MONIT_PM2_BIN" ]; then
+    printf '%s' "$MONIT_PM2_BIN"; return 0
   fi
-  local jlist out=""
-  jlist=$(pm2 jlist 2>/dev/null || true)
-  if [ -n "$jlist" ] && command -v jq >/dev/null 2>&1; then
-    out=$(printf '%s' "$jlist" | jq -c '
-      { present:true,
-        online:  ([.[] | select(.pm2_env.status=="online")] | length),
-        stopped: ([.[] | select(.pm2_env.status!="online")] | length),
-        processes:[.[] | {name:.name, status:.pm2_env.status, pid:(.pm2_env.pid // 0),
-                          memory:(.monit.memory // 0), cpu:(.monit.cpu // 0)}] }' 2>/dev/null) || out=""
-  fi
-  if [ -z "$out" ]; then
-    local online stopped
-    online=$(pm2 list 2>/dev/null | grep -c 'online' || true)
-    stopped=$(pm2 list 2>/dev/null | grep -cE 'stopped|errored|stopping' || true)
-    printf '{"present":true,"online":%d,"stopped":%d,"processes":[]}' "${online:-0}" "${stopped:-0}"
+  bin=$(command -v pm2 2>/dev/null) && [ -n "$bin" ] && { printf '%s' "$bin"; return 0; }
+  home_dir=$(getent passwd "$owner" 2>/dev/null | cut -d: -f6)
+  for bin in /usr/local/bin/pm2 /usr/bin/pm2 \
+             "$home_dir"/.nvm/versions/node/*/bin/pm2 \
+             "$home_dir"/.npm-global/bin/pm2 "$home_dir"/node_modules/.bin/pm2; do
+    [ -x "$bin" ] && { printf '%s' "$bin"; return 0; }
+  done
+  return 1
+}
+
+# Emits the jlist JSON for one daemon, or nothing if it cannot be read.
+pm2_jlist() {
+  local owner=$1 home=$2 bin out
+  bin=$(pm2_bin_for "$owner") || return 1
+  if [ "$owner" = "$(id -un 2>/dev/null)" ]; then
+    out=$(PM2_HOME="$home" "$bin" jlist 2>/dev/null) || return 1
+  elif [ -x /opt/monit/monit-pm2.sh ] && command -v sudo >/dev/null 2>&1; then
+    # Narrow NOPASSWD rule installed by install.sh; the helper only ever runs
+    # `pm2 jlist` against an existing PM2_HOME.
+    out=$(sudo -n /opt/monit/monit-pm2.sh "$owner" "$home" 2>/dev/null) || return 1
   else
-    printf '%s' "$out"
+    return 1
   fi
+  case $out in '['*) printf '%s' "$out" ;; *) return 1 ;; esac
+}
+
+collect_pm2() {
+  local daemons owner home lists="" owners="" blocked="" bin_missing=0
+  daemons=$(pm2_daemons)
+
+  if [ -z "$daemons" ]; then
+    # No daemon running. If the binary exists the host does use PM2, it just has
+    # nothing up right now — that is a real 0, and worth reporting as one.
+    if command -v pm2 >/dev/null 2>&1; then
+      printf '{"present":true,"accessible":true,"online":0,"stopped":0,"processes":[]}'
+    else
+      printf '{"present":false,"accessible":true,"online":0,"stopped":0,"processes":[]}'
+    fi
+    return 0
+  fi
+
+  while IFS=$'\t' read -r owner home; do
+    [ -z "$owner" ] && continue
+    owners="${owners}${owners:+,}$(json_escape "$owner")"
+    local one
+    if one=$(pm2_jlist "$owner" "$home"); then
+      lists="${lists}${lists:+$'\n'}${one}"
+    else
+      blocked="${blocked}${blocked:+, }${owner} (${home})"
+      pm2_bin_for "$owner" >/dev/null 2>&1 || bin_missing=1
+    fi
+  done <<< "$daemons"
+
+  if [ -z "$lists" ]; then
+    # Detected but unreadable: report the fact, not a fabricated zero.
+    local why
+    if [ "$bin_missing" = 1 ]; then
+      why="the pm2 binary is not on \$PATH for user $(id -un) — set MONIT_PM2_BIN in /etc/monit/agent.conf"
+    else
+      why="the agent runs as $(id -un) and PM2 only answers its owner — run: sudo /opt/monit/monit-config.sh --pm2"
+    fi
+    printf '{"present":true,"accessible":false,"online":null,"stopped":null,"processes":[],"owners":[%s],"reason":"%s"}' \
+      "${owners:+\"${owners//,/\",\"}\"}" "$(json_escape "$why")"
+    return 0
+  fi
+
+  if command -v jq >/dev/null 2>&1; then
+    printf '%s' "$lists" | jq -sc '
+      [ .[] | .[] ] as $all
+      | { present:true, accessible:true,
+          online:  ([$all[] | select(.pm2_env.status=="online")] | length),
+          stopped: ([$all[] | select(.pm2_env.status!="online")] | length),
+          processes:[$all[] | {name:.name, status:.pm2_env.status, pid:(.pid // .pm2_env.pid // 0),
+                               memory:(.monit.memory // 0), cpu:(.monit.cpu // 0),
+                               restarts:(.pm2_env.restart_time // 0),
+                               owner:(.pm2_env.username // "")}] }' 2>/dev/null && return 0
+  fi
+
+  # jq-less fallback: count "status":"online" occurrences in the raw jlist.
+  local online stopped total
+  online=$(printf '%s' "$lists" | grep -o '"status":"online"' | wc -l | tr -d ' ')
+  total=$(printf '%s' "$lists" | grep -o '"status":"[a-z]*"' | wc -l | tr -d ' ')
+  stopped=$(( total > online ? total - online : 0 ))
+  printf '{"present":true,"accessible":true,"online":%d,"stopped":%d,"processes":[]}' \
+    "${online:-0}" "${stopped:-0}"
 }
 
 collect_http() {

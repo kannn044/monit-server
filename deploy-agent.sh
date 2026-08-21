@@ -236,7 +236,7 @@ info "copying agent → $TARGET:$STAGE/"
 rsh "mkdir -p '$STAGE'"
 rsync -az --delete -e "ssh ${SSH_OPTS[*]}" \
   agent/monit-agent.sh agent/monit-agent.service agent/install.sh \
-  agent/monit-config.sh agent/agent.conf.example \
+  agent/monit-config.sh agent/monit-pm2.sh agent/agent.conf.example \
   "$TARGET:$STAGE/"
 rsh "chmod +x '$STAGE'/*.sh"
 ok "files staged in $STAGE"
@@ -246,6 +246,9 @@ if [ "$UPDATE_ONLY" = 1 ]; then
   sudo_rsh "
     install -m 0755 $STAGE/monit-agent.sh /opt/monit/monit-agent.sh
     install -m 0755 $STAGE/monit-config.sh /opt/monit/monit-config.sh 2>/dev/null || true
+    # Root-owned 0755 on purpose: the agent user runs it through sudo, so it
+    # must not be writable by that user.
+    install -m 0755 -o root -g root $STAGE/monit-pm2.sh /opt/monit/monit-pm2.sh 2>/dev/null || true
     if systemctl list-unit-files monit-agent.service >/dev/null 2>&1; then
       systemctl restart monit-agent && systemctl is-active --quiet monit-agent \
         && echo restarted || { echo FAILED; exit 1; }

@@ -182,6 +182,8 @@ running cluster.
 | Alerts fire but nothing arrives | Settings → **Test** the channel; then `/notification-log` and `notification_dead_letter` |
 | Notification stuck retrying | pg_boss retries 5× with backoff, then dead-letters; inspect `pgboss.job` |
 | Migration warns about timescaledb | extension missing — the fallback views work, but install TimescaleDB for production |
+| PM2 says **not readable** (or used to say 0 online) | the daemon belongs to another user — `sudo /opt/monit/monit-config.sh --pm2` on that host ([AGENTS](AGENTS.md)) |
+| Docker says **not readable** | the agent is not in the `docker` group, or the daemon is down — `sudo usermod -aG docker monit && systemctl restart monit-agent` |
 | Intermittent `Server Offline` while the agent is clearly running | see below |
 
 ### Intermittent "Server Offline" on a host that is up

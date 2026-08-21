@@ -190,6 +190,81 @@ if command -v docker >/dev/null 2>&1 && getent group docker >/dev/null 2>&1; the
   fi
 fi
 
+# --- 5b. pm2 access (optional) -----------------------------------------------
+# PM2 state lives in a per-user daemon and PM2 will not serve a socket it does
+# not own, so 'monit' cannot see apps started by root or a deploy user — it gets
+# an empty daemon of its own and the dashboard shows "0 online". The daemon
+# advertises its PM2_HOME in its process title, so we can find it and install a
+# narrow NOPASSWD rule for one helper that only ever runs `pm2 jlist`.
+setup_pm2_access() {
+  local daemons owner home foreign=0 bin owner_home
+  daemons=$(ps -eo user:32,args 2>/dev/null | awk '
+    /God Daemon/ && !/awk/ {
+      if (match($0, /\(([^)]*\.pm2[^)]*)\)/))
+        printf "%s\t%s\n", $1, substr($0, RSTART + 1, RLENGTH - 2)
+    }' | sort -u)
+
+  if [ -z "$daemons" ]; then
+    command -v pm2 >/dev/null 2>&1 && \
+      warn "pm2 is installed but no daemon is running — nothing to monitor yet"
+    return 0
+  fi
+
+  while IFS=$'\t' read -r owner home; do
+    [ -z "$owner" ] && continue
+    [ "$owner" = monit ] && continue
+    foreign=1
+    ok "found PM2 daemon: $owner ($home)"
+    # Pin the binary the way the owner sees it — pm2 is usually under nvm and
+    # would not be on root's PATH inside the helper.
+    if [ -z "${PM2_BIN:-}" ]; then
+      owner_home=$(getent passwd "$owner" | cut -d: -f6)
+      for bin in /usr/local/bin/pm2 /usr/bin/pm2 \
+                 "$owner_home"/.nvm/versions/node/*/bin/pm2 \
+                 "$owner_home"/.npm-global/bin/pm2 "$owner_home"/.yarn/bin/pm2; do
+        [ -x "$bin" ] && { PM2_BIN=$bin; break; }
+      done
+      [ -z "${PM2_BIN:-}" ] && PM2_BIN=$(command -v pm2 2>/dev/null || true)
+    fi
+  done <<< "$daemons"
+
+  [ "$foreign" = 1 ] || return 0
+
+  if [ ! -f "$DIR/monit-pm2.sh" ]; then
+    warn "monit-pm2.sh is missing from the agent directory — PM2 will show as unreadable"
+    return 0
+  fi
+  install -m 0755 -o root -g root "$DIR/monit-pm2.sh" /opt/monit/monit-pm2.sh
+
+  if [ -n "${PM2_BIN:-}" ]; then
+    printf '# written by monit install.sh — root-owned on purpose\nMONIT_PM2_BIN=%s\n' "$PM2_BIN" \
+      > /etc/monit/pm2.conf
+    chown root:root /etc/monit/pm2.conf; chmod 0644 /etc/monit/pm2.conf
+    ok "pinned pm2 binary: $PM2_BIN"
+  fi
+
+  if ! command -v sudo >/dev/null 2>&1; then
+    warn "sudo is not installed — PM2 belonging to another user cannot be read"
+    return 0
+  fi
+  cat > /etc/sudoers.d/monit-agent <<'SUDO'
+# Lets the monit agent read PM2 state owned by another user.
+# The helper is root-owned 0755 and can only run `pm2 jlist`.
+monit ALL=(root) NOPASSWD: /opt/monit/monit-pm2.sh
+SUDO
+  chmod 0440 /etc/sudoers.d/monit-agent
+  if command -v visudo >/dev/null 2>&1 && ! visudo -cf /etc/sudoers.d/monit-agent >/dev/null 2>&1; then
+    rm -f /etc/sudoers.d/monit-agent
+    warn "the sudoers rule did not validate and was removed — PM2 will show as unreadable"
+    return 0
+  fi
+  ok "granted 'monit' read-only access to PM2 (sudoers.d/monit-agent)"
+  # sudo is setuid, which NoNewPrivileges forbids — the unit is written without
+  # it when this path is in use.
+  PM2_SUDO=1
+}
+setup_pm2_access
+
 # --- 6. send one real sample before enabling anything ------------------------
 info "sending a test sample…"
 PAYLOAD=$(runuser -u monit -- bash /opt/monit/monit-agent.sh --print 2>/dev/null \
@@ -232,7 +307,16 @@ elif command -v systemctl >/dev/null 2>&1; then
     warn "switched from cron to the systemd loop — the cron job was removed"
   fi
   rm -f /etc/monit/cron.disabled
-  install -m 0644 "$DIR/monit-agent.service" /etc/systemd/system/monit-agent.service
+  if [ "${PM2_SUDO:-0}" = 1 ]; then
+    # sudo is setuid, and NoNewPrivileges=true makes every setuid exec fail — the
+    # PM2 helper would silently return nothing. Everything else stays hardened.
+    sed 's/^NoNewPrivileges=true$/# NoNewPrivileges disabled: the PM2 helper runs through sudo\nNoNewPrivileges=false/' \
+      "$DIR/monit-agent.service" > /etc/systemd/system/monit-agent.service
+    chmod 0644 /etc/systemd/system/monit-agent.service
+    warn "NoNewPrivileges disabled so the agent can read PM2 through sudo"
+  else
+    install -m 0644 "$DIR/monit-agent.service" /etc/systemd/system/monit-agent.service
+  fi
   systemctl daemon-reload
   systemctl enable --now monit-agent.service
   sleep 3

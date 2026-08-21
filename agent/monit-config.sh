@@ -8,12 +8,13 @@
 #   sudo /opt/monit/monit-config.sh -i 30        # sample every 30 s
 #   sudo /opt/monit/monit-config.sh -H "http://127.0.0.1:8084/health"
 #   sudo /opt/monit/monit-config.sh -k sk_agent_new…   # after rotating the key
+#   sudo /opt/monit/monit-config.sh --pm2        # let the agent read another user's PM2
 #
 #   -i SECONDS   sample interval          -n "IF1 IF2"  network interfaces
 #   -H URLS      HTTP checks (comma sep)  -u URL        central server URL
 #   -k KEY       API key                  -g auto|1|0   GPU collection
 #   -b N         buffer file cap          -s            show and exit
-#   -y           no confirmation prompt
+#   -y           no confirmation prompt    --pm2         grant PM2 read access
 #
 # Every change is written to /etc/monit/agent.conf, verified with a real sample,
 # and the service restarted — so a bad value is caught here, not hours later.
@@ -28,6 +29,14 @@ info() { printf '\033[36m▸\033[0m %s\n' "$*"; }
 ok()   { printf '\033[32m✓\033[0m %s\n' "$*"; }
 warn() { printf '\033[33m!\033[0m %s\n' "$*"; }
 die()  { printf '\033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
+
+# getopts does not do long options; pull --pm2 out first.
+PM2_FIX=0
+_args=()
+for _a in "$@"; do
+  case $_a in --pm2) PM2_FIX=1 ;; *) _args+=("$_a") ;; esac
+done
+set -- ${_args[@]+"${_args[@]}"}
 
 while getopts "i:H:n:u:k:g:b:syh" opt; do
   case $opt in
@@ -45,6 +54,94 @@ done
 [ -f "$CONF" ] || die "$CONF not found — run install.sh first"
 
 get() { grep -E "^$1=" "$CONF" | head -1 | cut -d= -f2- | sed 's/^"//; s/"$//'; }
+
+# --- PM2 access ---------------------------------------------------------------
+# PM2 keeps its state in a per-user daemon and refuses to serve a socket it does
+# not own, so the 'monit' user reaches an empty daemon of its own and the
+# dashboard shows "0 online". Grant a narrow NOPASSWD rule for one helper that
+# can only run `pm2 jlist`.
+grant_pm2() {
+  local daemons owner home foreign=0 bin owner_home
+  daemons=$(ps -eo user:32,args 2>/dev/null | awk '
+    /God Daemon/ && !/awk/ {
+      if (match($0, /\(([^)]*\.pm2[^)]*)\)/))
+        printf "%s\t%s\n", $1, substr($0, RSTART + 1, RLENGTH - 2)
+    }' | sort -u)
+  [ -n "$daemons" ] || die "no PM2 daemon is running on this host.
+   start your apps first (pm2 list), then re-run: sudo $0 --pm2"
+
+  while IFS=$'\t' read -r owner home; do
+    [ -z "$owner" ] && continue
+    ok "found PM2 daemon: $owner ($home)"
+    [ "$owner" = monit ] && continue
+    foreign=1
+    if [ -z "${bin:-}" ]; then
+      owner_home=$(getent passwd "$owner" | cut -d: -f6)
+      for c in /usr/local/bin/pm2 /usr/bin/pm2 \
+               "$owner_home"/.nvm/versions/node/*/bin/pm2 \
+               "$owner_home"/.npm-global/bin/pm2 "$owner_home"/.yarn/bin/pm2; do
+        [ -x "$c" ] && { bin=$c; break; }
+      done
+      [ -z "${bin:-}" ] && bin=$(command -v pm2 2>/dev/null || true)
+    fi
+  done <<< "$daemons"
+
+  if [ "$foreign" = 0 ]; then
+    ok "PM2 already belongs to 'monit' — no extra access needed"
+    return 0
+  fi
+
+  [ -x /opt/monit/monit-pm2.sh ] || die "/opt/monit/monit-pm2.sh is missing.
+   update the agent first:  ./deploy-agent.sh <target> -u     (from the central server)"
+  chown root:root /opt/monit/monit-pm2.sh; chmod 0755 /opt/monit/monit-pm2.sh
+
+  if [ -n "${bin:-}" ]; then
+    printf '# written by monit-config.sh — root-owned on purpose\nMONIT_PM2_BIN=%s\n' "$bin" \
+      > /etc/monit/pm2.conf
+    chown root:root /etc/monit/pm2.conf; chmod 0644 /etc/monit/pm2.conf
+    ok "pinned pm2 binary: $bin"
+  fi
+
+  command -v sudo >/dev/null 2>&1 || die "sudo is not installed — cannot grant PM2 access"
+  cat > /etc/sudoers.d/monit-agent <<'SUDO'
+# Lets the monit agent read PM2 state owned by another user.
+# The helper is root-owned 0755 and can only run `pm2 jlist`.
+monit ALL=(root) NOPASSWD: /opt/monit/monit-pm2.sh
+SUDO
+  chmod 0440 /etc/sudoers.d/monit-agent
+  if command -v visudo >/dev/null 2>&1 && ! visudo -cf /etc/sudoers.d/monit-agent >/dev/null 2>&1; then
+    rm -f /etc/sudoers.d/monit-agent
+    die "the sudoers rule did not validate and was removed"
+  fi
+  ok "granted 'monit' read-only access to PM2"
+
+  # sudo is setuid; NoNewPrivileges=true forbids that, so the helper would
+  # silently return nothing. Everything else in the unit stays hardened.
+  local unit=/etc/systemd/system/monit-agent.service
+  if [ -f "$unit" ] && grep -q '^NoNewPrivileges=true' "$unit"; then
+    sed -i 's/^NoNewPrivileges=true$/# disabled: the PM2 helper runs through sudo\nNoNewPrivileges=false/' "$unit"
+    systemctl daemon-reload 2>/dev/null || true
+    warn "NoNewPrivileges disabled in monit-agent.service so sudo can run"
+  fi
+
+  if systemctl list-unit-files monit-agent.service >/dev/null 2>&1; then
+    systemctl restart monit-agent || true
+  fi
+
+  info "checking what the agent can now see…"
+  local seen
+  seen=$(runuser -u monit -- bash "$AGENT" --print 2>/dev/null \
+         | tr ',' '\n' | grep -m1 '"online"' || true)
+  if printf '%s' "$seen" | grep -q 'null'; then
+    warn "PM2 is still unreadable — check: sudo -u monit sudo -n /opt/monit/monit-pm2.sh <owner> <pm2_home>"
+  else
+    ok "PM2 is readable now (${seen:-no output})"
+  fi
+  exit 0
+}
+
+[ "$PM2_FIX" = 1 ] && grant_pm2
+
 
 show() {
   echo

@@ -120,6 +120,53 @@ Each change backs up `agent.conf`, sends a test sample, and restarts the
 service. **If the sample is rejected the config is rolled back**, so a mistyped
 key cannot leave a host silently not reporting.
 
+### PM2 shows "not readable" (or used to show 0 online)
+
+PM2 keeps its state in a **per-user daemon**, and it refuses to serve a socket it
+does not own. The agent runs as the unprivileged `monit` user, so a plain
+`pm2 jlist` reaches a brand-new empty daemon of its own — which is why apps
+started by `root` or a deploy user reported as *0 online / 0 stopped*.
+
+Grant read access once, on the agent host:
+
+```bash
+ssh -t user@host 'sudo /opt/monit/monit-config.sh --pm2'
+```
+
+That finds every running PM2 daemon (their `PM2_HOME` is in the process title),
+pins the `pm2` binary — usually under nvm, so not on root's `PATH` — installs
+
+```
+monit ALL=(root) NOPASSWD: /opt/monit/monit-pm2.sh
+```
+
+and restarts the agent. `monit-pm2.sh` is root-owned `0755` and can do exactly
+one thing: run `pm2 jlist` for an existing `PM2_HOME` owned by the user named on
+the command line. It is not a general sudo grant.
+
+`install.sh` does the same automatically when it sees a foreign PM2 daemon.
+
+Two details worth knowing:
+
+- The systemd unit ships with `NoNewPrivileges=true`, which forbids every setuid
+  exec — including `sudo`. When PM2 access is granted, that one line is flipped
+  to `false`; the rest of the hardening (`ProtectSystem`, `PrivateTmp`, the
+  memory and CPU caps) stays.
+- If the agent still cannot read PM2, it now reports `accessible: false` and the
+  dashboard says **"not readable"** with the owner's name. It never publishes a
+  count it did not measure, and `Service Down` skips those checks rather than
+  firing a false outage.
+
+To point at a pm2 binary in an unusual place, set it root-side:
+
+```bash
+echo 'MONIT_PM2_BIN=/opt/node/bin/pm2' | sudo tee /etc/monit/pm2.conf
+```
+
+Docker gets the same treatment: if `docker ps` fails (socket permissions, daemon
+down) the agent reports the daemon as unreadable instead of "0 containers
+running".
+
 ### Lost the key?
 
 It cannot be looked up — the dashboard stores only its SHA-256 hash. Issue a

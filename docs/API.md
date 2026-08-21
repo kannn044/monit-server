@@ -119,6 +119,12 @@ Metric paths: `cpu.total`, `ram.used_pct`, `ram.free_kb`, `ram.available_kb`,
 A `null` point is a real gap (missing sample, counter reset, or a span too long
 to interpolate) — plot it as a break, not as zero.
 
+The same rule applies to the app-level blocks in a sample. `docker` and `pm2`
+carry an `accessible` flag; when it is `false` the agent could not read that
+daemon, so `running` / `online` are `null` rather than `0`. Alert evaluation
+skips those metrics entirely — an unreadable daemon must never be scored as an
+outage — and `service_down` returns `null` when it had nothing it could check.
+
 ### `GET /servers/:id/series` — multi-series for charts
 
 `kind=cpu|ram|disk|net|load|gpu|gpuvram`, plus `from`/`to`. Returns

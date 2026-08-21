@@ -132,7 +132,14 @@ watch(id, () => { info.value = null; charts.value = {}; loadInfo(); loadCharts()
       <div class="card" v-if="summary">
         <h2>Application health</h2>
         <template v-if="summary.docker?.present">
-          <h3 class="muted" style="font-size: 12px; margin: 8px 0 4px">Docker — {{ summary.docker.running }}/{{ summary.docker.total }} running</h3>
+          <h3 class="muted" style="font-size: 12px; margin: 8px 0 4px">
+            Docker — <template v-if="summary.docker.accessible === false">not readable</template>
+            <template v-else>{{ summary.docker.running }}/{{ summary.docker.total }} running</template>
+          </h3>
+          <div v-if="summary.docker.accessible === false" class="unreadable">
+            The agent cannot reach the Docker daemon, so container state is unknown — it is not being
+            reported as down.<span v-if="summary.docker.reason" class="mono"> {{ summary.docker.reason }}</span>
+          </div>
           <table>
             <tbody>
               <tr v-for="c in (summary.docker.containers || []).slice(0, 20)" :key="c.name">
@@ -144,7 +151,20 @@ watch(id, () => { info.value = null; charts.value = {}; loadInfo(); loadCharts()
           </table>
         </template>
         <template v-if="summary.pm2?.present">
-          <h3 class="muted" style="font-size: 12px; margin: 12px 0 4px">PM2 — {{ summary.pm2.online }} online / {{ summary.pm2.stopped }} stopped</h3>
+          <h3 class="muted" style="font-size: 12px; margin: 12px 0 4px">
+            PM2 —
+            <template v-if="summary.pm2.accessible === false">not readable</template>
+            <template v-else>{{ summary.pm2.online }} online / {{ summary.pm2.stopped }} stopped</template>
+          </h3>
+          <!-- PM2's daemon is per-user and only answers its owner, so an agent
+               running as 'monit' reaches an empty daemon of its own. Say that,
+               rather than publishing a zero we never actually measured. -->
+          <div v-if="summary.pm2.accessible === false" class="unreadable">
+            A PM2 daemon is running<span v-if="summary.pm2.owners?.length"> (owner:
+            <b>{{ summary.pm2.owners.join(', ') }}</b>)</span> but the agent cannot read it, so process
+            state is unknown — it is not being reported as down.
+            <div v-if="summary.pm2.reason" class="fix">Fix: <span class="mono">{{ summary.pm2.reason }}</span></div>
+          </div>
           <table>
             <tbody>
               <tr v-for="p in (summary.pm2.processes || []).slice(0, 20)" :key="p.name">
@@ -210,3 +230,13 @@ watch(id, () => { info.value = null; charts.value = {}; loadInfo(); loadCharts()
     </div>
   </template>
 </template>
+
+<style scoped>
+.unreadable {
+  font-size: 12px; color: var(--ink-2); line-height: 1.5;
+  background: color-mix(in oklab, var(--warning) 9%, transparent);
+  border-left: 3px solid var(--warning); border-radius: 0 8px 8px 0;
+  padding: 8px 11px; margin: 4px 0 8px;
+}
+.unreadable .fix { margin-top: 4px; color: var(--muted); }
+</style>

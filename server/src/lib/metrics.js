@@ -55,8 +55,10 @@ export function extractMetric(path, sample, ctx = {}) {
         .filter((x) => x !== null);
       return v.length ? Math.max(...v) : null;
     }
-    case 'docker.running':   return num(docker?.running);
-    case 'pm2.online':       return num(pm2?.online);
+    // accessible === false means the agent could not read the daemon at all.
+    // Returning 0 there would fire "nothing is running" on a healthy host.
+    case 'docker.running':   return docker?.accessible === false ? null : num(docker?.running);
+    case 'pm2.online':       return pm2?.accessible === false ? null : num(pm2?.online);
     case 'http.status_code': { // worst check: any non-200 wins (returns that code)
       const checks = arr(http);
       if (!checks.length) return null;
@@ -88,16 +90,22 @@ export function extractMetric(path, sample, ctx = {}) {
       const expected = ctx.expected || [];
       if (!expected.length) return null;
       let down = 0;
+      let checked = 0;
       for (const e of expected) {
         if (e.kind === 'docker') {
+          // Unreadable ≠ down. Skip the check rather than invent an outage.
+          if (docker?.accessible === false) continue;
+          checked++;
           const c = arr(docker?.containers).find((x) => x.name === e.name);
           if (!c || c.state !== 'running') down++;
         } else if (e.kind === 'pm2') {
+          if (pm2?.accessible === false) continue;
+          checked++;
           const p = arr(pm2?.processes).find((x) => x.name === e.name);
           if (!p || p.status !== 'online') down++;
         }
       }
-      return down;
+      return checked ? down : null;
     }
     // no_sample: seconds since last sample (computed by the caller from last_seen)
     case 'no_sample':        return ctx.noSampleSeconds ?? null;

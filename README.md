@@ -113,10 +113,11 @@ cd dashboard && npm install && npm run dev
 | `server/src/lib/` | metric extraction, health computation, auth helpers |
 | `server/migrations/` | SQL migrations (run in filename order) |
 | `dashboard/src/views/` | Fleet, ServerDetail, Incidents, Rules, Projects, Settings |
-| `docs/` | [API](docs/API.md) · [agents](docs/AGENTS.md) · [operations](docs/OPERATIONS.md) · [nginx](docs/NGINX.md) · [decisions](docs/DECISIONS.md) |
+| `docs/` | [API](docs/API.md) · [agents](docs/AGENTS.md) · [operations](docs/OPERATIONS.md) · [telegram](docs/TELEGRAM.md) · [nginx](docs/NGINX.md) · [decisions](docs/DECISIONS.md) |
 | `setup-db.sh` | one-command setup against an existing PostgreSQL container |
 | `deploy-agent.sh` | push + install the agent on a target host over ssh |
 | `prune-metrics.sh` | cron-friendly retention when not using TimescaleDB |
+| `check-telegram.sh` | diagnose why Telegram alerts are not arriving |
 
 ---
 

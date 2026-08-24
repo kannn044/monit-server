@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted } from 'vue';
+import { ref, onMounted, computed } from 'vue';
 import { api } from '../api.js';
 import { useAuth } from '../stores/auth.js';
 
@@ -10,6 +10,10 @@ const projects = ref([]);
 const servers = ref([]);
 const error = ref('');
 const editing = ref(null);
+
+// Rules that fire but notify nobody — the most common "alerts do not arrive"
+// cause, and nothing else on screen makes it visible.
+const silentRules = computed(() => rules.value.filter((r) => r.enabled && !(r.channels || []).length));
 
 const METRICS = [
   ['cpu.total', 'CPU total %'], ['ram.used_pct', 'RAM used %'], ['ram.available_kb', 'RAM available (KB)'],
@@ -83,6 +87,11 @@ async function toggle(r) {
     <button v-if="auth.isAdmin" class="primary" @click="edit(null)">New rule</button>
   </div>
   <div v-if="error" class="error-banner">{{ error }}</div>
+  <div v-if="silentRules.length" class="notice">
+    {{ silentRules.length }} of {{ rules.length }} rules have no notification channel — they will open
+    incidents in the dashboard but send nothing.
+    <span v-if="!channels.length"> Add a channel in <router-link to="/settings">Settings</router-link> first.</span>
+  </div>
 
   <div class="card">
     <table>
@@ -96,7 +105,14 @@ async function toggle(r) {
           <td class="num">{{ r.duration_min }} min</td>
           <td><span class="badge" :class="r.severity === 'critical' ? 'critical' : r.severity === 'warning' ? 'warning' : 'offline'">{{ r.severity }}</span></td>
           <td class="muted">{{ r.scope_type }}{{ r.scope_ids?.length ? ` (${r.scope_ids.length})` : '' }}</td>
-          <td class="muted">{{ (r.channels || []).join(', ') || '—' }}</td>
+          <!-- A rule with no channel still opens incidents; it just never
+               notifies anyone. That is invisible until an outage, so name it. -->
+          <td>
+            <span v-if="(r.channels || []).length" class="muted">{{ r.channels.join(', ') }}</span>
+            <span v-else class="nochan" :title="channels.length
+              ? 'This rule opens incidents but sends no notification. Edit it and pick a channel.'
+              : 'No notification channels exist yet — add one in Settings.'">no channel</span>
+          </td>
           <td><span class="badge" :class="r.enabled ? 'online' : 'offline'">{{ r.enabled ? 'on' : 'off' }}</span></td>
           <td>
             <template v-if="auth.isAdmin">
@@ -180,6 +196,12 @@ async function toggle(r) {
 </template>
 
 <style scoped>
+.notice {
+  background: color-mix(in oklab, var(--warning) 10%, transparent);
+  border: 1px solid color-mix(in oklab, var(--warning) 40%, var(--border));
+  border-radius: 10px; padding: 9px 12px; margin-bottom: 12px; font-size: 13px;
+}
+.nochan { color: var(--warning); font-weight: 600; font-size: 12px; cursor: help; }
 .modal-wrap { position: fixed; inset: 0; background: rgba(0,0,0,0.45); display: grid; place-items: center; z-index: 40; }
 .modal { width: 640px; max-width: 94vw; max-height: 90vh; overflow: auto; display: flex; flex-direction: column; gap: 10px; }
 </style>

@@ -179,7 +179,7 @@ running cluster.
 | Ingest 403 | `MONIT_SERVER_ID` ≠ the registered `server_id` |
 | Ingest 429 | interval too short, or two agents sharing one `server_id` |
 | Charts empty but server online | wait one aggregate refresh (1 min), or query with `bucket=raw` |
-| Alerts fire but nothing arrives | Settings → **Test** the channel; then `/notification-log` and `notification_dead_letter` |
+| Alerts fire but nothing arrives | usually the rule has no channel — Alert rules page flags them as **no channel**. See [TELEGRAM.md](TELEGRAM.md) |
 | Notification stuck retrying | pg_boss retries 5× with backoff, then dead-letters; inspect `pgboss.job` |
 | Migration warns about timescaledb | extension missing — the fallback views work, but install TimescaleDB for production |
 | PM2 says **not readable** (or used to say 0 online) | the daemon belongs to another user — `sudo /opt/monit/monit-config.sh --pm2` on that host ([AGENTS](AGENTS.md)) |

@@ -164,6 +164,7 @@ On the central server, in the project directory:
 ./check-telegram.sh -t           # also send a real test message
 ./check-telegram.sh -f           # attach the channel to every rule that has none
 ./check-telegram.sh --fix-token  # strip stray whitespace / a 'bot' prefix from the stored token
+./check-telegram.sh --set-token  # paste a fresh token (hidden), verified before it is stored
 ```
 
 It walks the delivery path in the order things actually break and names the fix:
@@ -255,6 +256,39 @@ so rather than pretending:
 ✗ still malformed after stripping whitespace — the token is incomplete, not just dirty
    re-copy the whole line from @BotFather (/mybots → your bot → API Token)
 ```
+
+### Right shape, wrong length → 401
+
+Telegram's secret half is **always exactly 35 characters**. A token carrying one
+extra character still *parses*, so Telegram answers 401 rather than 404 — which
+reads as "wrong password" when the real problem is one stray keystroke. The
+script measures both halves:
+
+```
+✗ telegram-ops — bot_token has the right SHAPE but the wrong LENGTH (47 chars total)
+   bot id: 10 digits   secret after the colon: 36 chars (Telegram always issues exactly 35)
+   → 36 is 1 too many — an extra character came along with the paste.
+```
+
+### Replacing the token safely
+
+`--set-token` takes it typed in, hidden, and **checks it with Telegram before
+storing** — so a bad paste can never replace a credential that works:
+
+```
+$ ./check-telegram.sh --set-token
+Setting a new bot token for 'telegram-ops'
+   Get it from @BotFather: /mybots → your bot → API Token
+   paste the token (input hidden):
+▸ checking it with Telegram before storing…
+✓ Telegram accepts it — @acme_monit_alerts_bot
+✓ stored for channel 'telegram-ops'
+✓ test message delivered to chat 8647538703 — look in Telegram
+```
+
+It refuses, leaving the stored value untouched, when the paste has the wrong
+length or Telegram rejects it. The value never reaches shell history or a web
+form.
 
 Independently of the repair, the app itself now strips whitespace and a stray
 `bot` prefix before calling Telegram, so a pasted-in space no longer breaks

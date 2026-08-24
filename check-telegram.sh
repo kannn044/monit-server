@@ -17,6 +17,7 @@
 #   ./check-telegram.sh -t           # diagnose, then send a test message
 #   ./check-telegram.sh -f           # also offer to attach the channel to silent rules
 #   ./check-telegram.sh --fix-token  # strip stray whitespace / 'bot' prefix from the stored token
+#   ./check-telegram.sh --set-token  # paste a fresh token (hidden), verified before it is stored
 #
 #   -c NAME   PostgreSQL container name (default: auto-detect)
 #   -a NAME   app container name (default: auto-detect)
@@ -26,6 +27,7 @@
 #   -t        send a test message through each enabled telegram channel
 #   -f        attach the first enabled telegram channel to every rule that has none
 #   -T        (--fix-token) repair a token damaged by copy-paste, then send a test
+#             (--set-token) prompt for a new token, check it with Telegram, then store it
 #
 set -euo pipefail
 
@@ -36,8 +38,13 @@ cd "$(dirname "$0")"
 # getopts has no long options; pull the long ones out first.
 FIX_TOKEN=0
 _args=()
+SET_TOKEN=0
 for _a in "$@"; do
-  case $_a in --fix-token) FIX_TOKEN=1 ;; *) _args+=("$_a") ;; esac
+  case $_a in
+    --fix-token) FIX_TOKEN=1 ;;
+    --set-token) SET_TOKEN=1 ;;
+    *) _args+=("$_a") ;;
+  esac
 done
 set -- ${_args[@]+"${_args[@]}"}
 
@@ -46,7 +53,7 @@ while getopts "c:a:n:U:LtfTh" opt; do
     c) CONTAINER=$OPTARG ;; a) APP=$OPTARG ;;  n) DBNAME=$OPTARG ;;
     U) DBROLE=$OPTARG ;;   L) LOCAL=1 ;;       t) SEND_TEST=1 ;;
     f) FIX=1 ;;          T) FIX_TOKEN=1 ;;
-    h) sed -n '3,31p' "$0"; exit 0 ;;
+    h) sed -n '3,32p' "$0"; exit 0 ;;
     *) echo "run '$0 -h' for usage" >&2; exit 2 ;;
   esac
 done
@@ -115,12 +122,17 @@ CHANNEL_SQL="
   SELECT name, enabled,
          COALESCE(config->>'bot_token',''), COALESCE(config->>'chat_id',''),
          length(COALESCE(config->>'bot_token','')),
-         CASE WHEN COALESCE(config->>'bot_token','') ~ '^[0-9]{5,16}:[A-Za-z0-9_-]{30,}\$'
-              THEN 'ok' ELSE 'malformed' END,
+         CASE WHEN COALESCE(config->>'bot_token','') ~ '^[0-9]{5,16}:[A-Za-z0-9_-]{35}\$'
+              THEN 'ok'
+              WHEN COALESCE(config->>'bot_token','') ~ '^[0-9]{5,16}:[A-Za-z0-9_-]+\$'
+              THEN 'wronglen' ELSE 'malformed' END,
          CASE WHEN COALESCE(config->>'bot_token','') ~ '\s' THEN 'yes' ELSE 'no' END,
          CASE WHEN lower(COALESCE(config->>'bot_token','')) LIKE 'bot%' THEN 'yes' ELSE 'no' END,
          CASE WHEN COALESCE(config->>'bot_token','') ~ '[^\x20-\x7E]' THEN 'yes' ELSE 'no' END,
-         CASE WHEN COALESCE(config->>'chat_id','') ~ '\s' THEN 'yes' ELSE 'no' END
+         CASE WHEN COALESCE(config->>'chat_id','') ~ '\s' THEN 'yes' ELSE 'no' END,
+         -- the two halves, so a wrong length can be pinned to one of them
+         length(split_part(COALESCE(config->>'bot_token',''), ':', 1)),
+         length(split_part(COALESCE(config->>'bot_token',''), ':', 2))
     FROM notify_channels WHERE type = 'telegram' ORDER BY name"
 CHANNELS=$(psql_run "$CHANNEL_SQL")
 
@@ -133,7 +145,7 @@ fi
 read_channels() {
 ACTIVE=""
 TOKEN_BAD=0
-while IFS='|' read -r name enabled token chat tlen tshape twhite tbotpfx tnonascii cwhite; do
+while IFS='|' read -r name enabled token chat tlen tshape twhite tbotpfx tnonascii cwhite idlen seclen; do
   [ -z "$name" ] && continue
   if [ "$enabled" != "t" ]; then warn "$name — DISABLED (Settings → Enabled column)"; continue; fi
   if [ -z "$token" ] || [ -z "$chat" ]; then
@@ -141,19 +153,36 @@ while IFS='|' read -r name enabled token chat tlen tshape twhite tbotpfx tnonasc
     continue
   fi
 
-  # A real token is <5-16 digits>:<35 chars of A-Za-z0-9_->, exactly 45-46 long.
-  if [ "$tshape" = ok ]; then
-    ok "$name — bot_token looks well formed (${tlen} chars)"
-  else
-    TOKEN_BAD=1
-    bad "$name — bot_token is MALFORMED (${tlen} chars; expected about 46, shaped 1234567890:AAH9xQ…)"
-    [ "$tbotpfx"  = yes ] && echo "   → it starts with 'bot'. The URL already adds that prefix; store only the token itself."
-    [ "$twhite"   = yes ] && echo "   → it contains a SPACE or tab. Delete every space, including a trailing one."
-    [ "$tnonascii" = yes ] && echo "   → it contains a non-ASCII character — retype it instead of pasting."
-    if [ "$twhite" = no ] && [ "$tbotpfx" = no ] && [ "$tnonascii" = no ]; then
-      echo "   → it is probably truncated or missing part after the colon. Re-copy the whole line from @BotFather."
-    fi
-  fi
+  # A real token is <bot id digits>:<exactly 35 of A-Za-z0-9_->.
+  case $tshape in
+    ok)
+      ok "$name — bot_token is the right shape (bot id ${idlen} digits, secret ${seclen} chars)"
+      ;;
+    wronglen)
+      # Parses, so Telegram answers 401 rather than 404 — but the secret half is
+      # not 35 characters, so it cannot be a token Telegram ever issued.
+      TOKEN_BAD=1
+      bad "$name — bot_token has the right SHAPE but the wrong LENGTH (${tlen} chars total)"
+      echo "   bot id: ${idlen} digits   secret after the colon: ${seclen} chars (Telegram always issues exactly 35)"
+      if [ "$seclen" -gt 35 ]; then
+        echo "   → ${seclen} is $((seclen - 35)) too many — an extra character came along with the paste."
+      else
+        echo "   → ${seclen} is $((35 - seclen)) short — part of the token was left behind."
+      fi
+      echo "   Telegram will answer 401 for this. Re-copy the token and store it with:"
+      echo "     ./check-telegram.sh --set-token"
+      ;;
+    *)
+      TOKEN_BAD=1
+      bad "$name — bot_token is MALFORMED (${tlen} chars; expected 1234567890:AAH9xQ… with 35 chars after the colon)"
+      [ "$tbotpfx"  = yes ] && echo "   → it starts with 'bot'. The URL already adds that prefix; store only the token itself."
+      [ "$twhite"   = yes ] && echo "   → it contains a SPACE or tab. Delete every space, including a trailing one."
+      [ "$tnonascii" = yes ] && echo "   → it contains a non-ASCII character — retype it instead of pasting."
+      if [ "$twhite" = no ] && [ "$tbotpfx" = no ] && [ "$tnonascii" = no ]; then
+        echo "   → it is probably truncated or missing part after the colon. Re-copy the whole line from @BotFather."
+      fi
+      ;;
+  esac
   [ "$cwhite" = yes ] && { TOKEN_BAD=1; bad "$name — chat_id contains whitespace; remove it"; }
 
   case $chat in
@@ -204,6 +233,51 @@ if [ "$FIX_TOKEN" = 1 ]; then
       SEND_TEST=1
     fi
   fi
+fi
+
+# --- replace the token outright ----------------------------------------------
+# Typed straight into the database, so the value never passes through a web form
+# or the shell history, and it is checked against Telegram BEFORE being stored —
+# a bad paste cannot replace a working credential.
+if [ "$SET_TOKEN" = 1 ]; then
+  head_ "Setting a new bot token for '$ACTIVE'"
+  echo "   Get it from @BotFather: /mybots → your bot → API Token"
+  printf '   paste the token (input hidden): '
+  IFS= read -rs NEWTOK || true
+  echo
+  NEWTOK=${NEWTOK//[[:space:]]/}
+  [[ $NEWTOK =~ ^[Bb][Oo][Tt][0-9] ]] && NEWTOK=${NEWTOK:3}
+  if [ -z "$NEWTOK" ]; then
+    die "nothing entered"
+  fi
+  if ! [[ $NEWTOK =~ ^[0-9]{5,16}:[A-Za-z0-9_-]{35}$ ]]; then
+    NID=${NEWTOK%%:*}; NSEC=${NEWTOK#*:}
+    bad "that is not a Telegram token: ${#NEWTOK} chars (bot id ${#NID}, secret ${#NSEC}; the secret must be exactly 35)"
+    echo "   nothing was changed."
+    exit 1
+  fi
+  info "checking it with Telegram before storing…"
+  VERIFY=$(node_run "
+  fetch('https://api.telegram.org/bot$NEWTOK/getMe')
+   .then(r=>r.text().then(b=>console.log(r.status+' '+b.slice(0,300))))
+   .catch(e=>console.log('NETFAIL '+e.message));")
+  case $VERIFY in
+    200*)
+      VBOT=$(printf '%s' "$VERIFY" | sed -n 's/.*"username":"\([^"]*\)".*/\1/p')
+      ok "Telegram accepts it — @${VBOT:-unknown}"
+      ;;
+    401*) bad "Telegram rejected it (401) — that token is wrong or revoked. Nothing was changed."; exit 1 ;;
+    404*) bad "Telegram could not parse it (404). Nothing was changed."; exit 1 ;;
+    *)    bad "could not verify it: $VERIFY — nothing was changed."; exit 1 ;;
+  esac
+  # Safe to interpolate: the value matched ^[0-9:A-Za-z_-]+$ above.
+  psql_run "UPDATE notify_channels SET config = jsonb_set(config,'{bot_token}', to_jsonb(\$\$$NEWTOK\$\$::text))
+             WHERE type = 'telegram' AND name = \$\$$ACTIVE\$\$" >/dev/null
+  ok "stored for channel '$ACTIVE'"
+  CHANNELS=$(psql_run "$CHANNEL_SQL")
+  FAILED=0
+  read_channels
+  SEND_TEST=1
 fi
 
 # --- 2. does Telegram accept the token and the chat? -------------------------

@@ -67,6 +67,7 @@ info() { printf '%s %s\n' "$C_INF" "$*"; }
 head_() { printf '\n\033[1m%s\033[0m\n' "$*"; }
 die()  { printf '%s %s\n' "$C_BAD" "$*" >&2; exit 1; }
 FAILED=0
+LIVE_OK=0
 
 # --- database access ---------------------------------------------------------
 if [ "$LOCAL" = 0 ] && [ -z "$CONTAINER" ] && command -v docker >/dev/null 2>&1 \
@@ -321,7 +322,7 @@ if [ "$SEND_TEST" = 1 ] && [[ $GETME == 200* ]]; then
    .then(r=>r.text().then(b=>console.log(r.status+' '+b.slice(0,300))))
    .catch(e=>console.log('NETFAIL '+e.message));")
   case $SEND in
-    200*) ok "test message delivered to chat $LAST_CHAT — look in Telegram" ;;
+    200*) ok "test message delivered to chat $LAST_CHAT — look in Telegram"; LIVE_OK=1 ;;
     400*chat*not*found*|400*chat_id*)
       bad "chat not found — the id is wrong, or the bot has never been messaged in that chat"
       echo "   private chat: open the bot, press Start, send any message, then:"
@@ -383,15 +384,35 @@ if [ -z "$LOG" ]; then
     echo "   that combination means the rules are not referencing a channel — see section 3"
   fi
 else
+  # These rows are HISTORY. A failure from before a fix must not condemn the
+  # current configuration, so they are listed without failing the run; what
+  # decides the verdict is the most recent attempt, or a live test if one ran.
   while IFS='|' read -r t ch ev res detail; do
     [ -z "$t" ] && continue
     if [ "$res" = sent ]; then ok  "$t  $ch  $ev"
-    else                       bad "$t  $ch  $ev  $detail"; fi
+    else printf '%s %s\n' "$C_BAD" "$t  $ch  $ev  $detail"; fi
   done <<< "$LOG"
+
+  LAST_RESULT=$(psql_run "
+    SELECT CASE WHEN success THEN 'sent' ELSE 'failed' END
+      FROM notification_log ORDER BY created_at DESC LIMIT 1")
+  echo
+  if [ "$LAST_RESULT" = sent ]; then
+    ok "the most recent delivery succeeded"
+  elif [ "$LIVE_OK" = 1 ]; then
+    warn "the failures above pre-date the fix applied just now — a live test message got through"
+    echo "   they stay in the log as history. Trigger a real alert to see a fresh success:"
+    echo "     ssh -t <agent-host> 'sudo systemctl stop monit-agent'   # then start it again"
+  elif [ "$FAILED" = 0 ]; then
+    warn "the last recorded attempt failed, but nothing is wrong with the configuration now"
+    echo "   the log keeps history; send a test to confirm:  ./check-telegram.sh -t"
+  else
+    bad "the most recent delivery attempt failed — see the reason above"
+  fi
 fi
 
-DEAD=$(psql_run "SELECT count(*) FROM notification_dead_letter")
-[ "${DEAD:-0}" -gt 0 ] && warn "$DEAD notifications gave up after retrying (notification_dead_letter)"
+DEAD=$(psql_run "SELECT count(*) FROM notification_dead_letter WHERE created_at > now() - interval '1 day'")
+[ "${DEAD:-0}" -gt 0 ] && warn "$DEAD notifications gave up after retrying in the last 24 h (notification_dead_letter)"
 
 # --- 5. current state --------------------------------------------------------
 head_ "5. Servers currently offline"

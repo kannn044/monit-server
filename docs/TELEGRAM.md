@@ -318,6 +318,21 @@ behind a proxy by adding to the app service in `docker-compose.app-only.yml`:
 Node 20 does not read `HTTPS_PROXY` on its own; if you need a proxy, say so and
 the delivery code can be pointed through an `undici` `ProxyAgent`.
 
+### The log shows old failures after you fixed something
+
+`notification_log` is history, not current state. Rows from before a fix stay
+there forever, so the script judges the **most recent attempt** (and a live test
+message, if one just went through) rather than counting old failures:
+
+```
+✗ 08-24 05:10  telegram-ops  alert.fired  {"error": "HTTP 404: ..."}
+…
+! the failures above pre-date the fix applied just now — a live test message got through
+   they stay in the log as history. Trigger a real alert to see a fresh success.
+```
+
+To see a fresh success, stop and start an agent and let `Server Offline` fire.
+
 ### Alerts fire but nothing arrives
 
 In order of how often it turns out to be each:

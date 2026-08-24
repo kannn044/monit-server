@@ -160,9 +160,10 @@ alerts, it does not lose them.
 On the central server, in the project directory:
 
 ```bash
-./check-telegram.sh          # diagnose
-./check-telegram.sh -t       # also send a real test message
-./check-telegram.sh -f       # attach the channel to every rule that has none
+./check-telegram.sh              # diagnose
+./check-telegram.sh -t           # also send a real test message
+./check-telegram.sh -f           # attach the channel to every rule that has none
+./check-telegram.sh --fix-token  # strip stray whitespace / a 'bot' prefix from the stored token
 ```
 
 It walks the delivery path in the order things actually break and names the fix:
@@ -229,13 +230,36 @@ Verified causes of a 404:
 `./check-telegram.sh` names which one it is without ever printing the token:
 
 ```
-✗ telegram-ops — bot_token is MALFORMED (47 chars; expected about 46, shaped 1234567890:AAH9xQ…)
+✗ telegram-ops — bot_token is MALFORMED (48 chars; expected about 46, shaped 1234567890:AAH9xQ…)
    → it contains a SPACE or tab. Delete every space, including a trailing one.
 ```
 
-The app now strips whitespace and a stray `bot` prefix before calling Telegram,
-so a pasted-in space no longer breaks delivery, and a token that is genuinely
-too short fails with a message that says so instead of a bare 404.
+Whitespace and a `bot` prefix are never part of a real token, so they can be
+removed without guessing — `--fix-token` does exactly that, in place, and then
+sends a test:
+
+```
+Repairing the stored token
+✓ telegram-ops — bot_token looks well formed (46 chars)
+✓ repaired — no restart needed, the notifier reads the channel per send
+
+2. Telegram API
+✓ bot token is valid — @acme_monit_alerts_bot
+✓ test message delivered to chat 8647538703 — look in Telegram
+```
+
+A token that is genuinely *incomplete* cannot be repaired, and the script says
+so rather than pretending:
+
+```
+✗ still malformed after stripping whitespace — the token is incomplete, not just dirty
+   re-copy the whole line from @BotFather (/mybots → your bot → API Token)
+```
+
+Independently of the repair, the app itself now strips whitespace and a stray
+`bot` prefix before calling Telegram, so a pasted-in space no longer breaks
+delivery at all, and a token that is too short fails with a message that says
+so instead of a bare 404.
 
 ### The central server needs outbound HTTPS
 

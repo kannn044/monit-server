@@ -16,6 +16,7 @@
 #   ./check-telegram.sh              # diagnose only
 #   ./check-telegram.sh -t           # diagnose, then send a test message
 #   ./check-telegram.sh -f           # also offer to attach the channel to silent rules
+#   ./check-telegram.sh --fix-token  # strip stray whitespace / 'bot' prefix from the stored token
 #
 #   -c NAME   PostgreSQL container name (default: auto-detect)
 #   -a NAME   app container name (default: auto-detect)
@@ -24,6 +25,7 @@
 #   -L        local mode: use psql on this host with DATABASE_URL
 #   -t        send a test message through each enabled telegram channel
 #   -f        attach the first enabled telegram channel to every rule that has none
+#   -T        (--fix-token) repair a token damaged by copy-paste, then send a test
 #
 set -euo pipefail
 
@@ -31,12 +33,20 @@ CONTAINER=""; APP=""; DBNAME="monit"; DBROLE="postgres"
 LOCAL=0; SEND_TEST=0; FIX=0
 cd "$(dirname "$0")"
 
-while getopts "c:a:n:U:Ltfh" opt; do
+# getopts has no long options; pull the long ones out first.
+FIX_TOKEN=0
+_args=()
+for _a in "$@"; do
+  case $_a in --fix-token) FIX_TOKEN=1 ;; *) _args+=("$_a") ;; esac
+done
+set -- ${_args[@]+"${_args[@]}"}
+
+while getopts "c:a:n:U:LtfTh" opt; do
   case $opt in
     c) CONTAINER=$OPTARG ;; a) APP=$OPTARG ;;  n) DBNAME=$OPTARG ;;
     U) DBROLE=$OPTARG ;;   L) LOCAL=1 ;;       t) SEND_TEST=1 ;;
-    f) FIX=1 ;;
-    h) sed -n '3,29p' "$0"; exit 0 ;;
+    f) FIX=1 ;;          T) FIX_TOKEN=1 ;;
+    h) sed -n '3,31p' "$0"; exit 0 ;;
     *) echo "run '$0 -h' for usage" >&2; exit 2 ;;
   esac
 done
@@ -101,7 +111,7 @@ head_ "1. Notification channels"
 # The token itself is never printed — only facts about it. A malformed token is
 # the difference between Telegram answering 404 (cannot parse it) and 401 (parsed
 # but wrong), so these flags decide the whole diagnosis.
-CHANNELS=$(psql_run "
+CHANNEL_SQL="
   SELECT name, enabled,
          COALESCE(config->>'bot_token',''), COALESCE(config->>'chat_id',''),
          length(COALESCE(config->>'bot_token','')),
@@ -111,7 +121,8 @@ CHANNELS=$(psql_run "
          CASE WHEN lower(COALESCE(config->>'bot_token','')) LIKE 'bot%' THEN 'yes' ELSE 'no' END,
          CASE WHEN COALESCE(config->>'bot_token','') ~ '[^\x20-\x7E]' THEN 'yes' ELSE 'no' END,
          CASE WHEN COALESCE(config->>'chat_id','') ~ '\s' THEN 'yes' ELSE 'no' END
-    FROM notify_channels WHERE type = 'telegram' ORDER BY name")
+    FROM notify_channels WHERE type = 'telegram' ORDER BY name"
+CHANNELS=$(psql_run "$CHANNEL_SQL")
 
 if [ -z "$CHANNELS" ]; then
   bad "no telegram channel exists — Settings → Add channel (type Telegram)"
@@ -119,6 +130,7 @@ if [ -z "$CHANNELS" ]; then
   exit 1
 fi
 
+read_channels() {
 ACTIVE=""
 TOKEN_BAD=0
 while IFS='|' read -r name enabled token chat tlen tshape twhite tbotpfx tnonascii cwhite; do
@@ -154,8 +166,45 @@ while IFS='|' read -r name enabled token chat tlen tshape twhite tbotpfx tnonasc
   [ -z "$ACTIVE" ] && ACTIVE=$name
   LAST_TOKEN=$token; LAST_CHAT=$chat
 done <<< "$CHANNELS"
+}
+read_channels
 
 [ -n "$ACTIVE" ] || { bad "no usable telegram channel"; exit 1; }
+
+# --- repair a copy-paste-damaged token ---------------------------------------
+# Whitespace is never part of a Telegram token, and the "bot" prefix belongs to
+# the URL, not the credential — so both can be removed without guessing. A token
+# that is simply too short cannot be repaired and is left alone.
+if [ "$FIX_TOKEN" = 1 ]; then
+  if [ "$TOKEN_BAD" = 0 ]; then
+    info "token already looks well formed — nothing to repair"
+  else
+    head_ "Repairing the stored token"
+    psql_run "
+      UPDATE notify_channels
+         SET config = jsonb_set(
+               jsonb_set(config, '{bot_token}',
+                 to_jsonb(regexp_replace(
+                   regexp_replace(config->>'bot_token', '\s', '', 'g'),
+                   '^[Bb][Oo][Tt]([0-9])', '\1'))),
+               '{chat_id}', to_jsonb(regexp_replace(COALESCE(config->>'chat_id',''), '\s', '', 'g')))
+       WHERE type = 'telegram'
+         AND (config->>'bot_token' ~ '\s'
+              OR lower(config->>'bot_token') ~ '^bot[0-9]'
+              OR COALESCE(config->>'chat_id','') ~ '\s')" >/dev/null
+    CHANNELS=$(psql_run "$CHANNEL_SQL")
+    FAILED=0
+    read_channels
+    if [ "$TOKEN_BAD" = 1 ]; then
+      bad "still malformed after stripping whitespace — the token is incomplete, not just dirty"
+      echo "   re-copy the whole line from @BotFather (/mybots → your bot → API Token)"
+      echo "   and paste it into Settings → the telegram channel"
+    else
+      ok "repaired — no restart needed, the notifier reads the channel per send"
+      SEND_TEST=1
+    fi
+  fi
+fi
 
 # --- 2. does Telegram accept the token and the chat? -------------------------
 head_ "2. Telegram API"

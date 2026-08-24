@@ -98,9 +98,19 @@ printf '\033[1mTelegram delivery check\033[0m  (%s)\n' "$DBSRC"
 
 # --- 1. channels -------------------------------------------------------------
 head_ "1. Notification channels"
+# The token itself is never printed — only facts about it. A malformed token is
+# the difference between Telegram answering 404 (cannot parse it) and 401 (parsed
+# but wrong), so these flags decide the whole diagnosis.
 CHANNELS=$(psql_run "
   SELECT name, enabled,
-         COALESCE(config->>'bot_token',''), COALESCE(config->>'chat_id','')
+         COALESCE(config->>'bot_token',''), COALESCE(config->>'chat_id',''),
+         length(COALESCE(config->>'bot_token','')),
+         CASE WHEN COALESCE(config->>'bot_token','') ~ '^[0-9]{5,16}:[A-Za-z0-9_-]{30,}\$'
+              THEN 'ok' ELSE 'malformed' END,
+         CASE WHEN COALESCE(config->>'bot_token','') ~ '\s' THEN 'yes' ELSE 'no' END,
+         CASE WHEN lower(COALESCE(config->>'bot_token','')) LIKE 'bot%' THEN 'yes' ELSE 'no' END,
+         CASE WHEN COALESCE(config->>'bot_token','') ~ '[^\x20-\x7E]' THEN 'yes' ELSE 'no' END,
+         CASE WHEN COALESCE(config->>'chat_id','') ~ '\s' THEN 'yes' ELSE 'no' END
     FROM notify_channels WHERE type = 'telegram' ORDER BY name")
 
 if [ -z "$CHANNELS" ]; then
@@ -110,17 +120,30 @@ if [ -z "$CHANNELS" ]; then
 fi
 
 ACTIVE=""
-while IFS='|' read -r name enabled token chat; do
+TOKEN_BAD=0
+while IFS='|' read -r name enabled token chat tlen tshape twhite tbotpfx tnonascii cwhite; do
   [ -z "$name" ] && continue
   if [ "$enabled" != "t" ]; then warn "$name — DISABLED (Settings → Enabled column)"; continue; fi
   if [ -z "$token" ] || [ -z "$chat" ]; then
     bad "$name — missing $( [ -z "$token" ] && printf 'bot_token '; [ -z "$chat" ] && printf 'chat_id' )"
     continue
   fi
-  case $token in
-    [0-9]*:*) ;;
-    *) warn "$name — bot_token does not look like a Telegram token (expected 1234567890:AA…)" ;;
-  esac
+
+  # A real token is <5-16 digits>:<35 chars of A-Za-z0-9_->, exactly 45-46 long.
+  if [ "$tshape" = ok ]; then
+    ok "$name — bot_token looks well formed (${tlen} chars)"
+  else
+    TOKEN_BAD=1
+    bad "$name — bot_token is MALFORMED (${tlen} chars; expected about 46, shaped 1234567890:AAH9xQ…)"
+    [ "$tbotpfx"  = yes ] && echo "   → it starts with 'bot'. The URL already adds that prefix; store only the token itself."
+    [ "$twhite"   = yes ] && echo "   → it contains a SPACE or tab. Delete every space, including a trailing one."
+    [ "$tnonascii" = yes ] && echo "   → it contains a non-ASCII character — retype it instead of pasting."
+    if [ "$twhite" = no ] && [ "$tbotpfx" = no ] && [ "$tnonascii" = no ]; then
+      echo "   → it is probably truncated or missing part after the colon. Re-copy the whole line from @BotFather."
+    fi
+  fi
+  [ "$cwhite" = yes ] && { TOKEN_BAD=1; bad "$name — chat_id contains whitespace; remove it"; }
+
   case $chat in
     -100*) ok "$name — enabled, chat_id $chat (supergroup)" ;;
     -*)    ok "$name — enabled, chat_id $chat (group)" ;;
@@ -147,7 +170,18 @@ case $GETME in
     BOTNAME=$(printf '%s' "$GETME" | sed -n 's/.*"username":"\([^"]*\)".*/\1/p')
     ok "bot token is valid — @${BOTNAME:-unknown}"
     ;;
-  401*) bad "bot token rejected (401 Unauthorized) — re-copy it from @BotFather (/mybots → API Token)" ;;
+  401*) bad "bot token rejected (401 Unauthorized) — the token is well formed but wrong or revoked.
+   re-copy it from @BotFather: /mybots → your bot → API Token" ;;
+  404*)
+    bad "Telegram answered 404 Not Found — it could not parse the token at all"
+    echo "   404 is NOT 'wrong password'. It means the token is malformed, so the API URL"
+    echo "   /bot<token>/getMe is not a valid route. Almost always one of:"
+    echo "     · a stray SPACE inside or at the end of the token (most common when pasting)"
+    echo "     · the value was saved with a 'bot' prefix — store only 1234567890:AAH9xQ…"
+    echo "     · only part of the token was copied"
+    echo "   Fix: Settings → delete the telegram channel → add it again, pasting the token"
+    echo "   in one go from @BotFather (/mybots → API Token), with nothing before or after."
+    ;;
   NETFAIL*|SKIP*)
     bad "cannot reach api.telegram.org from the app container"
     echo "   ${GETME#NETFAIL }"
@@ -238,14 +272,19 @@ DEAD=$(psql_run "SELECT count(*) FROM notification_dead_letter")
 
 # --- 5. current state --------------------------------------------------------
 head_ "5. Servers currently offline"
-psql_run "
+OFFLINE=$(psql_run "
   SELECT id, COALESCE(to_char(last_seen,'MM-DD HH24:MI'),'never')
     FROM servers
    WHERE archived_at IS NULL
      AND (last_seen IS NULL OR last_seen < now() - interval '60 seconds')
-   ORDER BY id" | while IFS='|' read -r id seen; do
-     [ -n "$id" ] && info "$id — last seen $seen"
-   done
+   ORDER BY id")
+if [ -z "$OFFLINE" ]; then
+  ok "none — every server is reporting"
+else
+  while IFS='|' read -r id seen; do
+    [ -n "$id" ] && info "$id — last seen $seen"
+  done <<< "$OFFLINE"
+fi
 
 echo
 if [ "$FAILED" = 1 ]; then

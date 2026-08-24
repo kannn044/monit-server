@@ -32,24 +32,41 @@ function renderText(p) {
   return lines.filter(Boolean).join('\n');
 }
 
+// Credentials get pasted into a web form, and a copied token routinely carries a
+// trailing space or an invisible character. Whitespace is never part of any of
+// these values, so strip it rather than sending a URL Telegram cannot parse.
+const clean = (v) => (typeof v === 'string' ? v.replace(/\s+/g, '').trim() : v);
+
 export async function deliver(channel, payload) {
   const cfg = channel.config || {};
   switch (channel.type) {
     case 'telegram': {
-      if (!cfg.bot_token || !cfg.chat_id) throw new Error('telegram channel needs config.bot_token and config.chat_id');
-      return post(`https://api.telegram.org/bot${cfg.bot_token}/sendMessage`, {
-        chat_id: cfg.chat_id,
+      // The URL already supplies the "bot" prefix; people paste it in anyway.
+      const token = clean(cfg.bot_token).replace(/^bot(?=\d)/i, '');
+      const chatId = clean(cfg.chat_id);
+      if (!token || !chatId) throw new Error('telegram channel needs config.bot_token and config.chat_id');
+      // Telegram answers 404 (not 401) for a token it cannot parse, which reads
+      // as "the API is down" rather than "your token is wrong". Say it plainly.
+      if (!/^\d{5,16}:[A-Za-z0-9_-]{30,}$/.test(token)) {
+        throw new Error(
+          `telegram bot_token is malformed (${token.length} chars) — expected 1234567890:AAH9xQ…; ` +
+          're-copy it from @BotFather (/mybots → API Token)');
+      }
+      return post(`https://api.telegram.org/bot${token}/sendMessage`, {
+        chat_id: chatId,
         text: renderText(payload),
         disable_web_page_preview: true,
       });
     }
     case 'slack': {
-      if (!cfg.webhook_url) throw new Error('slack channel needs config.webhook_url');
-      return post(cfg.webhook_url, { text: renderText(payload) });
+      const url = clean(cfg.webhook_url);
+      if (!url) throw new Error('slack channel needs config.webhook_url');
+      return post(url, { text: renderText(payload) });
     }
     case 'webhook': {
-      if (!cfg.url) throw new Error('webhook channel needs config.url');
-      return post(cfg.url, payload, cfg.headers || {});
+      const url = clean(cfg.url);
+      if (!url) throw new Error('webhook channel needs config.url');
+      return post(url, payload, cfg.headers || {});
     }
     default:
       throw new Error(`unknown channel type ${channel.type}`);

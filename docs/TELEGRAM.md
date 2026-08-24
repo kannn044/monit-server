@@ -196,11 +196,46 @@ The **Test** button surfaces Telegram's own error text.
 
 | What Test says | Meaning | Fix |
 |---|---|---|
-| `HTTP 401: {"ok":false,...,"description":"Unauthorized"}` | the bot token is wrong or was revoked | re-copy it from BotFather (`/mybots` → your bot → API Token) |
+| `HTTP 401: {"ok":false,...,"description":"Unauthorized"}` | the token is **well formed but wrong** or was revoked | re-copy it from BotFather (`/mybots` → your bot → API Token) |
+| `HTTP 404: {"ok":false,...,"description":"Not Found"}` | the token is **malformed** — Telegram cannot parse it, so `/bot<token>/…` is not a route | see below |
 | `HTTP 400: ..."description":"Bad Request: chat not found"` | wrong chat id, or the bot was never messaged in that chat | send a message in the chat, re-run `getUpdates`, use the id verbatim including `-100…` |
 | `HTTP 403: ..."bot was kicked from the group chat"` | the bot was removed | add it back and make it an admin |
 | `telegram channel needs config.bot_token and config.chat_id` | a field was left blank | fill both in Settings |
 | `fetch failed` / `ETIMEDOUT` / `ENOTFOUND` | the central server has no route to `api.telegram.org` | see below |
+
+### 404 Not Found — the token is malformed
+
+404 and 401 mean different things and it is worth being precise, because 404
+looks like "Telegram is down" when it is really "this string is not a token":
+
+| Telegram says | Token parsed? | Meaning |
+|---|---|---|
+| `401 Unauthorized` | yes | the token is a valid *shape* but wrong or revoked |
+| `404 Not Found` | **no** | the token is malformed — whitespace, a `bot` prefix, or truncated |
+
+A real token is about **46 characters**: 5–16 digits, a colon, then 35
+characters of `A-Z a-z 0-9 _ -`, e.g. `7712345678:AAH9xQwErTyUiOpAsDfGhJkLzXcVbNm1234`.
+
+Verified causes of a 404:
+
+| Stored value | Result |
+|---|---|
+| `…Nm1234` + a trailing space | **404** |
+| a space anywhere inside | **404** |
+| saved as `bot7712345678:AA…` | **404** |
+| only part of it copied | **404** |
+| a trailing newline | fine — URLs drop newlines |
+
+`./check-telegram.sh` names which one it is without ever printing the token:
+
+```
+✗ telegram-ops — bot_token is MALFORMED (47 chars; expected about 46, shaped 1234567890:AAH9xQ…)
+   → it contains a SPACE or tab. Delete every space, including a trailing one.
+```
+
+The app now strips whitespace and a stray `bot` prefix before calling Telegram,
+so a pasted-in space no longer breaks delivery, and a token that is genuinely
+too short fails with a message that says so instead of a bare 404.
 
 ### The central server needs outbound HTTPS
 

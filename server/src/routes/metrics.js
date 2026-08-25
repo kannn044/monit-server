@@ -181,7 +181,15 @@ export default async function metricsRoutes(app) {
   });
 
   // Fleet landing page
-  app.get('/api/v1/fleet/health', { preHandler: requireRole('viewer') }, async () => {
+  // The Fleet page polls this every 10 s, so everything in it is on the hot path.
+  // `top` and `sparkline_24h` are opt-in (?include=top,sparkline): the sparkline
+  // aggregated 24 h of RAW samples through the metrics_1m view, which on plain
+  // PostgreSQL is not materialised — a full scan of system_metrics (1.6 s over
+  // 1.7 M rows) for a chart the dashboard does not draw.
+  app.get('/api/v1/fleet/health', { preHandler: requireRole('viewer') }, async (req) => {
+    const include = String(req.query.include || '').split(',').map((x) => x.trim());
+    const wantSpark = include.includes('sparkline');
+    const wantTop = include.includes('top') || wantSpark;
     const servers = await serversWithHealth({});
     const counts = {
       total: servers.length,
@@ -215,16 +223,24 @@ export default async function metricsRoutes(app) {
           uptime_s: r.uptime_s,
         } : null;
       }
-      const byMetric = (key) => servers
-        .filter((s) => s.current && s.current[key] !== null)
-        .map((s) => ({ server_id: s.id, value: Number(s.current[key]) }))
-        .sort((a, b) => b.value - a.value).slice(0, 5);
-      top = { cpu: byMetric('cpu'), ram: byMetric('ram'), disk: byMetric('disk'), load: byMetric('load_1m') };
-      const { rows: sp } = await q(
-        `SELECT to_timestamp(floor(extract(epoch FROM bucket) / 1800) * 1800) AS t,
-                avg(cpu_total_pct) AS cpu, avg(ram_used_pct) AS ram, avg(disk_used_pct) AS disk
-         FROM metrics_1m WHERE bucket > now() - INTERVAL '24 hours' GROUP BY t ORDER BY t`);
-      spark = sp.map((r) => ({ t: r.t, cpu: r.cpu === null ? null : Number(r.cpu), ram: r.ram === null ? null : Number(r.ram), disk: r.disk === null ? null : Number(r.disk) }));
+      if (wantTop) {
+        const byMetric = (key) => servers
+          .filter((s) => s.current && s.current[key] !== null)
+          .map((s) => ({ server_id: s.id, value: Number(s.current[key]) }))
+          .sort((a, b) => b.value - a.value).slice(0, 5);
+        top = { cpu: byMetric('cpu'), ram: byMetric('ram'), disk: byMetric('disk'), load: byMetric('load_1m') };
+      }
+      if (wantSpark) {
+        // Straight off system_metrics: `time > …` can use the index, whereas the
+        // view's `bucket > …` becomes date_trunc('minute', time) > … and cannot.
+        const { rows: sp } = await q(
+          `SELECT to_timestamp(floor(extract(epoch FROM time) / 1800) * 1800) AS t,
+                  avg((cpu->>'total')::double precision)    AS cpu,
+                  avg((ram->>'used_pct')::double precision) AS ram,
+                  avg(disk_total_used_pct(disk))            AS disk
+           FROM system_metrics WHERE time > now() - INTERVAL '24 hours' GROUP BY t ORDER BY t`);
+        spark = sp.map((r) => ({ t: r.t, cpu: r.cpu === null ? null : Number(r.cpu), ram: r.ram === null ? null : Number(r.ram), disk: r.disk === null ? null : Number(r.disk) }));
+      }
     }
     const { rows: ticker } = await q(
       `SELECT id, rule_name, severity, server_id, status, metric, value, threshold, started_at, message

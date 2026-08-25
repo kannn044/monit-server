@@ -10,6 +10,9 @@ const props = defineProps({
   warn: { type: Number, default: 75 },
   crit: { type: Number, default: 90 },
   sub: { type: String, default: '' },       // e.g. "31 GB free"
+  // Dense variant for the fleet grid, where three of these sit side by side in
+  // a card and every pixel of height is multiplied by the number of servers.
+  compact: { type: Boolean, default: false },
 });
 
 const level = computed(() => {
@@ -22,7 +25,7 @@ const width = computed(() => Math.max(0, Math.min(100, props.value ?? 0)));
 </script>
 
 <template>
-  <div class="meter" :class="level">
+  <div class="meter" :class="[level, { compact }]">
     <div class="head">
       <span class="lab">{{ label }}</span>
       <span class="val">{{ value === null ? '—' : value.toFixed(0) + '%' }}</span>
@@ -30,7 +33,7 @@ const width = computed(() => Math.max(0, Math.min(100, props.value ?? 0)));
     <div class="track" role="img" :aria-label="`${label} ${value === null ? 'no data' : value.toFixed(0) + '%'}`">
       <div class="fill" :style="{ width: width + '%' }"></div>
     </div>
-    <div v-if="sub" class="sub">{{ sub }}</div>
+    <div v-if="sub && !compact" class="sub">{{ sub }}</div>
   </div>
 </template>
 
@@ -46,4 +49,9 @@ const width = computed(() => Math.max(0, Math.min(100, props.value ?? 0)));
 .crit .val { color: var(--critical); }
 .none .fill { background: var(--muted); opacity: 0.35; }
 .sub { font-size: 10px; color: var(--muted); margin-top: 3px; font-variant-numeric: tabular-nums; }
+
+.compact .head { margin-bottom: 2px; gap: 4px; }
+.compact .lab { font-size: 9px; letter-spacing: 0.04em; }
+.compact .val { font-size: 11px; }
+.compact .track { height: 3px; }
 </style>

@@ -134,9 +134,22 @@ spans return aggregated series.
 
 ### `GET /fleet/health`
 
-KPI counts, all servers with health, top-5 by CPU/RAM/disk/load, a 24-hour
-30-minute-bucket fleet sparkline, the 10 most recent incidents, and per-project
-rollups.
+KPI counts and all servers with health, each carrying `current` (the newest raw
+sample: cpu, ram, disk, disk_avail_kb, disk_size_kb, load_1m, cores, uptime_s),
+plus the 10 most recent incidents and per-project rollups.
+
+`top` (top-5 by CPU/RAM/disk/load) and `sparkline_24h` are **opt-in**:
+
+```
+GET /fleet/health?include=top,sparkline
+```
+
+They are excluded by default because the Fleet page polls this endpoint every
+10 seconds and renders neither. The sparkline in particular aggregated 24 hours
+of raw samples through the `metrics_1m` view — which on plain PostgreSQL is a
+view, not a materialised rollup, so it scanned the whole of `system_metrics`
+(measured: 1.6 s over 1.7 M rows, and growing with retention). With it excluded
+the endpoint answers in ~5 ms for a 14-server fleet.
 
 ## Alerting
 

@@ -1,7 +1,7 @@
 <script setup>
 import { ref, onMounted, onUnmounted, computed } from 'vue';
 import { api } from '../api.js';
-import { fmtBytes, ago, fmtTime, fmtDuration } from '../util.js';
+import { fmtBytes, ago, fmtTime } from '../util.js';
 import Meter from '../components/Meter.vue';
 
 const data = ref(null);
@@ -10,7 +10,20 @@ const projFilter = ref('');
 const envFilter = ref('');
 const search = ref('');
 const sortBy = ref('health');
+const troubleOnly = ref(false);
+// Cards read well up to a dozen servers; past that a dense row per server fits
+// far more on screen. Remembered per browser so the choice survives a reload.
+const layout = ref(readLayout());
 let timer;
+
+function readLayout() {
+  try { return localStorage.getItem('monit.fleet.layout') === 'rows' ? 'rows' : 'cards'; }
+  catch { return 'cards'; }
+}
+function setLayout(v) {
+  layout.value = v;
+  try { localStorage.setItem('monit.fleet.layout', v); } catch { /* private mode */ }
+}
 
 async function load() {
   try {
@@ -26,10 +39,33 @@ const envs = computed(() => [...new Set((data.value?.projects || []).map((p) => 
 // Trouble first: a fleet view is for finding the box that needs attention.
 const HEALTH_ORDER = { critical: 0, offline: 1, warning: 2, online: 3 };
 
+// The thresholds a card is judged against — the same numbers the seeded alert
+// rules use, so a red bar here means a rule is about to fire, not a private
+// opinion of this page.
+const LIMITS = { cpu: [80, 95], ram: [80, 90], disk: [70, 80] };
+const level = (v, [warn, crit]) => (v == null ? 'none' : v >= crit ? 'crit' : v >= warn ? 'warn' : 'ok');
+
+// The one number worth showing when there is only room for one.
+function worst(s) {
+  if (!s.current) return null;
+  const items = [
+    { k: 'CPU', v: s.current.cpu, lim: LIMITS.cpu },
+    { k: 'RAM', v: s.current.ram, lim: LIMITS.ram },
+    { k: 'DISK', v: s.current.disk, lim: LIMITS.disk },
+  ].filter((x) => x.v != null);
+  if (!items.length) return null;
+  const rank = { crit: 0, warn: 1, ok: 2, none: 3 };
+  return items.sort((a, b) => {
+    const d = rank[level(a.v, a.lim)] - rank[level(b.v, b.lim)];
+    return d || b.v - a.v;
+  })[0];
+}
+
 const servers = computed(() => {
   let s = [...(data.value?.servers || [])];
   if (projFilter.value) s = s.filter((x) => x.projects.some((p) => p.id === projFilter.value));
   if (envFilter.value) s = s.filter((x) => x.projects.some((p) => p.environment === envFilter.value));
+  if (troubleOnly.value) s = s.filter((x) => x.health !== 'online');
   if (search.value.trim()) {
     const q = search.value.trim().toLowerCase();
     s = s.filter((x) => x.name.toLowerCase().includes(q) || x.id.toLowerCase().includes(q));
@@ -58,8 +94,8 @@ const KPIS = [
   { key: 'offline', label: 'Offline', tone: 'offline' },
 ];
 
-const diskSub = (c) =>
-  c?.disk_avail_kb != null ? `${fmtBytes(c.disk_avail_kb * 1024)} free of ${fmtBytes((c.disk_size_kb || 0) * 1024)}` : '';
+const diskFree = (c) => (c?.disk_avail_kb != null ? `${fmtBytes(c.disk_avail_kb * 1024)} free` : '');
+const pct = (v) => (v == null ? '—' : `${v.toFixed(0)}%`);
 </script>
 
 <template>
@@ -89,47 +125,77 @@ const diskSub = (c) =>
         <option value="">All environments</option>
         <option v-for="e in envs" :key="e" :value="e">{{ e }}</option>
       </select>
+      <label class="chk" title="Hide servers that are online and within every threshold">
+        <input v-model="troubleOnly" type="checkbox" /> Needs attention
+      </label>
       <div class="seg">
         <button v-for="s in [['health','Status'],['cpu','CPU'],['ram','RAM'],['disk','Disk'],['name','Name']]"
                 :key="s[0]" :class="{ on: sortBy === s[0] }" @click="sortBy = s[0]">{{ s[1] }}</button>
       </div>
+      <div class="seg">
+        <button :class="{ on: layout === 'cards' }" @click="setLayout('cards')">Cards</button>
+        <button :class="{ on: layout === 'rows' }" @click="setLayout('rows')">Rows</button>
+      </div>
       <span class="muted" style="margin-left: auto; font-size: 12px">{{ servers.length }} shown</span>
     </div>
 
-    <div class="cards">
+    <!-- Cards: name, state, and the three numbers an alert rule watches.
+         Project, environment, load, cores and uptime are context rather than
+         signals — they live on the server's own page, one click away. -->
+    <div v-if="layout === 'cards'" class="cards">
       <router-link v-for="s in servers" :key="s.id" :to="`/servers/${s.id}`" class="cardlink">
         <article class="scard" :class="s.health">
           <header>
             <span class="dot" :class="s.health"></span>
-            <span class="name" :title="s.name">{{ s.name }}</span>
-            <span class="state" :class="s.health">{{ s.health }}</span>
+            <span class="name" :title="`${s.name} · ${s.id}`">{{ s.name }}</span>
+            <span v-if="s.health !== 'online'" class="state" :class="s.health">{{ s.health }}</span>
           </header>
 
-          <div class="meta">
-            <span v-if="s.projects.length" class="tag">{{ s.projects[0].name }}</span>
-            <span v-if="s.projects.length" class="env">{{ s.projects[0].environment }}</span>
-            <span class="seen">{{ ago(s.last_seen) }}</span>
-          </div>
-
           <div v-if="s.current" class="meters">
-            <Meter label="CPU" :value="s.current.cpu" :warn="80" :crit="95" />
-            <Meter label="RAM" :value="s.current.ram" :warn="80" :crit="90" />
-            <Meter label="DISK" :value="s.current.disk" :warn="70" :crit="80" :sub="diskSub(s.current)" />
+            <Meter compact label="CPU" :value="s.current.cpu" :warn="LIMITS.cpu[0]" :crit="LIMITS.cpu[1]" />
+            <Meter compact label="RAM" :value="s.current.ram" :warn="LIMITS.ram[0]" :crit="LIMITS.ram[1]" />
+            <Meter compact label="DISK" :value="s.current.disk" :warn="LIMITS.disk[0]" :crit="LIMITS.disk[1]" />
           </div>
           <div v-else class="nodata">
-            {{ s.health === 'offline' ? 'no samples — agent not reporting' : 'waiting for first sample' }}
+            {{ s.health === 'offline' ? `no samples · ${ago(s.last_seen)}` : 'waiting for first sample' }}
           </div>
-
-          <footer v-if="s.current">
-            <span>load {{ s.current.load_1m?.toFixed(2) ?? '—' }}<span v-if="s.current.cores"> / {{ s.current.cores }} cores</span></span>
-            <span v-if="s.current.uptime_s">up {{ fmtDuration(s.current.uptime_s) }}</span>
-          </footer>
         </article>
       </router-link>
 
       <div v-if="!servers.length" class="empty" style="grid-column: 1/-1">
-        {{ data.servers.length ? 'No servers match the filters.' : 'No servers yet — register one in Projects.' }}
+        {{ troubleOnly && data.servers.length ? 'Nothing needs attention.'
+           : data.servers.length ? 'No servers match the filters.' : 'No servers yet — register one in Projects.' }}
       </div>
+    </div>
+
+    <!-- Rows: the same signals at roughly a third of the height per server. -->
+    <div v-else class="card rows-card">
+      <table class="rows">
+        <thead>
+          <tr>
+            <th>Server</th><th class="num">CPU</th><th class="num">RAM</th>
+            <th class="num">Disk</th><th>Free</th><th>Last seen</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="s in servers" :key="s.id" class="rowline" :class="s.health"
+              @click="$router.push(`/servers/${s.id}`)">
+            <td class="who">
+              <span class="dot" :class="s.health"></span>
+              <router-link :to="`/servers/${s.id}`" @click.stop>{{ s.name }}</router-link>
+              <span v-if="s.health !== 'online'" class="state" :class="s.health">{{ s.health }}</span>
+            </td>
+            <td class="num" :class="level(s.current?.cpu, LIMITS.cpu)">{{ pct(s.current?.cpu) }}</td>
+            <td class="num" :class="level(s.current?.ram, LIMITS.ram)">{{ pct(s.current?.ram) }}</td>
+            <td class="num" :class="level(s.current?.disk, LIMITS.disk)">{{ pct(s.current?.disk) }}</td>
+            <td class="muted num">{{ diskFree(s.current) || '—' }}</td>
+            <td class="muted">{{ ago(s.last_seen) }}</td>
+          </tr>
+          <tr v-if="!servers.length"><td colspan="6" class="empty">
+            {{ troubleOnly && data.servers.length ? 'Nothing needs attention.' : 'No servers match the filters.' }}
+          </td></tr>
+        </tbody>
+      </table>
     </div>
 
     <div class="grid two">
@@ -177,47 +243,55 @@ const diskSub = (c) =>
 .stat.hot { border-color: color-mix(in oklab, var(--critical) 45%, transparent); }
 
 .toolbar { display: flex; gap: 8px; align-items: center; margin: 16px 0 12px; flex-wrap: wrap; }
-.search { min-width: 200px; }
+.search { min-width: 180px; }
+.chk { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--ink-2); white-space: nowrap; }
+.chk input { width: auto; }
 
-.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(268px, 1fr)); gap: 12px; margin-bottom: 16px; }
+/* Narrower minimum than before: 14 servers fit without scrolling on a laptop. */
+.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(186px, 1fr)); gap: 9px; margin-bottom: 16px; }
 .cardlink { text-decoration: none; color: inherit; }
 .cardlink:hover { text-decoration: none; }
 
 .scard {
-  background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
-  padding: 13px 15px 12px; height: 100%;
-  border-left: 4px solid var(--good);
+  background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+  padding: 9px 11px 10px; height: 100%;
+  border-left: 3px solid var(--good);
   transition: border-color 0.15s ease, transform 0.15s ease, box-shadow 0.15s ease;
 }
-.scard:hover { transform: translateY(-1px); box-shadow: 0 4px 16px rgba(0, 0, 0, 0.09); }
+.scard:hover { transform: translateY(-1px); box-shadow: 0 3px 12px rgba(0, 0, 0, 0.08); }
 .scard.warning { border-left-color: var(--warning); }
 .scard.critical { border-left-color: var(--critical); }
 .scard.offline { border-left-color: var(--offline); }
-.scard.offline .meters, .scard.offline .meta { opacity: 0.55; }
+.scard.offline .meters { opacity: 0.5; }
 
-.scard header { display: flex; align-items: center; gap: 7px; margin-bottom: 6px; }
-.dot { width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--good); }
+.scard header { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; }
+.dot { width: 7px; height: 7px; border-radius: 50%; flex: none; background: var(--good); }
 .dot.warning { background: var(--warning); }
 .dot.critical { background: var(--critical); }
 .dot.offline { background: var(--offline); }
-.name { font-weight: 650; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.state { margin-left: auto; font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); font-weight: 700; }
+.name { font-weight: 600; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.state {
+  margin-left: auto; font-size: 9px; text-transform: uppercase; letter-spacing: 0.05em;
+  color: var(--muted); font-weight: 700; flex: none;
+}
 .state.critical { color: var(--critical); }
 .state.warning { color: var(--warning); }
 
-.meta { display: flex; align-items: center; gap: 6px; margin-bottom: 11px; font-size: 11px; color: var(--muted); }
-.tag { background: color-mix(in oklab, var(--accent) 11%, transparent); color: var(--ink-2); padding: 1px 7px; border-radius: 999px; }
-.env { color: var(--muted); }
-.seen { margin-left: auto; font-variant-numeric: tabular-nums; }
+.meters { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.nodata { color: var(--muted); font-size: 11px; padding: 7px 0 5px; }
 
-.meters { display: flex; flex-direction: column; gap: 9px; }
-.nodata { color: var(--muted); font-size: 12px; padding: 14px 0; text-align: center; }
-
-.scard footer {
-  display: flex; justify-content: space-between; gap: 8px;
-  margin-top: 11px; padding-top: 8px; border-top: 1px solid var(--grid);
-  font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums;
-}
+/* Rows */
+.rows-card { margin-bottom: 16px; padding-top: 6px; }
+table.rows { font-variant-numeric: tabular-nums; }
+table.rows th { font-size: 11px; }
+.rowline { cursor: pointer; }
+.rowline:hover { background: color-mix(in oklab, var(--accent) 6%, transparent); }
+.rowline td { padding-top: 5px; padding-bottom: 5px; }
+.rowline .who { display: flex; align-items: center; gap: 7px; }
+.rowline .who .state { margin-left: 0; }
+.rowline td.warn { color: var(--warning); font-weight: 600; }
+.rowline td.crit { color: var(--critical); font-weight: 700; }
+.rowline.offline td:not(.who) { opacity: 0.5; }
 
 .grid.two { grid-template-columns: 1.3fr 1fr; align-items: start; }
 @media (max-width: 900px) { .grid.two { grid-template-columns: 1fr; } }

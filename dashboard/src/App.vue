@@ -13,7 +13,7 @@ const route = useRoute();
       <router-link class="navlink" to="/">Fleet</router-link>
       <router-link class="navlink" to="/incidents">Incidents</router-link>
       <router-link class="navlink" to="/rules">Alert rules</router-link>
-      <router-link class="navlink" to="/projects">Projects</router-link>
+      <router-link class="navlink" to="/projects">Groups</router-link>
       <router-link v-if="auth.isAdmin" class="navlink" to="/settings">Settings</router-link>
       <div class="foot">
         <div>{{ auth.user?.email }}</div>

@@ -66,6 +66,7 @@ Old timestamps are accepted (buffered backlog); `last_seen` only moves forward.
 | DELETE | `/servers/:id` | admin | archive: revoke keys, close alerts, hide it — history kept, id restorable |
 | DELETE | `/servers/:id?purge=1` | admin | erase: row, keys, alerts and every stored sample are deleted; the id is free |
 | POST | `/servers/:id/restore` | admin | un-archive an archived server, return a new key once |
+| POST | `/servers/bulk/group` | admin | `{server_ids:[...], project_id: uuid\|null}` — move many servers into one group; membership is **replaced**, `null` clears it |
 | POST | `/servers/:id/keys/rotate` | admin | revoke old, return new key once |
 | POST | `/servers/:id/expected-services` | admin | `{kind:"docker"\|"pm2", name}` |
 | DELETE | `/servers/:id/expected-services/:esId` | admin | |
@@ -83,7 +84,18 @@ a new one and revokes the old immediately. Deleting a server and re-registering
 it under the same id also issues a new key, which is the path a forgotten key
 used to be worked around with.
 
-## Projects
+## Projects — "Groups" in the dashboard
+
+The dashboard calls a project a **Group**: one concept, one word on screen. The
+API and database keep the name `projects` / `server_projects`, so nothing here
+changed. A group also carries an `environment` label (Prod / UAT / Dev), which
+the Fleet page can group by instead.
+
+**A server belongs to exactly one group.** The join table is many-to-many and
+the API still accepts an array, but every screen writes a single id (or an empty
+array for "Ungrouped"), and `/servers/bulk/group` replaces rather than appends.
+Archiving a group leaves its servers registered — they simply become Ungrouped.
+
 
 `GET /projects` (viewer) · `POST /projects` · `PUT /projects/:id` ·
 `DELETE /projects/:id` (admin, archives) · `GET /projects/:id/overview` (viewer —

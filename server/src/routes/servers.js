@@ -167,6 +167,60 @@ export default async function serverRoutes(app) {
     };
   });
 
+  // Move many servers into one group at once. Assigning 14 hosts one modal at a
+  // time is the reason grouping went unused; this is the same operation the
+  // Groups page performs from a multi-select.
+  //
+  // A server belongs to exactly one group, so membership is REPLACED, not added
+  // to. project_id: null clears it (the server moves to "Ungrouped").
+  app.post('/api/v1/servers/bulk/group', {
+    preHandler: requireRole('admin'),
+    schema: {
+      body: {
+        type: 'object', required: ['server_ids'],
+        properties: {
+          server_ids: { type: 'array', items: { type: 'string' }, minItems: 1 },
+          project_id: { type: ['string', 'null'] },
+        },
+      },
+    },
+  }, async (req, reply) => {
+    const { server_ids, project_id = null } = req.body;
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      if (project_id) {
+        const { rows } = await client.query(
+          'SELECT id FROM projects WHERE id = $1 AND archived_at IS NULL', [project_id]);
+        if (!rows[0]) {
+          await client.query('ROLLBACK');
+          return reply.code(404).send({ title: 'Group not found', status: 404 });
+        }
+      }
+      const { rows: found } = await client.query(
+        'SELECT id FROM servers WHERE id = ANY($1) AND archived_at IS NULL', [server_ids]);
+      const ids = found.map((r) => r.id);
+      if (!ids.length) {
+        await client.query('ROLLBACK');
+        return reply.code(404).send({ title: 'No matching servers', status: 404 });
+      }
+      await client.query('DELETE FROM server_projects WHERE server_id = ANY($1)', [ids]);
+      if (project_id) {
+        await client.query(
+          `INSERT INTO server_projects (server_id, project_id)
+           SELECT unnest($1::text[]), $2`, [ids, project_id]);
+      }
+      await client.query('COMMIT');
+      await audit(req, 'server.group', 'group', project_id || '(none)', { servers: ids.length });
+      return { updated: ids.length, project_id };
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
+    } finally {
+      client.release();
+    }
+  });
+
   app.patch('/api/v1/servers/:id', {
     preHandler: requireRole('admin'),
     schema: {

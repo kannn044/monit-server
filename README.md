@@ -113,6 +113,10 @@ cd dashboard && npm install && npm run dev
 | `server/src/lib/` | metric extraction, health computation, auth helpers |
 | `server/migrations/` | SQL migrations (run in filename order) |
 | `dashboard/src/views/` | Fleet, ServerDetail, Incidents, Rules, Projects, Settings |
+Servers are organised into **groups** (`projects` in the API): one group per
+server, shown as collapsible sections on the Fleet page and managed in bulk from
+the Groups page.
+
 | `docs/` | [API](docs/API.md) · [agents](docs/AGENTS.md) · [operations](docs/OPERATIONS.md) · [telegram](docs/TELEGRAM.md) · [nginx](docs/NGINX.md) · [decisions](docs/DECISIONS.md) |
 | `setup-db.sh` | one-command setup against an existing PostgreSQL container |
 | `deploy-agent.sh` | push + install the agent on a target host over ssh |

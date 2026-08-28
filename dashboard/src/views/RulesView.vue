@@ -159,11 +159,11 @@ async function toggle(r) {
         <label class="f">Scope
           <select v-model="editing.scope_type" @change="editing.scope_ids = []">
             <option value="all">All servers</option>
-            <option value="project">Projects</option>
+            <option value="project">Groups</option>
             <option value="servers">Specific servers</option>
           </select>
         </label>
-        <label v-if="editing.scope_type === 'project'" class="f" style="flex: 1">Projects
+        <label v-if="editing.scope_type === 'project'" class="f" style="flex: 1">Groups
           <select v-model="editing.scope_ids" multiple size="4">
             <option v-for="p in projects" :key="p.id" :value="p.id">{{ p.name }}</option>
           </select>

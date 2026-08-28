@@ -27,6 +27,12 @@ const METRICS = [
   ['http.status_code', 'HTTP status code'], ['http.latency_ms', 'HTTP latency (ms)'],
   ['db.active_pct', 'DB connections used %'], ['db.active', 'DB active connections'],
   ['service_down', 'Expected services down (count)'], ['no_sample', 'Seconds since last sample'],
+  ['ndb.nodes_unhealthy', 'NDB data nodes not STARTED (count)'],
+  ['ndb.data_nodes_started', 'NDB data nodes started (count)'],
+  ['ndb.node_groups_down', 'NDB node groups with no live node'],
+  ['ndb.data_memory_pct', 'NDB DataMemory used %'],
+  ['ndb.index_memory_pct', 'NDB IndexMemory used %'],
+  ['ndb.arbitrator_connected', 'NDB arbitrator connected (1/0)'],
 ];
 
 const blank = () => ({

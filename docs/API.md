@@ -126,7 +126,10 @@ Metric paths: `cpu.total`, `ram.used_pct`, `ram.free_kb`, `ram.available_kb`,
 `disk.used_pct` (worst mount), `disk.avail_kb` (tightest mount), `load.1m|5m|15m`,
 `uptime_s`, `gpu.util_pct`, `gpu.mem_used_pct`, `net.rx_bps`, `net.tx_bps`,
 `docker.running`, `pm2.online`, `http.status_code`, `http.latency_ms`,
-`db.active`, `db.active_pct`, `service_down`, `no_sample`.
+`db.active`, `db.active_pct`, `service_down`, `no_sample`,
+`ndb.nodes_unhealthy`, `ndb.data_nodes_started`, `ndb.data_nodes_configured`,
+`ndb.node_groups_down`, `ndb.data_memory_pct`, `ndb.index_memory_pct`,
+`ndb.arbitrator_connected`.
 
 A `null` point is a real gap (missing sample, counter reset, or a span too long
 to interpolate) — plot it as a break, not as zero.

@@ -32,6 +32,9 @@ set -o pipefail
 # Optional DB monitoring (read-only credentials; leave empty to disable)
 : "${MONIT_MYSQL:=0}"          # 1 = enabled (uses ~/.my.cnf or MYSQL_* envs)
 : "${MONIT_PG:=0}"             # 1 = enabled (uses PG* envs / .pgpass)
+# MySQL NDB Cluster (ndbd / ndb_mgmd / SQL nodes).
+: "${MONIT_NDB:=auto}"         # auto = use it if ndbinfo or ndb_mgm is available
+: "${MONIT_NDB_CONNECTSTRING:=}"   # e.g. 10.1.1.20:1186 — only for the ndb_mgm path
 
 INGEST_URL="${MONIT_API_URL%/}/api/v1/ingest"
 
@@ -309,6 +312,183 @@ collect_http() {
   printf '[%s]' "$out"
 }
 
+# --- MySQL NDB Cluster -------------------------------------------------------
+# "Is any node down" cannot be answered by the live-node list alone: NDB drops
+# the row for a data node that is not running, so a dead node simply vanishes.
+# The configured roster has to come from somewhere else —
+#   · ndbinfo.config_nodes  (NDB 8.0.22+), read over SQL from any SQL node
+#   · ndb_mgm -e show       always lists configured nodes, including
+#                           "not connected", and works on a host with no mysqld
+# so both are implemented and whichever can answer is used.
+#
+# Data memory is reported too, because an NDB cluster stops accepting writes
+# when DataMemory fills — it is as much an outage as a missing node.
+
+ndb_sql() {  # $1 = SQL; prints tab-separated rows, empty on any failure
+  mysql -N -B -e "$1" 2>/dev/null || true
+}
+
+# Parses `ndb_mgm -e show`. Format is stable across 7.x/8.x:
+#   [ndbd(NDB)]     2 node(s)
+#   id=1    @10.1.1.21  (mysql-8.0.36 ndb-8.0.36, Nodegroup: 0, *)
+#   id=2 (not connected, accepting connect from 10.1.1.22)
+ndb_parse_mgm() {
+  awk '
+    /^\[ndbd\(NDB\)\]/      { sect="NDB";  next }
+    /^\[ndb_mgmd\(MGM\)\]/  { sect="MGM";  next }
+    /^\[mysqld\(API\)\]/    { sect="API";  next }
+    /^id=/ {
+      if (sect == "") next
+      line = $0
+      id = line; sub(/^id=/, "", id); sub(/[^0-9].*$/, "", id)
+      host = ""; group = ""; state = "STARTED"
+      if (line ~ /not connected/) {
+        state = "MISSING"
+        if (match(line, /accepting connect from [^)]*/)) {
+          host = substr(line, RSTART + 23, RLENGTH - 23)
+          if (host == "any host") host = ""
+        }
+      } else {
+        if (match(line, /@[0-9a-zA-Z_.:-]+/)) host = substr(line, RSTART + 1, RLENGTH - 1)
+        if (line ~ /, starting/ || line ~ /\(starting/) state = "STARTING"
+        if (line ~ /, shutting down/) state = "STOPPING"
+        if (match(line, /Nodegroup: [0-9]+/)) {
+          group = substr(line, RSTART + 11, RLENGTH - 11)
+        } else if (line ~ /no nodegroup/) {
+          group = "none"
+        }
+      }
+      printf "%s\t%s\t%s\t%s\t%s\n", sect, id, host, state, group
+    }' 
+}
+
+collect_ndb() {
+  local have_sql=0 have_mgm=0
+  [ "$MONIT_NDB" = "0" ] && { printf ''; return 0; }
+
+  # Probe cheaply: one row from ndbinfo means this host is an NDB SQL node.
+  if command -v mysql >/dev/null 2>&1; then
+    [ -n "$(ndb_sql "SELECT 1 FROM ndbinfo.nodes LIMIT 1;")" ] && have_sql=1
+  fi
+  command -v ndb_mgm >/dev/null 2>&1 && have_mgm=1
+
+  if [ "$have_sql" = 0 ] && [ "$have_mgm" = 0 ]; then
+    [ "$MONIT_NDB" = "1" ] && \
+      printf '{"present":true,"accessible":false,"reason":"%s"}' \
+        "$(json_escape "MONIT_NDB=1 but neither ndbinfo (via mysql) nor ndb_mgm is available on this host")"
+    return 0
+  fi
+
+  local roster="" live="" mem="" memberships="" arb_connected="" src=""
+
+  if [ "$have_sql" = 1 ]; then
+    src="ndbinfo"
+    # config_nodes exists from 8.0.22; without it a missing node is invisible.
+    roster=$(ndb_sql "SELECT node_id, node_type, node_hostname FROM ndbinfo.config_nodes ORDER BY node_id;")
+    live=$(ndb_sql "SELECT node_id, status, uptime FROM ndbinfo.nodes ORDER BY node_id;")
+    memberships=$(ndb_sql "SELECT node_id, group_id FROM ndbinfo.membership ORDER BY node_id;")
+    arb_connected=$(ndb_sql "SELECT arb_connected FROM ndbinfo.membership LIMIT 1;")
+    mem=$(ndb_sql "SELECT node_id, memory_type, used, total FROM ndbinfo.memoryusage;")
+  fi
+
+  # Use the management client when it can add the configured roster the SQL
+  # path lacks, or when there is no SQL node here at all.
+  local mgm=""
+  if [ "$have_mgm" = 1 ] && { [ "$have_sql" = 0 ] || [ -z "$roster" ]; }; then
+    local args=()
+    [ -n "$MONIT_NDB_CONNECTSTRING" ] && args=(-c "$MONIT_NDB_CONNECTSTRING")
+    mgm=$(timeout "${MONIT_TIMEOUT:-5}" ndb_mgm "${args[@]+"${args[@]}"}" --try-reconnect=1 -e show 2>/dev/null | ndb_parse_mgm || true)
+    [ -n "$mgm" ] && src="${src:+$src+}ndb_mgm"
+  fi
+
+  if [ -z "$roster" ] && [ -z "$mgm" ] && [ -z "$live" ]; then
+    printf '{"present":true,"accessible":false,"reason":"%s"}' \
+      "$(json_escape "NDB is present but neither ndbinfo nor ndb_mgm returned anything — check the mysql credentials, or set MONIT_NDB_CONNECTSTRING to the management node")"
+    return 0
+  fi
+
+  # Merge every source into one node list. awk keeps this to a single pass and
+  # avoids a bash loop per node.
+  printf '%s' "$(
+    { printf 'ROSTER\n%s\n' "$roster"
+      printf 'LIVE\n%s\n'   "$live"
+      printf 'GROUP\n%s\n'  "$memberships"
+      printf 'MEM\n%s\n'    "$mem"
+      printf 'MGM\n%s\n'    "$mgm"
+      printf 'ARB\n%s\n'    "$arb_connected"
+      printf 'SRC\n%s\n'    "$src"
+    } | awk -F'\t' '
+      function esc(x) { gsub(/\\/, "\\\\", x); gsub(/"/, "\\\"", x); return x }
+      /^ROSTER$/ { m="R"; next } /^LIVE$/ { m="L"; next } /^GROUP$/ { m="G"; next }
+      /^MEM$/    { m="M"; next } /^MGM$/  { m="X"; next } /^ARB$/   { m="A"; next }
+      /^SRC$/    { m="S"; next }
+      $0 == "" { next }
+      m == "R" { id=$1+0; seen[id]=1; type[id]=$2; if ($3 != "" && $3 != "NULL") host[id]=$3; next }
+      m == "L" { id=$1+0; seen[id]=1; if (type[id]=="") type[id]="NDB"; status[id]=$2; uptime[id]=$3+0; next }
+      m == "G" { id=$1+0; if ($2 != "" && $2 != "NULL") grp[id]=$2+0; next }
+      m == "M" { id=$1+0; if ($2 ~ /^Data/) { dused[id]=$3+0; dtot[id]=$4+0 }
+                          if ($2 ~ /^Index/) { iused[id]=$3+0; itot[id]=$4+0 } next }
+      m == "X" { id=$2+0; seen[id]=1
+                 if (type[id]=="") type[id]=$1
+                 if (host[id]=="" && $3!="") host[id]=$3
+                 # ndb_mgm is authoritative about "not connected"
+                 if ($4=="MISSING" || status[id]=="") status[id]=$4
+                 if ($5 != "" && $5 != "none") grp[id]=$5+0
+                 next }
+      m == "A" { arb=$1; next }
+      m == "S" { src=$0; next }
+      END {
+        n=0; ndb_conf=0; ndb_started=0; unhealthy=0
+        dmax=0; imax=0
+        for (id in seen) {
+          t = (type[id]=="" ? "NDB" : type[id])
+          st = status[id]
+          if (st == "") st = (t=="NDB" ? "MISSING" : "CONNECTED")
+          ok = (st=="STARTED" || st=="CONNECTED")
+          if (t=="NDB") {
+            ndb_conf++
+            if (st=="STARTED") { ndb_started++; if (id in grp) live_in_group[grp[id]]++ }
+            else unhealthy++
+            # ndb_mgm does not print a Nodegroup for a node that is not
+            # connected, so a dead node cannot always be attributed to a group.
+            if (!(id in grp)) unknown_group++
+          }
+          if (id in grp) group_seen[grp[id]]=1
+          if (dtot[id] > 0) { p = 100*dused[id]/dtot[id]; if (p > dmax) dmax=p }
+          if (itot[id] > 0) { p = 100*iused[id]/itot[id]; if (p > imax) imax=p }
+          items[n++] = sprintf("{\"id\":%d,\"type\":\"%s\",\"host\":\"%s\",\"status\":\"%s\"%s%s}",
+                        id, esc(t), esc(host[id]), esc(st),
+                        (id in grp)    ? sprintf(",\"group\":%d", grp[id]) : "",
+                        (uptime[id]>0) ? sprintf(",\"uptime_s\":%d", uptime[id]) : "")
+        }
+        groups_total=0; groups_down=0
+        for (g in group_seen) { groups_total++; if (live_in_group[g]+0 == 0) groups_down++ }
+        # Sort by node id so the dashboard order is stable between samples.
+        for (i=0;i<n;i++) for (j=i+1;j<n;j++) {
+          ai=items[i]; aj=items[j]
+          sub(/^\{"id":/,"",ai); sub(/,.*$/,"",ai)
+          sub(/^\{"id":/,"",aj); sub(/,.*$/,"",aj)
+          if (aj+0 < ai+0) { t2=items[i]; items[i]=items[j]; items[j]=t2 }
+        }
+        body=""
+        for (i=0;i<n;i++) body = body (i?",":"") items[i]
+        printf "{\"present\":true,\"accessible\":true,\"source\":\"%s\"", esc(src)
+        printf ",\"data_nodes_configured\":%d,\"data_nodes_started\":%d,\"unhealthy\":%d",
+               ndb_conf, ndb_started, unhealthy
+        # Only claim a node-group verdict when every data node group is known.
+        # Reporting 0 groups down while some group is unknown would be a
+        # false all-clear on the one condition that takes the cluster offline.
+        if (unknown_group+0 == 0)
+          printf ",\"node_groups_total\":%d,\"node_groups_down\":%d", groups_total, groups_down
+        else
+          printf ",\"node_groups_known\":false"
+        if (dmax > 0) printf ",\"data_memory_pct\":%.1f", dmax
+        if (imax > 0) printf ",\"index_memory_pct\":%.1f", imax
+        if (arb != "") printf ",\"arbitrator_connected\":%s", (arb==1 || arb=="1" || arb=="YES" ? "true" : "false")
+        printf ",\"nodes\":[%s]}", body
+      }')"
+}
+
 collect_databases() {
   local mysql_json="" pg_json=""
   if [ "$MONIT_MYSQL" = "1" ] && command -v mysql >/dev/null 2>&1; then
@@ -333,7 +513,15 @@ collect_databases() {
       pg_json="\"postgres\":{\"present\":true,\"reachable\":false,\"total\":0,\"active\":0,\"max\":0}"
     fi
   fi
-  local body="${mysql_json}${mysql_json:+${pg_json:+,}}${pg_json}"
+  local ndb_json=""
+  local ndb_body
+  ndb_body=$(collect_ndb)
+  [ -n "$ndb_body" ] && ndb_json="\"ndb\":${ndb_body}"
+
+  local body=""
+  for part in "$mysql_json" "$pg_json" "$ndb_json"; do
+    [ -n "$part" ] && body="${body}${body:+,}${part}"
+  done
   printf '{%s}' "$body"
 }
 

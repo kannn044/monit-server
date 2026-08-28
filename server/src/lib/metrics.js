@@ -77,6 +77,32 @@ export function extractMetric(path, sample, ctx = {}) {
       }
       return out.length ? Math.max(...out) : null;
     }
+    // --- MySQL NDB Cluster -------------------------------------------------
+    // Every one returns null when the agent could not read the cluster, so a
+    // collector that cannot see NDB never scores as "every node is down".
+    case 'ndb.nodes_unhealthy':
+    case 'ndb.data_nodes_started':
+    case 'ndb.data_nodes_configured':
+    case 'ndb.node_groups_down':
+    case 'ndb.data_memory_pct':
+    case 'ndb.index_memory_pct':
+    case 'ndb.arbitrator_connected': {
+      const c = databases?.ndb;
+      if (!c?.present || c.accessible === false) return null;
+      switch (path) {
+        case 'ndb.nodes_unhealthy':       return num(c.unhealthy);
+        case 'ndb.data_nodes_started':    return num(c.data_nodes_started);
+        case 'ndb.data_nodes_configured': return num(c.data_nodes_configured);
+        // Omitted by the agent when a downed node could not be attributed to a
+        // node group — null skips the rule rather than reporting a false zero.
+        case 'ndb.node_groups_down':      return num(c.node_groups_down);
+        case 'ndb.data_memory_pct':       return num(c.data_memory_pct);
+        case 'ndb.index_memory_pct':      return num(c.index_memory_pct);
+        case 'ndb.arbitrator_connected':
+          return c.arbitrator_connected === undefined ? null : (c.arbitrator_connected ? 1 : 0);
+        default: return null;
+      }
+    }
     case 'db.active': {
       const out = [];
       for (const k of ['mysql', 'postgres']) {
@@ -134,6 +160,10 @@ export const METRIC_UNITS = {
   'gpu.util_pct': 'percent', 'gpu.mem_used_pct': 'percent',
   'net.rx_bps': 'bytes/s', 'net.tx_bps': 'bytes/s',
   'docker.running': 'count', 'pm2.online': 'count',
+  'ndb.nodes_unhealthy': 'count', 'ndb.data_nodes_started': 'count',
+  'ndb.data_nodes_configured': 'count', 'ndb.node_groups_down': 'count',
+  'ndb.data_memory_pct': 'percent', 'ndb.index_memory_pct': 'percent',
+  'ndb.arbitrator_connected': 'count',
   'http.status_code': 'code', 'http.latency_ms': 'ms',
   'db.active_pct': 'percent', 'db.active': 'count',
   'service_down': 'count', 'no_sample': 'seconds',

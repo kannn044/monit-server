@@ -6,6 +6,7 @@ import { fmt, fmtBytes, fmtDuration, ago, fmtTime, RANGES } from '../util.js';
 import { useAuth } from '../stores/auth.js';
 import TimeChart from '../components/TimeChart.vue';
 import AgentKey from '../components/AgentKey.vue';
+import Meter from '../components/Meter.vue';
 
 const route = useRoute();
 const auth = useAuth();
@@ -68,6 +69,11 @@ async function rotateKey() {
     newKey.value = r.api_key;
   } catch (e) { error.value = e.message; }
 }
+
+// `databases` also carries the NDB cluster block, which is rendered on its own
+// above and has no connection-pool shape — keep it out of this table.
+const connDatabases = computed(() => Object.fromEntries(
+  Object.entries(summary.value?.databases || {}).filter(([, d]) => d && d.reachable !== undefined)));
 
 const hasGpu = computed(() => Object.keys(charts.value.gpu || {}).length > 0 || (summary.value?.gpu || []).length > 0);
 const visibleKinds = computed(() => kinds.filter((k) => !k.startsWith('gpu') || hasGpu.value));
@@ -175,6 +181,60 @@ watch(id, () => { info.value = null; charts.value = {}; loadInfo(); loadCharts()
             </tbody>
           </table>
         </template>
+        <!-- MySQL NDB Cluster. A data node that is down disappears from
+             ndbinfo entirely, so the agent compares the configured roster
+             against the live one; "MISSING" below is a node that should be
+             there and is not. -->
+        <template v-if="summary.databases?.ndb?.present">
+          <h3 class="muted" style="font-size: 12px; margin: 12px 0 4px">
+            NDB Cluster —
+            <template v-if="summary.databases.ndb.accessible === false">not readable</template>
+            <template v-else>
+              {{ summary.databases.ndb.data_nodes_started }}/{{ summary.databases.ndb.data_nodes_configured }} data nodes started
+            </template>
+          </h3>
+          <div v-if="summary.databases.ndb.accessible === false" class="unreadable">
+            An NDB cluster is configured but the agent cannot read it, so node state is unknown —
+            nothing is being reported as down.
+            <div v-if="summary.databases.ndb.reason" class="fix">{{ summary.databases.ndb.reason }}</div>
+          </div>
+          <template v-else>
+            <div class="ndbstats">
+              <span :class="{ bad: summary.databases.ndb.unhealthy > 0 }">
+                {{ summary.databases.ndb.unhealthy }} not started
+              </span>
+              <span v-if="summary.databases.ndb.node_groups_total !== undefined"
+                    :class="{ bad: summary.databases.ndb.node_groups_down > 0 }">
+                {{ summary.databases.ndb.node_groups_down }}/{{ summary.databases.ndb.node_groups_total }} node groups down
+              </span>
+              <span v-else class="muted" title="A node that is not connected does not report its node group">
+                node groups unknown
+              </span>
+              <span v-if="summary.databases.ndb.arbitrator_connected === false" class="bad">arbitrator lost</span>
+            </div>
+            <div v-if="summary.databases.ndb.data_memory_pct != null" class="meters ndbmem">
+              <Meter label="DATA MEMORY" :value="summary.databases.ndb.data_memory_pct" :warn="75" :crit="85" />
+              <Meter v-if="summary.databases.ndb.index_memory_pct != null"
+                     label="INDEX MEMORY" :value="summary.databases.ndb.index_memory_pct" :warn="75" :crit="85" />
+            </div>
+            <table>
+              <tbody>
+                <tr v-for="n in (summary.databases.ndb.nodes || [])" :key="n.id">
+                  <td class="mono">id={{ n.id }}</td>
+                  <td class="muted">{{ n.type }}</td>
+                  <td class="mono muted">{{ n.host || '—' }}</td>
+                  <td>
+                    <span class="badge" :class="n.status === 'STARTED' || n.status === 'CONNECTED' ? 'online'
+                          : n.status === 'STARTING' ? 'warning' : 'critical'">{{ n.status }}</span>
+                  </td>
+                  <td class="muted">{{ n.group !== undefined ? `nodegroup ${n.group}` : '' }}</td>
+                  <td class="muted num">{{ n.uptime_s ? fmtDuration(n.uptime_s) : '' }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </template>
+        </template>
+
         <template v-if="(summary.http || []).length">
           <h3 class="muted" style="font-size: 12px; margin: 12px 0 4px">HTTP checks</h3>
           <table>
@@ -187,11 +247,11 @@ watch(id, () => { info.value = null; charts.value = {}; loadInfo(); loadCharts()
             </tbody>
           </table>
         </template>
-        <template v-if="summary.databases && Object.keys(summary.databases).length">
+        <template v-if="Object.keys(connDatabases).length">
           <h3 class="muted" style="font-size: 12px; margin: 12px 0 4px">Databases</h3>
           <table>
             <tbody>
-              <tr v-for="(d, name) in summary.databases" :key="name">
+              <tr v-for="(d, name) in connDatabases" :key="name">
                 <td>{{ name }}</td>
                 <td><span class="badge" :class="d.reachable ? 'online' : 'critical'">{{ d.reachable ? 'up' : 'down' }}</span></td>
                 <td class="num muted">{{ d.active }}/{{ d.max }} active</td>
@@ -199,7 +259,7 @@ watch(id, () => { info.value = null; charts.value = {}; loadInfo(); loadCharts()
             </tbody>
           </table>
         </template>
-        <div v-if="!summary.docker?.present && !summary.pm2?.present && !(summary.http || []).length" class="empty">
+        <div v-if="!summary.docker?.present && !summary.pm2?.present && !summary.databases?.ndb?.present && !(summary.http || []).length" class="empty">
           No app-level checks reported by the agent.
         </div>
 
@@ -239,4 +299,7 @@ watch(id, () => { info.value = null; charts.value = {}; loadInfo(); loadCharts()
   padding: 8px 11px; margin: 4px 0 8px;
 }
 .unreadable .fix { margin-top: 4px; color: var(--muted); }
+.ndbstats { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--ink-2); margin: 2px 0 8px; }
+.ndbstats .bad { color: var(--critical); font-weight: 650; }
+.meters.ndbmem { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin-bottom: 10px; max-width: 420px; }
 </style>

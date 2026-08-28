@@ -14,6 +14,7 @@
 #   -H URLS      HTTP checks (comma sep)  -u URL        central server URL
 #   -k KEY       API key                  -g auto|1|0   GPU collection
 #   -b N         buffer file cap          -s            show and exit
+#   -d auto|1|0  NDB cluster checks       -D HOST:PORT  ndb_mgmd connectstring
 #   -y           no confirmation prompt    --pm2         grant PM2 read access
 #
 # Every change is written to /etc/monit/agent.conf, verified with a real sample,
@@ -38,12 +39,13 @@ for _a in "$@"; do
 done
 set -- ${_args[@]+"${_args[@]}"}
 
-while getopts "i:H:n:u:k:g:b:syh" opt; do
+while getopts "i:H:n:u:k:g:b:d:D:syh" opt; do
   case $opt in
     i) SET[MONIT_INTERVAL]=$OPTARG ;;   H) SET[MONIT_HTTP_CHECKS]=$OPTARG ;;
     n) SET[MONIT_NET_IFACES]=$OPTARG ;; u) SET[MONIT_API_URL]=${OPTARG%/} ;;
     k) SET[MONIT_API_KEY]=$OPTARG ;;    g) SET[MONIT_GPU]=$OPTARG ;;
     b) SET[MONIT_BUFFER_MAX]=$OPTARG ;; s) SHOW_ONLY=1 ;;
+    d) SET[MONIT_NDB]=$OPTARG ;;        D) SET[MONIT_NDB_CONNECTSTRING]=$OPTARG ;;
     y) ASSUME_YES=1 ;;
     h) sed -n '3,20p' "$0"; exit 0 ;;
     *) echo "run '$0 -h' for usage" >&2; exit 2 ;;
@@ -154,7 +156,8 @@ show() {
     "interfaces:"  "$(get MONIT_NET_IFACES)" \
     "HTTP checks:" "$(get MONIT_HTTP_CHECKS || echo none)" \
     "GPU:"         "$(get MONIT_GPU)" \
-    "buffer cap:"  "$(get MONIT_BUFFER_MAX) files"
+    "buffer cap:"  "$(get MONIT_BUFFER_MAX) files" \
+    "NDB cluster:" "$(get MONIT_NDB || echo auto)"
   if systemctl list-unit-files monit-agent.service >/dev/null 2>&1; then
     printf '    %-16s %s\n' "service:" "$(systemctl is-active monit-agent 2>/dev/null || echo inactive)"
   elif [ -f /etc/cron.d/monit-agent ]; then

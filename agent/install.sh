@@ -130,6 +130,7 @@ mkdir -p /opt/monit /etc/monit /var/lib/monit-agent/buffer
 install -m 0755 "$DIR/monit-agent.sh" /opt/monit/monit-agent.sh
 chown -R monit:monit /var/lib/monit-agent
 [ -f "$DIR/monit-config.sh" ] && install -m 0755 "$DIR/monit-config.sh" /opt/monit/monit-config.sh
+[ -f "$DIR/check-ndb.sh" ] && install -m 0755 "$DIR/check-ndb.sh" /opt/monit/check-ndb.sh
 ok "installed /opt/monit/monit-agent.sh"
 
 # --- 4. config ---------------------------------------------------------------

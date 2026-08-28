@@ -167,6 +167,64 @@ Docker gets the same treatment: if `docker ps` fails (socket permissions, daemon
 down) the agent reports the daemon as unreadable instead of "0 containers
 running".
 
+### MySQL NDB Cluster
+
+Set `MONIT_NDB` (default `auto`): the agent looks for NDB and reports it if
+found. Run the readability check once on a monitored host:
+
+```bash
+ssh -t user@host 'sudo -u monit /opt/monit/check-ndb.sh'
+```
+
+It reads the cluster two ways and uses whichever answers:
+
+| Source | Gives | Needs |
+|---|---|---|
+| `ndbinfo` over SQL | live data nodes, node groups, DataMemory / IndexMemory, arbitrator | an SQL node and a MySQL user that can `SELECT ON ndbinfo.*` |
+| `ndb_mgm -e show` | the **configured** roster, including nodes that are not connected | the management client, reachable `ndb_mgmd` |
+
+**Both matter.** A data node that is down leaves no row in `ndbinfo.nodes` — it
+simply vanishes — so the configured roster has to come from somewhere:
+`ndbinfo.config_nodes` (NDB 8.0.22+) or `ndb_mgm`. Without one of them the agent
+can report how many nodes are up but not that one is *missing*.
+
+Point the agent at the management node when it is not on the default
+connectstring:
+
+```bash
+ssh -t user@host 'sudo /opt/monit/monit-config.sh -D 10.1.1.20:1186'
+ssh -t user@host 'sudo /opt/monit/monit-config.sh -d 0'   # turn NDB checks off
+```
+
+Give the agent user read-only access — nothing more is needed:
+
+```sql
+CREATE USER 'monit'@'localhost' IDENTIFIED BY '…';
+GRANT SELECT ON ndbinfo.* TO 'monit'@'localhost';
+```
+
+and make it the default for that user (`~monit/.my.cnf`, mode 0600).
+
+What is reported, and the rules seeded for it:
+
+| Rule | Metric | Fires when |
+|---|---|---|
+| NDB Node Down | `ndb.nodes_unhealthy` | any configured data node is not `STARTED` for 1 min |
+| NDB Node Group Down | `ndb.node_groups_down` | a node group has no live node — the cluster is offline |
+| NDB Data Memory | `ndb.data_memory_pct` | DataMemory above 85% for 5 min (recovers at 80%) |
+| NDB Index Memory | `ndb.index_memory_pct` | IndexMemory above 85% for 5 min |
+| NDB Arbitrator Lost | `ndb.arbitrator_connected` | no arbitrator — a split brain could not be resolved |
+
+Two honesty rules the collector follows, the same as the PM2 and Docker checks:
+
+- If NDB is present but unreadable it reports `accessible: false` with the
+  reason; every `ndb.*` metric then evaluates to null and **every NDB rule is
+  skipped** rather than firing a fleet-wide false outage.
+- `ndb_mgm` does not print a node group for a node that is not connected, so
+  when a dead node cannot be attributed to a group the agent emits
+  `node_groups_known: false` instead of `node_groups_down: 0`. A false all-clear
+  on the one condition that takes the cluster down is worse than no answer.
+
 ### Lost the key?
 
 It cannot be looked up — the dashboard stores only its SHA-256 hash. Issue a

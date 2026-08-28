@@ -55,6 +55,20 @@ die()  { printf '\033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
 # silently ignoring "deploy.sh host api-server sk_agent_…" and prompting for
 # things the caller already supplied.
 if [ $# -gt 0 ]; then
+  # A stray argument that is itself a command almost always means two commands
+  # were pasted onto one line. Saying so is more useful than repeating usage.
+  case $1 in
+    ssh|sudo|curl|bash|sh|scp|docker|git|systemctl|psql|mysql|./*)
+      die "unexpected argument '$1' — it looks like two commands ended up on one line.
+   Run them one at a time:
+
+     $0 $TARGET${UPDATE_ONLY:+ -u}
+     $1 ${*:2}" ;;
+  esac
+  if [ "${UPDATE_ONLY:-0}" = 1 ]; then
+    die "unexpected argument '$1' — '-u' takes no values:
+   $0 $TARGET -u"
+  fi
   die "unexpected argument '$1' — values go in flags:
    $0 $TARGET -i <server-id> -k <api-key>"
 fi

@@ -83,7 +83,17 @@ API=${MONIT_API:-http://127.0.0.1:$(api_port)}
 
 login() {
   local email=${MONIT_ADMIN_EMAIL:-} pass=${MONIT_ADMIN_PASSWORD:-}
-  [ -z "$email" ] && { read -r -p "  dashboard email: " email </dev/tty; }
+  # Say whose login this is and why. A bare "dashboard email:" prompt does not
+  # tell someone whether it wants their Linux account, a service account, or the
+  # web login — and the wrong guess just fails with "could not sign in".
+  if [ -z "$email" ] || [ -z "$pass" ]; then
+    echo "  The server list comes from the dashboard, so this needs the account you"
+    echo "  sign in to the web page with — at $API."
+    echo "  Any role can read the list; it is not used for anything else."
+    echo "  Set MONIT_ADMIN_EMAIL and MONIT_ADMIN_PASSWORD to skip this."
+    echo
+  fi
+  [ -z "$email" ] && { read -r -p "  email: " email </dev/tty; }
   [ -z "$pass" ] && { read -r -s -p "  password: " pass </dev/tty; echo; }
   TOKEN=$(curl -s -X POST "$API/api/v1/auth/login" -H 'Content-Type: application/json' \
           -d "{\"email\":\"$email\",\"password\":\"$pass\"}" \

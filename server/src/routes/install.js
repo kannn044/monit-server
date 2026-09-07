@@ -74,10 +74,59 @@ async function agentPayload() {
 export async function agentBaseUrl(req) {
   const { rows } = await q(`SELECT value FROM app_settings WHERE key = 'agent_api_url'`);
   if (rows[0]?.value) return { url: String(rows[0].value).replace(/\/+$/, ''), source: 'setting' };
+
   const proto = req.headers['x-forwarded-proto'] || req.protocol || 'http';
   const host = req.headers['x-forwarded-host'] || req.headers.host;
-  const prefix = String(req.headers['x-forwarded-prefix'] || '').replace(/\/+$/, '');
-  return { url: host ? `${proto}://${host}${prefix}` : '', source: host ? 'request' : 'none' };
+  if (!host) return { url: '', source: 'none' };
+
+  // The sub-path matters as much as the host. Behind nginx at
+  // https://host/monit, dropping "/monit" produces a URL that belongs to some
+  // other application on the same domain — which answers with its own HTML and
+  // hands the person `syntax error near unexpected token newline`.
+  //
+  // X-Forwarded-Prefix is the clean source but many nginx configs never set it,
+  // so fall back to the dashboard page the request came from: a Referer of
+  // https://host/monit/projects tells us the prefix is /monit.
+  let prefix = String(req.headers['x-forwarded-prefix'] || '').replace(/\/+$/, '');
+  if (!prefix && req.headers.referer) {
+    try {
+      const p = new URL(req.headers.referer).pathname;      // e.g. /monit/projects
+      const first = p.split('/').filter(Boolean)[0];
+      // Only a real prefix, not a dashboard route served from the root.
+      if (first && !['projects', 'servers', 'incidents', 'rules', 'settings', 'api'].includes(first)) {
+        prefix = `/${first}`;
+      }
+    } catch { /* a malformed Referer is not worth failing over */ }
+  }
+  return { url: `${proto}://${host}${prefix}`, source: 'request' };
+}
+
+/**
+ * Does this base URL actually serve the API?
+ *
+ * Handing out an install command without asking is how someone ends up pasting
+ * a link that returns another application's error page. Reachability from here
+ * is not conclusive — a server often cannot reach its own public name — so an
+ * unreachable address is reported as unverified, while an address that answers
+ * with something that is not the API is reported as wrong, because that is
+ * certain.
+ */
+export async function verifyAgentBase(url) {
+  if (!url) return { ok: false, certain: true, detail: 'No address is configured for agents to post to.' };
+  try {
+    const res = await fetch(`${url}/api/v1/health`, { signal: AbortSignal.timeout(4000) });
+    const body = await res.text();
+    if (res.ok && body.includes('"ok"')) return { ok: true, certain: true };
+    return {
+      ok: false,
+      certain: true,
+      detail: body.trim().startsWith('<')
+        ? `${url} answers with a web page, not this API. An install command built on it fails with a bash syntax error. If the dashboard lives under a sub-path, include it (…/monit); otherwise use the app's own host and port.`
+        : `${url}/api/v1/health answered HTTP ${res.status}, which is not this API.`,
+    };
+  } catch (e) {
+    return { ok: false, certain: false, detail: `Could not reach ${url} from the server itself (${e.message}). That may just be the network; check it before handing the command to anyone.` };
+  }
 }
 
 /**
@@ -188,18 +237,23 @@ export default async function installRoutes(app) {
       await client.query('INSERT INTO api_keys (server_id, key_hash) VALUES ($1,$2)', [id, sha256(apiKey)]);
       await client.query('COMMIT');
 
+      const base0 = await agentBaseUrl(req);
       const { token, expiresAt, ttlMinutes } = await mintInstallToken({
-        serverId: id, apiKey, userId: req.user?.sub || null,
+        serverId: id, apiKey, userId: req.user?.sub || null, baseUrl: base0.url || null,
       });
       await audit(req, 'install.token', 'server', id, { ttl_minutes: ttlMinutes });
 
-      const base = await agentBaseUrl(req);
+      const base = base0;
+      const check = await verifyAgentBase(base.url);
       return {
         token,
         expires_at: expiresAt,
         ttl_minutes: ttlMinutes,
         base_url: base.url,
         base_url_source: base.source,   // 'setting' = configured, 'request' = inferred
+        base_url_ok: check.ok,
+        base_url_certain: check.certain,
+        base_url_detail: check.detail || null,
         // No -f: with it, curl swallows the body on a 4xx and the person is
         // told nothing when a link has already been used or has expired.
         command: installCommand(base.url, token),
@@ -247,7 +301,9 @@ export default async function installRoutes(app) {
       ]));
     }
 
-    const apiUrl = (await agentBaseUrl(req)).url;
+    // Decided when the link was minted, when there was a browser (or an admin's
+    // setting) to learn it from. A bare curl carries none of that context.
+    const apiUrl = claim.baseUrl || (await agentBaseUrl(req)).url;
     req.log.info({ server_id: claim.serverId, ip: req.ip }, 'install token redeemed');
 
     return reply

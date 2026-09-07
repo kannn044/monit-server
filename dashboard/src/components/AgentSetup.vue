@@ -43,6 +43,9 @@ watch(() => props.install, (v) => {
   expiresAt.value = v?.expires_at ? new Date(v.expires_at) : null;
   serverCmd.value = v?.command || '';
   if (v?.base_url) { baseUrl.value = v.base_url; baseSource.value = v.base_url_source || 'setting'; }
+  urlOk.value = v?.base_url_ok ?? null;
+  urlCertain.value = v?.base_url_certain ?? true;
+  urlDetail.value = v?.base_url_detail || '';
 });
 
 const secondsLeft = computed(() => {
@@ -66,8 +69,17 @@ const serverCmd = ref(props.install?.command || '');
 const baseUrl = ref(props.install?.base_url || props.agentUrl || '');
 const baseSource = ref(props.install?.base_url_source || (props.agentUrl ? 'setting' : 'none'));
 
+// The server tries the address before handing it over. `urlBroken` means it got
+// a definite answer that this is not the API — a link built on it cannot work,
+// so say so instead of letting someone find out as a bash syntax error.
+const urlOk = ref(props.install?.base_url_ok ?? null);
+const urlCertain = ref(props.install?.base_url_certain ?? true);
+const urlDetail = ref(props.install?.base_url_detail || '');
+
 const base = computed(() => (baseUrl.value || '').replace(/\/+$/, ''));
 const guessed = computed(() => baseSource.value === 'request');
+const urlBroken = computed(() => urlOk.value === false && urlCertain.value === true);
+const urlUnverified = computed(() => urlOk.value === false && urlCertain.value === false);
 const installCmd = computed(() =>
   serverCmd.value || `sudo bash -c 'curl -sSL ${base.value || '<central-server-url>'}/install/${token.value} | bash'`);
 
@@ -81,6 +93,9 @@ async function newLink() {
     serverCmd.value = r.command || '';
     baseUrl.value = r.base_url || baseUrl.value;
     baseSource.value = r.base_url_source || baseSource.value;
+    urlOk.value = r.base_url_ok ?? null;
+    urlCertain.value = r.base_url_certain ?? true;
+    urlDetail.value = r.base_url_detail || '';
   } catch (e) {
     mintError.value = e.message;
   } finally {
@@ -163,7 +178,8 @@ async function copy(what, text) {
         <span v-else-if="secondsLeft !== null" class="badge">
           works once · expires in <b class="tnum">{{ countdown }}</b>
         </span>
-        <span v-if="guessed" class="badge warn">address not confirmed</span>
+        <span v-if="urlBroken" class="badge bad">wrong address — this will not work</span>
+        <span v-else-if="guessed" class="badge warn">address not confirmed</span>
       </div>
 
       <div class="cmdrow">
@@ -202,7 +218,15 @@ async function copy(what, text) {
         </li>
       </ul>
 
-      <p v-if="guessed" class="phint warn">
+      <p v-if="urlBroken" class="phint bad">
+        {{ urlDetail }}
+        An admin fixes it in Settings → “Address agents connect to”, then press
+        <b>New link</b> here.
+      </p>
+      <p v-else-if="urlUnverified" class="phint warn">
+        {{ urlDetail }}
+      </p>
+      <p v-else-if="guessed" class="phint warn">
         <b>{{ base }}</b> is where you are reading this dashboard from, not a configured value —
         the agent has to reach the API at that address for the install to work. An admin sets the
         real one once in Settings → “Address agents connect to”; it is usually the app's own IP and
@@ -341,6 +365,8 @@ async function copy(what, text) {
   border-radius: 999px; padding: 2px 8px; white-space: nowrap;
 }
 .badge.warn { color: var(--warning); background: color-mix(in oklab, var(--warning) 14%, transparent); }
+.badge.bad { color: var(--critical); background: color-mix(in oklab, var(--critical) 14%, transparent); font-weight: 700; }
+.phint.bad { color: var(--critical); }
 .tnum { font-variant-numeric: tabular-nums; }
 .phint { font-size: 12px; color: var(--ink-2); margin: 8px 0 0; max-width: 78ch; line-height: 1.55; }
 /* Three separate things someone needs to know, not one paragraph to wade

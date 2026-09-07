@@ -3,7 +3,7 @@ import { requireRole, audit, generateAgentKey, sha256 } from '../lib/auth.js';
 import { computeHealth } from '../lib/health.js';
 import { extractMetric } from '../lib/metrics.js';
 import { mintInstallToken } from '../lib/install-token.js';
-import { agentBaseUrl, installCommand } from './install.js';
+import { agentBaseUrl, installCommand, verifyAgentBase } from './install.js';
 
 async function serversWithHealth(filters = {}) {
   const { project, env, status, archived } = filters;
@@ -122,13 +122,16 @@ export default async function serverRoutes(app) {
       // fails the registration still stands — the ssh route works without it.
       let install = null;
       try {
-        const { token, expiresAt, ttlMinutes } = await mintInstallToken({
-          serverId: id, apiKey, userId: req.user?.sub || null,
-        });
         const base = await agentBaseUrl(req);
+        const { token, expiresAt, ttlMinutes } = await mintInstallToken({
+          serverId: id, apiKey, userId: req.user?.sub || null, baseUrl: base.url || null,
+        });
+        const check = await verifyAgentBase(base.url);
         install = {
           token, expires_at: expiresAt, ttl_minutes: ttlMinutes,
           base_url: base.url, base_url_source: base.source,
+          base_url_ok: check.ok, base_url_certain: check.certain,
+          base_url_detail: check.detail || null,
           command: installCommand(base.url, token),
         };
       } catch (e) {

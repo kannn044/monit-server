@@ -54,13 +54,14 @@ function unwrap(rawToken, packed) {
  * Mint a token that will hand `apiKey` back once.
  * Returns { token, expiresAt } — `token` is the only copy that will ever exist.
  */
-export async function mintInstallToken({ serverId, apiKey, userId = null }) {
+export async function mintInstallToken({ serverId, apiKey, userId = null, baseUrl = null }) {
   const token = randomToken();
   const expiresAt = new Date(Date.now() + TTL_MINUTES * 60_000);
+  // baseUrl is stored, not recomputed at redemption: see 013_install_token_base_url.sql.
   await q(
-    `INSERT INTO install_tokens (token_hash, server_id, key_wrapped, created_by, expires_at)
-     VALUES ($1, $2, $3, $4, $5)`,
-    [sha256(token), serverId, wrap(token, apiKey), userId, expiresAt]
+    `INSERT INTO install_tokens (token_hash, server_id, key_wrapped, created_by, expires_at, base_url)
+     VALUES ($1, $2, $3, $4, $5, $6)`,
+    [sha256(token), serverId, wrap(token, apiKey), userId, expiresAt, baseUrl]
   );
   return { token, expiresAt, ttlMinutes: TTL_MINUTES };
 }
@@ -79,7 +80,7 @@ export async function redeemInstallToken(token, ip = null) {
     `UPDATE install_tokens
         SET used_at = now(), used_from = $2
       WHERE token_hash = $1 AND used_at IS NULL AND expires_at > now()
-      RETURNING server_id, key_wrapped`,
+      RETURNING server_id, key_wrapped, base_url`,
     [hash, ip]
   );
 
@@ -108,7 +109,7 @@ export async function redeemInstallToken(token, ip = null) {
     err.reason = 'corrupt';
     throw err;
   }
-  return { serverId: rows[0].server_id, apiKey };
+  return { serverId: rows[0].server_id, apiKey, baseUrl: rows[0].base_url || null };
 }
 
 /** Drop spent and expired rows. Cheap, and keeps the table from growing forever. */

@@ -421,7 +421,61 @@ echo 'SAMPLE_INTERVAL_S=30' >> /opt/monit-server/.env
 docker compose -f docker-compose.app-only.yml up -d
 ```
 
-## Updating the agent on every host
+## Updating every host at once
+
+`./update-agents.sh` takes the server list from the dashboard, so it cannot
+drift from what you are actually monitoring.
+
+```bash
+./update-agents.sh --list     # writes agents.txt from the dashboard
+$EDITOR agents.txt            # fill in the ssh login for each host, once
+./update-agents.sh --plan     # what would change; touches nothing
+./update-agents.sh            # do it
+```
+
+The ssh login is the one thing the dashboard has never been told, and guessing
+it would mean one wrong assumption answering for two dozen machines — so
+`--list` writes the file and you fill that column in. Re-running `--list` keeps
+what you typed and adds any newly registered servers; a host with no IP recorded
+comes out commented, so a half-filled file cannot quietly skip a machine.
+
+It compares `sha256sum` of `monit-agent.sh` before doing anything, so hosts that
+already match are left alone rather than restarted for nothing — on 24 servers
+that is most of them, most of the time. `--force` updates regardless.
+
+```
+SERVER                   RESULT      DETAIL
+----------------------------------------------------------------------------
+web-prod-01              updated     4ec216325f2b… -> 4d2c06da7bbf…
+db-prod-01               unchanged   already on this version
+gpu-train-01             no agent    no agent installed at /opt/monit
+old-box-02               unreachable ssh to root@10.1.0.9 failed
+
+✓ 1 updated, 1 unchanged
+```
+
+| Flag | Meaning |
+|---|---|
+| `--list` | build or refresh `agents.txt` from the dashboard |
+| `--plan` | show what would change, change nothing |
+| `--only a,b` / `--skip a,b` | limit to, or exclude, these server IDs |
+| `-j N` | how many hosts at once (default 4) |
+| `--force` | update even when the checksum already matches |
+| `-f FILE` | use a different list file |
+
+Credentials for reading the list come from `MONIT_ADMIN_EMAIL` and
+`MONIT_ADMIN_PASSWORD`, or it asks. `agents.txt` holds ssh logins, so it is in
+`.gitignore` — keep it that way.
+
+**ssh keys are required.** Every connection uses `BatchMode=yes`: with four
+hosts running at once, a password prompt from one of them would hang the run
+with no way to tell which. Set up keys first (`ssh-copy-id`), or update those
+hosts one at a time with `./deploy-agent.sh <host> -u`.
+
+`-u` never touches `/etc/monit/agent.conf` — URLs, keys and intervals survive an
+update. Use `monit-config.sh` on the target to change those.
+
+## Updating the agent on a single host
 
 ```bash
 for h in 10.1.0.101 10.1.0.102 10.1.0.103; do

@@ -196,6 +196,13 @@ else
   CANDIDATES+=("http://${MYIP}:${PORT}")                    # straight to the app
 fi
 
+# `-u` swaps the agent files and restarts; it never writes agent.conf. Insisting
+# on resolving a central URL first therefore fails the update for a reason that
+# has nothing to do with it — which is exactly what broke a fleet-wide update on
+# hosts whose address the central server cannot guess.
+if [ "$UPDATE_ONLY" = 1 ]; then
+  API_URL=${API_URL:-unused-for-update}
+else
 info "checking which URL $TARGET can reach…"
 REACHABLE=""
 for u in "${CANDIDATES[@]}"; do
@@ -213,6 +220,7 @@ if [ -z "$REACHABLE" ]; then
    Override the address with -U once you know which one works."
 fi
 API_URL=$REACHABLE
+fi
 
 # --- server ID ---------------------------------------------------------------
 [ -z "$SERVER_ID" ] && SERVER_ID=$(rsh 'hostname -s 2>/dev/null || hostname' | tr -d '\r')

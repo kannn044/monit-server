@@ -41,6 +41,8 @@ onBeforeUnmount(() => clearInterval(timer));
 watch(() => props.install, (v) => {
   token.value = v?.token || '';
   expiresAt.value = v?.expires_at ? new Date(v.expires_at) : null;
+  serverCmd.value = v?.command || '';
+  if (v?.base_url) { baseUrl.value = v.base_url; baseSource.value = v.base_url_source || 'setting'; }
 });
 
 const secondsLeft = computed(() => {
@@ -54,9 +56,20 @@ const countdown = computed(() => {
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
 });
 
-const base = computed(() => (props.agentUrl || '').replace(/\/+$/, ''));
+// The server works out the base URL and hands back the finished command. It is
+// in a better position to: it knows the configured setting AND, when there is
+// none, the address this request actually arrived on — which is a guess that
+// demonstrably reaches the server. Recomposing the command here from a setting
+// that may be blank is what produced a dead <central-server-url> placeholder and
+// a Copy button nobody could press.
+const serverCmd = ref(props.install?.command || '');
+const baseUrl = ref(props.install?.base_url || props.agentUrl || '');
+const baseSource = ref(props.install?.base_url_source || (props.agentUrl ? 'setting' : 'none'));
+
+const base = computed(() => (baseUrl.value || '').replace(/\/+$/, ''));
+const guessed = computed(() => baseSource.value === 'request');
 const installCmd = computed(() =>
-  `curl -sSL ${base.value || '<central-server-url>'}/install/${token.value} | sudo bash`);
+  serverCmd.value || `curl -sSL ${base.value || '<central-server-url>'}/install/${token.value} | sudo bash`);
 
 async function newLink() {
   minting.value = true;
@@ -65,6 +78,9 @@ async function newLink() {
     const r = await api(`/api/v1/servers/${props.serverId}/install-token`, { method: 'POST' });
     token.value = r.token;
     expiresAt.value = new Date(r.expires_at);
+    serverCmd.value = r.command || '';
+    baseUrl.value = r.base_url || baseUrl.value;
+    baseSource.value = r.base_url_source || baseSource.value;
   } catch (e) {
     mintError.value = e.message;
   } finally {
@@ -143,38 +159,47 @@ async function copy(what, text) {
     <div class="oneline">
       <div class="ptitle">
         <span class="step">On the machine you want to monitor</span>
-        <span v-if="!base" class="badge warn">Settings → “Address agents connect to” is not set</span>
-        <span v-else-if="expired" class="badge warn">link expired</span>
+        <span v-if="expired" class="badge warn">link expired</span>
         <span v-else-if="secondsLeft !== null" class="badge">
           works once · expires in <b class="tnum">{{ countdown }}</b>
         </span>
+        <span v-if="guessed" class="badge warn">address not confirmed</span>
       </div>
 
       <div class="cmdrow">
         <code :class="{ stale: expired || !token }">{{ token ? installCmd : '— no install link —' }}</code>
-        <button class="sm primary" :disabled="!token || expired || !base"
-                @click="copy('one', installCmd)">
+        <!-- Never disabled while there is a link. A greyed-out Copy is a dead
+             end: whatever is wrong, the person still wants the text. -->
+        <button v-if="!expired && token" class="sm primary" @click="copy('one', installCmd)">
           {{ copied === 'one' ? 'Copied' : 'Copy' }}
+        </button>
+        <button v-else class="sm primary" :disabled="minting" @click="newLink">
+          {{ minting ? 'Creating…' : 'New link' }}
         </button>
       </div>
 
-      <p v-if="!base" class="phint warn">
-        The command has nowhere to point until an admin sets the address agents connect to.
-        It is the IP and port the app listens on, e.g. <code>http://10.1.1.171:8080</code> —
-        not the address of this dashboard.
-      </p>
-      <p v-else-if="expired || !token" class="phint">
-        Install links are short-lived on purpose. Getting a new one issues a new agent key,
-        so any agent still using the old one stops reporting.
-        <button class="link" :disabled="minting" @click="newLink">
-          {{ minting ? 'Creating…' : 'Create a new link' }}
-        </button>
+      <p v-if="expired || !token" class="phint">
+        Install links are short-lived on purpose. A new one issues a new agent key, so any agent
+        still using the old one stops reporting.
       </p>
       <p v-else class="phint">
-        Paste it into a root shell on <b class="mono">{{ serverIp || serverId }}</b>. It downloads the
-        agent, installs it, and sends one real sample before enabling anything — so a wrong address
-        or key fails there and then, in front of you. Nothing to copy by hand: the key travels
-        inside the link, and the link stops working the moment it is used.
+        Run it on <b class="mono">{{ serverIp || serverId }}</b>. <b>sudo</b> asks for that
+        machine's own login password — nothing from this dashboard. The script installs the agent
+        and sends one real sample before enabling anything, so a wrong address or key fails there
+        and then, in front of you. Nothing to copy by hand: the key travels inside the link, and
+        the link stops working the moment it is used.
+      </p>
+
+      <p v-if="guessed" class="phint warn">
+        <b>{{ base }}</b> is where you are reading this dashboard from, not a configured value —
+        the agent has to reach the API at that address for the install to work. An admin sets the
+        real one once in Settings → “Address agents connect to”; it is usually the app's own IP and
+        port, e.g. <code>http://10.1.1.171:8080</code>.
+      </p>
+      <p v-else-if="!base" class="phint warn">
+        There is no address for the agent to post to. An admin sets it in
+        Settings → “Address agents connect to” — the IP and port the app listens on,
+        e.g. <code>http://10.1.1.171:8080</code>.
       </p>
       <p v-if="mintError" class="phint warn">{{ mintError }}</p>
     </div>

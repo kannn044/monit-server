@@ -179,7 +179,9 @@ async function installLink(s) {
     const r = await api(`/api/v1/servers/${s.id}/install-token`, { method: 'POST' });
     issuedKey.value = {
       id: s.id, key: '', ip: s.ip || '', title: `Install ${s.name}`, rotated: false,
-      install: { token: r.token, expires_at: r.expires_at },
+      // Pass the response through whole: it carries the finished command and the
+      // base URL the server resolved, which the panel must not try to rebuild.
+      install: r,
     };
     notice.value = '';
     error.value = '';

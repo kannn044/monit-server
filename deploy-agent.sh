@@ -169,8 +169,14 @@ fi
 # `|| true` on each: with `set -o pipefail` a grep that matches nothing fails
 # the whole pipeline, and `set -e` would kill the script on the assignment.
 BASE=""
-[ -f .env ] && BASE=$(grep -E '^VITE_BASE=' .env | head -1 | cut -d= -f2- | sed 's#/$##' || true)
-PORT=$(grep -E '^APP_PORT=' .env 2>/dev/null | head -1 | cut -d= -f2- | awk -F: '{print $NF}' || true)
+PORT=""
+# -r, not -f. .env holds the database password and the JWT secret, so on a shared
+# checkout it is deliberately readable only by its owner; testing for existence
+# rather than readability printed "grep: .env: Permission denied" at everyone
+# else, which looks like a failure and is not one. Both values are conveniences
+# that -U overrides anyway.
+[ -r .env ] && BASE=$(grep -E '^VITE_BASE=' .env | head -1 | cut -d= -f2- | sed 's#/$##' || true)
+[ -r .env ] && PORT=$(grep -E '^APP_PORT=' .env | head -1 | cut -d= -f2- | awk -F: '{print $NF}' || true)
 [[ $PORT =~ ^[0-9]+$ ]] || PORT=8080
 MYIP=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}')
 [ -z "$MYIP" ] && MYIP=$(hostname -I 2>/dev/null | awk '{print $1}')
@@ -215,7 +221,8 @@ API_URL=$REACHABLE
 # --- optionally register it on the dashboard and grab the key ----------------
 if [ "$AUTO_REG" = 1 ] && [ -z "$API_KEY" ]; then
   # APP_PORT may be "8080" or "127.0.0.1:8080" — take whatever follows the colon.
-  APP_PORT_RAW=$(grep -E '^APP_PORT=' .env 2>/dev/null | head -1 | cut -d= -f2- || true)
+  APP_PORT_RAW=""
+  [ -r .env ] && APP_PORT_RAW=$(grep -E '^APP_PORT=' .env | head -1 | cut -d= -f2- || true)
   LOCAL_PORT=${APP_PORT_RAW##*:}
   [[ $LOCAL_PORT =~ ^[0-9]+$ ]] || LOCAL_PORT=8080
   LOCAL_URL="http://127.0.0.1:${LOCAL_PORT}"

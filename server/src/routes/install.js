@@ -62,15 +62,25 @@ async function agentPayload() {
   return files;
 }
 
-/** Where agents should post, as configured; falls back to how this request arrived. */
-async function agentBaseUrl(req) {
+/**
+ * Where agents should post.
+ *
+ * Prefer what an admin configured. When nothing is configured, fall back to the
+ * address this very request arrived on: it is a guess, but it is a guess that
+ * demonstrably reaches the server, which beats handing someone a command with a
+ * placeholder in it and a disabled button. `source` lets the caller say which
+ * of the two it is instead of passing a guess off as settled.
+ */
+export async function agentBaseUrl(req) {
   const { rows } = await q(`SELECT value FROM app_settings WHERE key = 'agent_api_url'`);
-  if (rows[0]?.value) return String(rows[0].value).replace(/\/+$/, '');
+  if (rows[0]?.value) return { url: String(rows[0].value).replace(/\/+$/, ''), source: 'setting' };
   const proto = req.headers['x-forwarded-proto'] || req.protocol || 'http';
   const host = req.headers['x-forwarded-host'] || req.headers.host;
   const prefix = String(req.headers['x-forwarded-prefix'] || '').replace(/\/+$/, '');
-  return host ? `${proto}://${host}${prefix}` : '';
+  return { url: host ? `${proto}://${host}${prefix}` : '', source: host ? 'request' : 'none' };
 }
+
+export const installCommand = (base, token) => `curl -sSL ${base}/install/${token} | sudo bash`;
 
 const shq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
 
@@ -176,9 +186,11 @@ export default async function installRoutes(app) {
         token,
         expires_at: expiresAt,
         ttl_minutes: ttlMinutes,
+        base_url: base.url,
+        base_url_source: base.source,   // 'setting' = configured, 'request' = inferred
         // No -f: with it, curl swallows the body on a 4xx and the person is
         // told nothing when a link has already been used or has expired.
-        command: `curl -sSL ${base}/install/${token} | sudo bash`,
+        command: installCommand(base.url, token),
         replaced_key: true,
       };
     } catch (e) {
@@ -223,7 +235,7 @@ export default async function installRoutes(app) {
       ]));
     }
 
-    const apiUrl = await agentBaseUrl(req);
+    const apiUrl = (await agentBaseUrl(req)).url;
     req.log.info({ server_id: claim.serverId, ip: req.ip }, 'install token redeemed');
 
     return reply

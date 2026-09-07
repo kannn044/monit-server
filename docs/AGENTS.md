@@ -22,6 +22,32 @@ sample to prove the address and key work, and enables the service. The person
 running it needs root **on that machine only** — no login on the central server,
 no ssh hop, and no agent key to carry.
 
+`sudo` will ask for a password. It is **that machine's own login password** for
+the account running the command — the dashboard has no part in it, and there is
+no password to look up anywhere. `sudo` reads it from the terminal, not from the
+pipe, so the prompt appears normally:
+
+```
+$ curl -sSL http://10.1.1.171:8080/install/kR7fMx… | sudo bash
+[sudo] password for adminmop:
+▸ checking http://10.1.1.171:8080 …
+✓ central server reachable
+✓ sample accepted (HTTP 202)
+```
+
+An account with `NOPASSWD` sudo is not asked at all. An account with no sudo
+rights cannot install the agent — that is a machine-level permission, and it has
+to be granted there.
+
+### The address in the link
+
+The command points at whatever **Settings → Address agents connect to** holds.
+If that has never been set, the dashboard falls back to the address you are
+reading it from and marks the command *address not confirmed* — it is a guess
+that at least reaches the server from your browser, which is not the same as
+reaching it from the machine being monitored. Set the real value once and the
+warning goes away.
+
 ### What the link is
 
 * **Good once.** Redeeming it marks it spent; a second run is refused.
@@ -122,16 +148,21 @@ handing out root, put it somewhere shared and gate it with a group:
 
 ```bash
 sudo mv /home/gdata/monit-server /opt/monit-deploy
-sudo groupadd -f monit-deploy
-sudo usermod -aG monit-deploy alice
-sudo chgrp -R monit-deploy /opt/monit-deploy
+sudo groupadd -f monitdeploy
+sudo usermod -aG monitdeploy alice
+sudo chgrp -R monitdeploy /opt/monit-deploy
 sudo chmod -R g+rX /opt/monit-deploy
 ```
 
 Leave `.env` out of it — `sudo chmod 600 /opt/monit-deploy/.env`. It holds the
-database password and the JWT secret, and the script does not need it once
-**Settings → Address agents connect to** is set, because the dashboard then
-supplies `-U` in the command it writes for you.
+database password and the JWT secret. The script reads it only to guess the
+port and sub-path, and does not need it once **Settings → Address agents connect
+to** is set, because the dashboard then supplies `-U` in the command it writes
+for you. An unreadable `.env` is skipped silently — it used to print
+`grep: .env: Permission denied`, which looked like a failure and was not one.
+
+Full step-by-step for a shared deployment account on Rocky 9, including the
+sshd password settings: **[docs/DEPLOY-ACCOUNT.md](DEPLOY-ACCOUNT.md)**.
 
 ### Deploying as an ordinary user
 

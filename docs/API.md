@@ -54,22 +54,80 @@ Old timestamps are accepted (buffered backlog); `last_seen` only moves forward.
 | POST | `/users` | admin | `{email,password,name,role}` |
 | PATCH | `/users/:id` | admin | `{name?,role?,disabled?,password?}` |
 
+## Roles
+
+Three roles, each a superset of the one before it (`viewer` < `operator` < `admin`).
+
+| | viewer | operator | admin |
+|---|---|---|---|
+| Read everything — fleet, servers, charts, rules, incidents, notification log | ✅ | ✅ | ✅ |
+| Acknowledge / resolve / silence incidents | | ✅ | ✅ |
+| **Register a server, edit it, move it between groups, set expected services** | | ✅ | ✅ |
+| Rotate an agent key · delete or restore a server | | | ✅ |
+| Create / archive groups · alert rules · notification channels | | | ✅ |
+| Manage users | | | ✅ |
+| Change **your own** password | ✅ | ✅ | ✅ |
+
+Where the operator line is drawn, and why:
+
+- **Onboarding is routine, removal is not.** `DELETE /servers/:id?purge=1` erases
+  every stored sample for a server and cannot be undone, and
+  `keys/rotate` stops a running agent the instant it is pressed — neither
+  belongs to the role whose job is adding machines.
+- **Re-registering a *deleted* id is an undelete**, not a create, so an operator
+  posting an archived id gets a 403 explaining that an admin must restore or
+  erase it. A brand-new id is created normally.
+- Operators can put servers into groups but not create or archive the groups
+  themselves.
+- Every server action is written to `audit_log` with the acting user's email, so
+  operator activity is attributable.
+
+Two things worth knowing when you hand someone the operator role: a new server
+inherits the `scope: all` alert rules, which are wired to your notification
+channels — so a misconfigured host can page the on-call channel. And the
+plaintext agent key is shown once at registration; if it is lost, only an admin
+can issue a replacement.
+
+### Sessions
+
+Access tokens last 15 minutes and refresh tokens 7 days, and both carry a `tv`
+claim holding the account's `token_version`. Every authenticated request
+re-checks it against the database, so:
+
+- changing a password (your own, or an admin resetting yours) bumps
+  `token_version` and **ends every other session immediately** — the 7-day
+  refresh window does not outlive the old password;
+- disabling an account signs it out at once rather than whenever its token
+  happens to expire;
+- a role change applies to the session already open.
+
+Agent ingest authenticates with a hashed API key and does not go through this
+path, so the write path is unaffected.
+
+| Method | Path | Role | Notes |
+|---|---|---|---|
+| POST | `/auth/change-password` | viewer | `{current_password, new_password}` — the current one is required, and a fresh token pair comes back so the caller stays signed in |
+| DELETE | `/users/:id` | admin | hard delete; refuses your own account and the last active admin |
+
+`PATCH /users/:id` also refuses to demote or disable the last active admin —
+losing it would leave nobody able to manage users, rules or channels.
+
 ## Servers
 
 | Method | Path | Role | Notes |
 |---|---|---|---|
 | GET | `/servers` | viewer | `?project=&env=&status=` — includes computed `health`. `?archived=only` lists deleted servers, `?archived=all` lists both |
-| POST | `/servers` | admin | `{id,name,ip?,project_ids?}` → **returns `api_key` once**. An id belonging to a *deleted* server is restored (`revived: true`); only a live id is a 409 |
+| POST | `/servers` | **operator** | `{id,name,ip?,project_ids?}` → **returns `api_key` once**. An id belonging to a *deleted* server is restored (`revived: true`); only a live id is a 409 |
 | GET | `/servers/:id` | viewer | detail + latest sample + expected services |
 | GET | `/servers/:id/summary` | viewer | latest values + derived net rate |
-| PATCH | `/servers/:id` | admin | `{name?,ip?,project_ids?}` |
+| PATCH | `/servers/:id` | **operator** | `{name?,ip?,project_ids?}` |
 | DELETE | `/servers/:id` | admin | archive: revoke keys, close alerts, hide it — history kept, id restorable |
 | DELETE | `/servers/:id?purge=1` | admin | erase: row, keys, alerts and every stored sample are deleted; the id is free |
 | POST | `/servers/:id/restore` | admin | un-archive an archived server, return a new key once |
-| POST | `/servers/bulk/group` | admin | `{server_ids:[...], project_id: uuid\|null}` — move many servers into one group; membership is **replaced**, `null` clears it |
+| POST | `/servers/bulk/group` | **operator** | `{server_ids:[...], project_id: uuid\|null}` — move many servers into one group; membership is **replaced**, `null` clears it |
 | POST | `/servers/:id/keys/rotate` | admin | revoke old, return new key once |
-| POST | `/servers/:id/expected-services` | admin | `{kind:"docker"\|"pm2", name}` |
-| DELETE | `/servers/:id/expected-services/:esId` | admin | |
+| POST | `/servers/:id/expected-services` | **operator** | `{kind:"docker"\|"pm2", name}` |
+| DELETE | `/servers/:id/expected-services/:esId` | **operator** | |
 
 `health` is `online` · `warning` · `critical` · `offline`, where offline means no
 sample for more than `SAMPLE_INTERVAL_S × 3`. Deleted servers report `archived`

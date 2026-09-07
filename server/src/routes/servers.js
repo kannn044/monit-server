@@ -43,8 +43,10 @@ export default async function serverRoutes(app) {
     return { servers };
   });
 
+  // Onboarding a server is an operator task. Removing one is not: DELETE can
+  // purge every stored sample, and rotating a key stops a running agent dead.
   app.post('/api/v1/servers', {
-    preHandler: requireRole('admin'),
+    preHandler: requireRole('operator'),
     schema: {
       body: {
         type: 'object', required: ['id', 'name'],
@@ -69,6 +71,17 @@ export default async function serverRoutes(app) {
       const { rows: prior } = await client.query(
         'SELECT id, archived_at FROM servers WHERE id = $1 FOR UPDATE', [id]);
       const revived = !!prior[0];
+      // Re-registering an archived id resurrects it. That is undoing an admin's
+      // deletion, so it needs an admin — an operator gets a clear explanation
+      // rather than a bare 403 on a form that looked like plain "add a server".
+      if (revived && prior[0].archived_at && req.user?.role !== 'admin') {
+        await client.query('ROLLBACK');
+        return reply.code(403).send({
+          title: 'That server ID belongs to a deleted server',
+          status: 403,
+          detail: `"${id}" was deleted and is being kept. Restoring it, or erasing it so the ID can be reused, is an admin action — ask an admin, or pick a different ID.`,
+        });
+      }
       if (revived && !prior[0].archived_at) {
         await client.query('ROLLBACK');
         return reply.code(409).send({
@@ -174,7 +187,7 @@ export default async function serverRoutes(app) {
   // A server belongs to exactly one group, so membership is REPLACED, not added
   // to. project_id: null clears it (the server moves to "Ungrouped").
   app.post('/api/v1/servers/bulk/group', {
-    preHandler: requireRole('admin'),
+    preHandler: requireRole('operator'),
     schema: {
       body: {
         type: 'object', required: ['server_ids'],
@@ -222,7 +235,7 @@ export default async function serverRoutes(app) {
   });
 
   app.patch('/api/v1/servers/:id', {
-    preHandler: requireRole('admin'),
+    preHandler: requireRole('operator'),
     schema: {
       body: {
         type: 'object',
@@ -342,8 +355,9 @@ export default async function serverRoutes(app) {
   });
 
   // ---- Expected services (drives service_down alerts) ----
+  // Expected services are part of configuring a server you just onboarded.
   app.post('/api/v1/servers/:id/expected-services', {
-    preHandler: requireRole('admin'),
+    preHandler: requireRole('operator'),
     schema: {
       body: {
         type: 'object', required: ['kind', 'name'],
@@ -366,7 +380,7 @@ export default async function serverRoutes(app) {
     }
   });
 
-  app.delete('/api/v1/servers/:id/expected-services/:esId', { preHandler: requireRole('admin') }, async (req, reply) => {
+  app.delete('/api/v1/servers/:id/expected-services/:esId', { preHandler: requireRole('operator') }, async (req, reply) => {
     const { rowCount } = await q('DELETE FROM expected_services WHERE id = $1 AND server_id = $2', [req.params.esId, req.params.id]);
     if (!rowCount) return reply.code(404).send({ title: 'Not found', status: 404 });
     await audit(req, 'expected_service.delete', 'server', req.params.id, { id: req.params.esId });

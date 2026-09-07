@@ -219,7 +219,9 @@ async function restore(s) {
            @click="filterGroup = filterGroup === '__none' ? '' : '__none'">
         <b>Ungrouped</b><span class="n">{{ ungroupedCount }}</span>
       </div>
-      <span v-if="!groups.length" class="muted" style="font-size: 12px">No groups yet — add one below.</span>
+      <span v-if="!groups.length" class="muted" style="font-size: 12px">
+        {{ auth.isAdmin ? 'No groups yet — add one below.' : 'No groups yet — an admin creates these.' }}
+      </span>
     </div>
 
     <form v-if="auth.isAdmin" class="row" style="margin-top: 12px" @submit.prevent="createGroup">
@@ -244,7 +246,7 @@ async function restore(s) {
 
     <!-- Bulk bar: the whole point of the redesign. Assigning 14 hosts one at a
          time is why grouping went unused. -->
-    <div v-if="auth.isAdmin && selected.size" class="bulk">
+    <div v-if="auth.isOperator && selected.size" class="bulk">
       <b>{{ selected.size }} selected</b>
       <select v-model="bulkTarget" style="width: 190px">
         <option value="">Move to group…</option>
@@ -258,7 +260,7 @@ async function restore(s) {
     <table>
       <thead>
         <tr>
-          <th v-if="auth.isAdmin" style="width: 26px">
+          <th v-if="auth.isOperator" style="width: 26px">
             <input type="checkbox" :checked="allVisibleSelected" title="Select all shown"
                    style="width: auto" @change="toggleAllVisible" />
           </th>
@@ -267,13 +269,13 @@ async function restore(s) {
       </thead>
       <tbody>
         <tr v-for="s in visibleServers" :key="s.id" :class="{ sel: selected.has(s.id) }">
-          <td v-if="auth.isAdmin">
+          <td v-if="auth.isOperator">
             <input type="checkbox" :checked="selected.has(s.id)" style="width: auto" @change="toggleOne(s.id)" />
           </td>
           <td><router-link :to="`/servers/${s.id}`">{{ s.name }}</router-link></td>
           <td class="mono muted nowrap">{{ s.id }}</td>
           <td>
-            <select v-if="auth.isAdmin" class="ginline" :class="{ unset: !groupOf(s) }"
+            <select v-if="auth.isOperator" class="ginline" :class="{ unset: !groupOf(s) }"
                     :value="groupOf(s)?.id || ''" @change="setGroup(s, $event.target.value)">
               <option value="">— Ungrouped —</option>
               <option v-for="g in groups" :key="g.id" :value="g.id">{{ g.name }}</option>
@@ -283,22 +285,26 @@ async function restore(s) {
           <td><span class="badge" :class="s.health">{{ s.health }}</span></td>
           <td class="muted">{{ ago(s.last_seen) }}</td>
           <td class="acts">
+            <button v-if="auth.isOperator" class="sm"
+                    @click="editingServer = { ...s, group_id: groupOf(s)?.id || '', ip: s.ip || '' }">Edit</button>
+            <!-- Issuing a key stops the running agent until the new one is
+                 installed, and Delete can erase the metric history, so both
+                 stay with admins even though operators manage servers. -->
             <template v-if="auth.isAdmin">
-              <button class="sm" @click="editingServer = { ...s, group_id: groupOf(s)?.id || '', ip: s.ip || '' }">Edit</button>
               <button class="sm" title="Issue a replacement key — forgotten keys cannot be looked up" @click="newKey(s)">New key</button>
               <button class="sm danger" @click="removing = { server: s, mode: 'archive' }">Delete</button>
             </template>
           </td>
         </tr>
         <tr v-if="!visibleServers.length">
-          <td :colspan="auth.isAdmin ? 7 : 6" class="empty">
+          <td :colspan="auth.isOperator ? 7 : 6" class="empty">
             {{ servers.length ? 'No servers match the filter.' : 'No servers registered.' }}
           </td>
         </tr>
       </tbody>
     </table>
 
-    <template v-if="auth.isAdmin">
+    <template v-if="auth.isOperator">
       <h2 style="margin-top: 16px">Register a server</h2>
       <form class="row" @submit.prevent="createServer">
         <input v-model="newServer.id" placeholder="server_id (e.g. web-prod-01)" required pattern="[A-Za-z0-9._\-]+" style="flex: 1" />

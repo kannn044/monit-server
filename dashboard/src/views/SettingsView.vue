@@ -2,7 +2,9 @@
 import { ref, onMounted, computed } from 'vue';
 import { api } from '../api.js';
 import { fmtTime } from '../util.js';
+import { useAuth } from '../stores/auth.js';
 
+const auth = useAuth();
 const users = ref([]);
 const channels = ref([]);
 const log = ref([]);
@@ -36,8 +38,34 @@ async function setRole(u, role) {
 }
 
 async function toggleUser(u) {
-  await api(`/api/v1/users/${u.id}`, { method: 'PATCH', body: { disabled: !u.disabled } });
-  await load();
+  try {
+    await api(`/api/v1/users/${u.id}`, { method: 'PATCH', body: { disabled: !u.disabled } });
+    await load();
+    flash(u.disabled ? `${u.email} enabled` : `${u.email} disabled and signed out`);
+  } catch (e) { error.value = e.message; }
+}
+
+// Resetting someone else's password also ends their open sessions, which is
+// the point when the reason for the reset is that the old one leaked.
+async function resetPassword(u) {
+  const pw = prompt(`New password for ${u.email} (at least 8 characters).\n\nThey will be signed out of every device.`);
+  if (pw === null) return;
+  if (pw.length < 8) { error.value = 'Password must be at least 8 characters'; return; }
+  try {
+    await api(`/api/v1/users/${u.id}`, { method: 'PATCH', body: { password: pw } });
+    flash(`Password reset for ${u.email} — their other sessions were ended`);
+    error.value = '';
+  } catch (e) { error.value = e.message; }
+}
+
+async function delUser(u) {
+  if (!confirm(`Delete ${u.email}?\n\nThe account is removed for good and the email can be used again. What they already did stays in the audit log.\n\nTo keep the account but block sign-in, use Disable instead.`)) return;
+  try {
+    await api(`/api/v1/users/${u.id}`, { method: 'DELETE' });
+    flash(`${u.email} deleted`);
+    error.value = '';
+    await load();
+  } catch (e) { error.value = e.message; }
 }
 
 const channelConfig = computed(() => {
@@ -92,7 +120,13 @@ async function delChannel(c) {
               </select>
             </td>
             <td><span class="badge" :class="u.disabled ? 'offline' : 'online'">{{ u.disabled ? 'disabled' : 'active' }}</span></td>
-            <td><button class="sm" @click="toggleUser(u)">{{ u.disabled ? 'Enable' : 'Disable' }}</button></td>
+            <td class="acts">
+              <button class="sm" @click="toggleUser(u)">{{ u.disabled ? 'Enable' : 'Disable' }}</button>
+              <button class="sm" @click="resetPassword(u)">Reset password</button>
+              <button class="sm danger" :disabled="u.id === auth.user?.sub"
+                      :title="u.id === auth.user?.sub ? 'You cannot delete your own account' : 'Remove this account for good'"
+                      @click="delUser(u)">Delete</button>
+            </td>
           </tr>
         </tbody>
       </table>
@@ -166,3 +200,7 @@ async function delChannel(c) {
 
   <div v-if="toast" class="toast">{{ toast }}</div>
 </template>
+
+<style scoped>
+.acts { white-space: nowrap; }
+</style>

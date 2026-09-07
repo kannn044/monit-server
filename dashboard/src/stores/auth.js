@@ -39,6 +39,15 @@ export const useAuth = defineStore('auth', {
         return true;
       } catch { return false; }
     },
+    // The server hands back a fresh token pair, so changing your own password
+    // does not sign you out of the tab you changed it in — every other session
+    // is invalidated.
+    setTokens(j) {
+      this.accessToken = j.access_token; this.refreshToken = j.refresh_token; this.user = j.user;
+      sessionStorage.setItem('mon_at', j.access_token);
+      sessionStorage.setItem('mon_rt', j.refresh_token);
+      sessionStorage.setItem('mon_user', JSON.stringify(j.user));
+    },
     logout() {
       this.accessToken = ''; this.refreshToken = ''; this.user = null;
       sessionStorage.clear();

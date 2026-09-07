@@ -1,0 +1,12 @@
+-- Password changes must end existing sessions.
+--
+-- Access and refresh tokens are stateless JWTs with no session table, so until
+-- now changing a password left every issued token valid — an access token for
+-- 15 minutes and a refresh token for a further 7 days. Someone whose password
+-- had been stolen could change it and the thief would keep working.
+--
+-- token_version is stamped into every token and re-checked on each request.
+-- Bumping it invalidates everything issued before, which is what "change my
+-- password" is expected to mean. It also makes disabling a user take effect at
+-- once rather than whenever their token happens to expire.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS token_version integer NOT NULL DEFAULT 0;

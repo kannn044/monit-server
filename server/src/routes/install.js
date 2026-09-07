@@ -1,6 +1,6 @@
 // The one-line install path.
 //
-//   curl -fsSL http://10.1.1.171:8080/install/<token> | sudo bash
+//   sudo bash -c 'curl -sSL http://10.1.1.171:8080/install/<token> | bash'
 //
 // Run on the machine being monitored, by whoever already has root there. That
 // removes three things from the old route: an account on the central server,
@@ -80,7 +80,19 @@ export async function agentBaseUrl(req) {
   return { url: host ? `${proto}://${host}${prefix}` : '', source: host ? 'request' : 'none' };
 }
 
-export const installCommand = (base, token) => `curl -sSL ${base}/install/${token} | sudo bash`;
+/**
+ * sudo first, then curl — the order matters more than it looks.
+ *
+ * The obvious `curl … | sudo bash` fetches the script, and therefore SPENDS the
+ * one-time token, before sudo has asked for anything. Mistype the password and
+ * the link is already gone: the retry gets "this install token has already been
+ * used" and the person has to go back to the dashboard for another one.
+ *
+ * Running curl inside `sudo bash -c` puts authentication first. A wrong password
+ * costs nothing, and the same link still works on the second attempt.
+ */
+export const installCommand = (base, token) =>
+  `sudo bash -c 'curl -sSL ${base}/install/${token} | bash'`;
 
 const shq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
 
@@ -131,7 +143,7 @@ __monit_install() {
 
   if [ "$(id -u)" != 0 ]; then
     red "run this with sudo:"
-    echo "   curl -sSL ${apiUrl}/install/<token> | sudo bash" >&2
+    echo "   sudo bash -c 'curl -sSL ${apiUrl}/install/<token> | bash'" >&2
     return 1
   fi
   command -v base64 >/dev/null 2>&1 || { red "base64 is required"; return 1; }

@@ -289,7 +289,7 @@ used — and answers with the command to run:
 
 ```json
 { "token": "kR7fMx…", "expires_at": "…", "ttl_minutes": 15, "replaced_key": true,
-  "command": "curl -sSL http://10.1.1.171:8080/install/kR7fMx… | sudo bash" }
+  "command": "sudo bash -c 'curl -sSL http://10.1.1.171:8080/install/kR7fMx… | bash'" }
 ```
 
 `GET /install/:token` returns a self-contained bash installer with the agent

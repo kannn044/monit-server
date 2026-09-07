@@ -14,7 +14,7 @@ Register the server in the dashboard (Groups → **Add a server**), or press
 on the machine being monitored:
 
 ```bash
-curl -sSL http://10.1.1.171:8080/install/kR7fMx…  | sudo bash
+sudo bash -c 'curl -sSL http://10.1.1.171:8080/install/kR7fMx… | bash'
 ```
 
 That is the whole procedure. It downloads the agent, installs it, sends one real
@@ -23,12 +23,12 @@ running it needs root **on that machine only** — no login on the central serve
 no ssh hop, and no agent key to carry.
 
 `sudo` will ask for a password. It is **that machine's own login password** for
-the account running the command — the dashboard has no part in it, and there is
-no password to look up anywhere. `sudo` reads it from the terminal, not from the
-pipe, so the prompt appears normally:
+the account running the command — the same one you would type to `ssh` in. The
+dashboard has no part in it: not your dashboard password, not the agent key, and
+there is nothing to look up anywhere.
 
 ```
-$ curl -sSL http://10.1.1.171:8080/install/kR7fMx… | sudo bash
+$ sudo bash -c 'curl -sSL http://10.1.1.171:8080/install/kR7fMx… | bash'
 [sudo] password for adminmop:
 ▸ checking http://10.1.1.171:8080 …
 ✓ central server reachable
@@ -36,8 +36,25 @@ $ curl -sSL http://10.1.1.171:8080/install/kR7fMx… | sudo bash
 ```
 
 An account with `NOPASSWD` sudo is not asked at all. An account with no sudo
-rights cannot install the agent — that is a machine-level permission, and it has
-to be granted there.
+rights cannot install the agent — that is a machine-level permission and has to
+be granted there.
+
+### Why `sudo bash -c '…'` and not `curl … | sudo bash`
+
+The pipeline form runs curl **first**. That spends the one-time token before
+sudo has asked for anything, so mistyping the password destroys the link:
+
+```
+$ curl -sSL …/install/kR7fMx… | sudo bash
+[sudo] password for pwuser:
+Sorry, try again.
+$ curl -sSL …/install/kR7fMx… | sudo bash      # same link, correct password
+✗ this install token has already been used
+```
+
+With curl inside `sudo bash -c`, authentication happens first and a wrong
+password costs nothing — the same link still installs on the next attempt. The
+dashboard generates this form; there is nothing to remember.
 
 ### The address in the link
 

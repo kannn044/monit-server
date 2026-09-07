@@ -69,7 +69,7 @@ const baseSource = ref(props.install?.base_url_source || (props.agentUrl ? 'sett
 const base = computed(() => (baseUrl.value || '').replace(/\/+$/, ''));
 const guessed = computed(() => baseSource.value === 'request');
 const installCmd = computed(() =>
-  serverCmd.value || `curl -sSL ${base.value || '<central-server-url>'}/install/${token.value} | sudo bash`);
+  serverCmd.value || `sudo bash -c 'curl -sSL ${base.value || '<central-server-url>'}/install/${token.value} | bash'`);
 
 async function newLink() {
   minting.value = true;
@@ -183,12 +183,24 @@ async function copy(what, text) {
         still using the old one stops reporting.
       </p>
       <p v-else class="phint">
-        Run it on <b class="mono">{{ serverIp || serverId }}</b>. <b>sudo</b> asks for that
-        machine's own login password — nothing from this dashboard. The script installs the agent
-        and sends one real sample before enabling anything, so a wrong address or key fails there
-        and then, in front of you. Nothing to copy by hand: the key travels inside the link, and
-        the link stops working the moment it is used.
+        Run it on <b class="mono">{{ serverIp || serverId }}</b>, signed in as any account with
+        <code>sudo</code> there.
       </p>
+      <ul v-if="!expired && token" class="facts">
+        <li>
+          <b>The password it asks for is that machine's own login password</b> — the account you
+          are signed in as. Nothing from this dashboard: not your dashboard password, not the
+          agent key.
+        </li>
+        <li>
+          Getting it wrong costs nothing. <code>sudo</code> authenticates before the link is
+          fetched, so the link survives a mistyped password — just run it again.
+        </li>
+        <li>
+          The script sends one real sample before enabling anything, so a wrong address or key
+          fails there and then, in front of you.
+        </li>
+      </ul>
 
       <p v-if="guessed" class="phint warn">
         <b>{{ base }}</b> is where you are reading this dashboard from, not a configured value —
@@ -331,6 +343,15 @@ async function copy(what, text) {
 .badge.warn { color: var(--warning); background: color-mix(in oklab, var(--warning) 14%, transparent); }
 .tnum { font-variant-numeric: tabular-nums; }
 .phint { font-size: 12px; color: var(--ink-2); margin: 8px 0 0; max-width: 78ch; line-height: 1.55; }
+/* Three separate things someone needs to know, not one paragraph to wade
+   through — the password question is the one that stops people. */
+.facts { margin: 7px 0 0; padding-left: 16px; max-width: 78ch; }
+.facts li { font-size: 12px; color: var(--ink-2); line-height: 1.55; margin-bottom: 4px; }
+.facts li::marker { color: var(--muted); }
+.facts code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  background: var(--grid); border-radius: 4px; padding: 0 4px;
+}
 .phint.warn { color: var(--warning); }
 .phint code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 

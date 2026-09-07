@@ -467,6 +467,30 @@ Credentials for reading the list come from `MONIT_ADMIN_EMAIL` and
 `MONIT_ADMIN_PASSWORD`, or it asks. `agents.txt` holds ssh logins, so it is in
 `.gitignore` — keep it that way.
 
+### If a script "does not exist" but you can see it
+
+```
+✗ run this from the monit-server directory (no ./deploy-agent.sh here)
+$ ls -l deploy-agent.sh
+-rw-r--r--. 1 root root 14201 Sep  7 16:05 deploy-agent.sh     ← no x
+```
+
+The execute bit does not survive every route into a repository: a file copied by
+a tool that does not carry file modes, then committed, is recorded in git as
+`100644` and every clone gets it that way. Restore it once, in git, so it stops
+happening:
+
+```bash
+chmod +x *.sh agent/*.sh
+git update-index --chmod=+x *.sh agent/*.sh
+git commit -m "restore exec bits on the scripts" && git push
+```
+
+`update-agents.sh` no longer stops for this — it falls back to running
+`bash ./deploy-agent.sh` and prints the fix — but the other scripts
+(`check-db-network.sh`, `check-telegram.sh`, `prune-metrics.sh`, `setup-db.sh`)
+will still need `bash ./script.sh` until the modes are fixed in git.
+
 **ssh keys are required.** Every connection uses `BatchMode=yes`: with four
 hosts running at once, a password prompt from one of them would hang the run
 with no way to tell which. Set up keys first (`ssh-copy-id`), or update those

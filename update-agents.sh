@@ -48,8 +48,24 @@ done
 
 command -v ssh >/dev/null 2>&1 || die "ssh is not installed on this host"
 command -v curl >/dev/null 2>&1 || die "curl is not installed on this host"
-[ -x ./deploy-agent.sh ] || die "run this from the monit-server directory (no ./deploy-agent.sh here)"
-[ -f agent/monit-agent.sh ] || die "agent/monit-agent.sh is missing — wrong directory?"
+
+# "missing" and "present but not executable" are different problems with
+# different fixes, and reporting the second as the first sends people hunting
+# for a file that is sitting right there. The execute bit is lost easily: a
+# file copied through a tool that does not carry modes, then committed, is
+# recorded in git as 0644 and arrives that way on every clone afterwards.
+[ -e ./deploy-agent.sh ] || die "no ./deploy-agent.sh here — run this from the monit-server directory (you are in $(pwd))"
+[ -r ./deploy-agent.sh ] || die "./deploy-agent.sh is not readable by $(id -un)"
+DEPLOY=./deploy-agent.sh
+if [ ! -x ./deploy-agent.sh ]; then
+  DEPLOY="bash ./deploy-agent.sh"
+  warn "./deploy-agent.sh is not executable ($(stat -c '%A' ./deploy-agent.sh)) — running it through bash"
+  echo "     Fix it for good, so every clone gets it too:"
+  echo "       chmod +x *.sh agent/*.sh"
+  echo "       git update-index --chmod=+x *.sh agent/*.sh && git commit -m 'restore exec bits' && git push"
+  echo
+fi
+[ -f agent/monit-agent.sh ] || die "agent/monit-agent.sh is missing — wrong directory? (you are in $(pwd))"
 
 # --- where is the dashboard, and who are we? ---------------------------------
 # Local first: this script runs on the central server, so the app is on
@@ -180,7 +196,7 @@ do_host() {
     return
   fi
 
-  if ./deploy-agent.sh "$target" -u >>"$logf" 2>&1; then
+  if $DEPLOY "$target" -u >>"$logf" 2>&1; then
     # -u swaps the files and restarts; confirm the service actually came back
     # rather than trusting the exit code.
     # cron mode is a legitimate install, so "no systemd unit" is not a failure —

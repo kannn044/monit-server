@@ -268,6 +268,28 @@ Outgoing notification payload:
 
 `event` is `alert.fired` · `alert.resolved` · `alert.reminder` · `alert.flapping` · `test`.
 
+## Settings
+
+The address agents post to. Stored in `app_settings`; it is what fills `-U` in
+the install command the dashboard prints after a server is registered.
+
+| Method | Path | Role |
+|---|---|---|
+| `GET` | `/api/v1/settings/agent-url` | viewer |
+| `PUT` | `/api/v1/settings/agent-url` | admin |
+| `POST` | `/api/v1/settings/agent-url/test` | admin |
+
+```json
+PUT  { "url": "http://10.1.1.171:8080" }
+POST { "url": "http://10.1.1.171:8080" }
+  -> { "ok": true,  "detail": "Reachable — agents can post here." }
+  -> { "ok": false, "detail": "That address returned the dashboard page, not the API. …" }
+```
+
+The test posts a real request rather than only opening a socket, so the common
+mistake — giving the browser's URL (`https://poc.moph.go.th/monit`), which
+answers with HTML — is caught here instead of on the first agent that fails.
+
 ## System
 
 `GET /api/v1/health` — unauthenticated liveness probe.

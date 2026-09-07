@@ -38,6 +38,19 @@ Without `-a` you paste a key you created in the dashboard yourself:
 Re-running on a host that already exists rotates its key and reinstalls — safe
 to repeat.
 
+### Where the dashboard gets `-U` from
+
+The dashboard writes this command out for you after you register a server, but
+it cannot guess the address agents should post to: the browser reaches the
+dashboard at whatever the reverse proxy publishes (`https://poc.moph.go.th/monit`),
+while an agent on the LAN has to reach the API directly (`http://10.1.1.171:8080`).
+Those are different addresses and only the second one works for an agent.
+
+An admin sets it once in **Settings → Address agents connect to**. **Test** posts
+to it and reports what came back — a dashboard page instead of the API is the
+usual mistake, and it is named as such. Every install command generated after
+that carries the right `-U`.
+
 **Values go in flags, never positionally.** `./deploy-agent.sh host api-server sk_…`
 is rejected rather than quietly ignoring the ID and key.
 

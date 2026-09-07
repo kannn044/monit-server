@@ -11,16 +11,46 @@ const log = ref([]);
 const error = ref('');
 const toast = ref('');
 const newUser = ref({ email: '', name: '', password: '', role: 'viewer' });
+const agentUrl = ref('');
+const agentUrlSaved = ref('');
+const agentUrlTest = ref(null);
 const newChannel = ref({ name: '', type: 'telegram', bot_token: '', chat_id: '', webhook_url: '', url: '' });
 
 async function load() {
   try {
-    const [u, c, l] = await Promise.all([api('/api/v1/users'), api('/api/v1/channels'), api('/api/v1/notification-log')]);
+    const [u, c, l, cfg] = await Promise.all([
+      api('/api/v1/users'), api('/api/v1/channels'), api('/api/v1/notification-log'),
+      api('/api/v1/settings/agent-url').catch(() => ({ agent_api_url: '' })),
+    ]);
     users.value = u.users; channels.value = c.channels; log.value = l.log;
+    agentUrl.value = cfg.agent_api_url || '';
+    agentUrlSaved.value = agentUrl.value;
     error.value = '';
   } catch (e) { error.value = e.message; }
 }
 onMounted(load);
+
+async function saveAgentUrl() {
+  try {
+    const r = await api('/api/v1/settings/agent-url', {
+      method: 'PUT', body: { agent_api_url: agentUrl.value },
+    });
+    agentUrl.value = r.agent_api_url; agentUrlSaved.value = r.agent_api_url;
+    agentUrlTest.value = null;
+    flash('Agent address saved');
+    error.value = '';
+  } catch (e) { error.value = e.message; }
+}
+
+// Tested from this process, which is the one agents actually talk to.
+async function testAgentUrl() {
+  agentUrlTest.value = { pending: true };
+  try {
+    agentUrlTest.value = await api('/api/v1/settings/agent-url/test', {
+      method: 'POST', body: { agent_api_url: agentUrl.value },
+    });
+  } catch (e) { agentUrlTest.value = { ok: false, detail: e.message }; }
+}
 
 function flash(m) { toast.value = m; setTimeout(() => (toast.value = ''), 2600); }
 
@@ -143,6 +173,29 @@ async function delChannel(c) {
     </div>
 
     <div class="card">
+      <h2>Address agents connect to</h2>
+      <p class="muted" style="font-size: 12px; margin: 4px 0 10px; line-height: 1.5">
+        The host and port an agent posts its samples to. This is usually
+        <b>not</b> the address you are reading this page at — the dashboard often sits behind a
+        domain and a sub-path, while agents go straight to the app's own port.
+        Every “add a server” screen uses this to write out a ready-to-run install command.
+      </p>
+      <div class="row" style="gap: 8px; flex-wrap: wrap">
+        <input v-model="agentUrl" placeholder="http://10.1.1.171:8080" spellcheck="false" style="flex: 1; min-width: 220px" />
+        <button class="sm" :disabled="!agentUrl" @click="testAgentUrl">Test</button>
+        <button class="sm primary" :disabled="agentUrl === agentUrlSaved" @click="saveAgentUrl">Save</button>
+      </div>
+      <div v-if="agentUrlTest" class="urlresult" :class="agentUrlTest.ok ? 'ok' : 'bad'">
+        <template v-if="agentUrlTest.pending">Checking…</template>
+        <template v-else-if="agentUrlTest.ok">Reachable — agents can post here.</template>
+        <template v-else>{{ agentUrlTest.detail || 'Not reachable.' }}</template>
+      </div>
+      <p v-if="!agentUrlSaved" class="urlresult bad" style="margin-top: 8px">
+        Not set yet — install commands will be missing their <span class="mono">-U</span> value.
+      </p>
+    </div>
+
+    <div class="card">
       <h2>Notification channels</h2>
       <table>
         <thead><tr><th>Name</th><th>Type</th><th>Enabled</th><th></th></tr></thead>
@@ -203,4 +256,7 @@ async function delChannel(c) {
 
 <style scoped>
 .acts { white-space: nowrap; }
+.urlresult { font-size: 12px; margin-top: 8px; border-radius: 8px; padding: 8px 11px; line-height: 1.5; }
+.urlresult.ok { color: var(--ink-2); background: color-mix(in oklab, var(--good) 12%, transparent); }
+.urlresult.bad { color: var(--ink-2); background: color-mix(in oklab, var(--warning) 12%, transparent); }
 </style>

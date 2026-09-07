@@ -5,7 +5,7 @@ import { api } from '../api.js';
 import { fmt, fmtBytes, fmtDuration, ago, fmtTime, RANGES } from '../util.js';
 import { useAuth } from '../stores/auth.js';
 import TimeChart from '../components/TimeChart.vue';
-import AgentKey from '../components/AgentKey.vue';
+import AgentSetup from '../components/AgentSetup.vue';
 import Meter from '../components/Meter.vue';
 
 const route = useRoute();
@@ -19,6 +19,7 @@ const range = ref(RANGES[1]); // 1h
 const charts = ref({}); // kind → series
 const loadingCharts = ref(false);
 const newKey = ref('');
+const agentUrl = ref('');
 const error = ref('');
 let timer;
 
@@ -62,6 +63,11 @@ async function loadCharts() {
 
 // There is no "show me the key again" — only its SHA-256 hash is stored. A
 // forgotten key is replaced, not recovered.
+async function loadAgentUrl() {
+  try { agentUrl.value = (await api('/api/v1/settings/agent-url')).agent_api_url || ''; }
+  catch { agentUrl.value = ''; }
+}
+
 async function rotateKey() {
   if (!confirm('Issue a new agent key?\n\nThe current key stops working immediately — the agent will not report again until the new key is installed on that host.')) return;
   try {
@@ -79,6 +85,7 @@ const hasGpu = computed(() => Object.keys(charts.value.gpu || {}).length > 0 || 
 const visibleKinds = computed(() => kinds.filter((k) => !k.startsWith('gpu') || hasGpu.value));
 
 onMounted(() => {
+  loadAgentUrl();
   loadInfo(); loadCharts();
   timer = setInterval(() => { loadInfo(); if (range.value.ms <= 3600e3) loadCharts(); }, 10_000);
 });
@@ -112,8 +119,9 @@ watch(id, () => { info.value = null; charts.value = {}; loadInfo(); loadCharts()
       </div>
     </div>
 
-    <AgentKey v-if="newKey" :server-id="info.server.id" :api-key="newKey" title="New agent key"
-              @dismiss="newKey = ''" />
+    <AgentSetup v-if="newKey" :server-id="info.server.id" :api-key="newKey"
+                :server-ip="info.server.ip || ''" :agent-url="agentUrl"
+                title="New agent key" rotated @dismiss="newKey = ''" />
 
     <div v-if="summary" class="kpis" style="margin-bottom: 12px">
       <div class="stat"><div class="v">{{ fmt(summary.cpu_total, 'percent') }}</div><div class="l">CPU</div></div>

@@ -3,7 +3,7 @@ import { ref, onMounted, computed } from 'vue';
 import { api } from '../api.js';
 import { ago } from '../util.js';
 import { useAuth } from '../stores/auth.js';
-import AgentKey from '../components/AgentKey.vue';
+import AgentSetup from '../components/AgentSetup.vue';
 
 // "Group" in the UI is the `projects` table in the API and database — one
 // concept, one name on screen. A server belongs to exactly one group, so every
@@ -23,17 +23,23 @@ const selected = ref(new Set());
 const bulkTarget = ref('');
 const filterGroup = ref('');
 const search = ref('');
+const agentUrl = ref('');
+const addOpen = ref(false);
 
 const groupOf = (s) => s.projects?.[0] || null;
 
 async function load() {
   try {
-    const [p, s, a] = await Promise.all([
+    const [p, s, a, cfg] = await Promise.all([
       api('/api/v1/projects'),
       api('/api/v1/servers'),
       api('/api/v1/servers?archived=only'),
+      // The address agents use is not the address this page is open at, so it
+      // has to be read from the server rather than guessed from the browser.
+      api('/api/v1/settings/agent-url').catch(() => ({ agent_api_url: '' })),
     ]);
     groups.value = p.projects; servers.value = s.servers; archived.value = a.servers;
+    agentUrl.value = cfg.agent_api_url || '';
     // Drop anything that no longer exists so the bulk bar cannot act on ghosts.
     const live = new Set(s.servers.map((x) => x.id));
     selected.value = new Set([...selected.value].filter((id) => live.has(id)));
@@ -131,13 +137,15 @@ async function createServer() {
     };
     const r = await api('/api/v1/servers', { method: 'POST', body });
     issuedKey.value = {
-      id: r.server.id, key: r.api_key,
-      title: r.revived ? 'Server restored — new agent key' : 'Agent key',
+      id: r.server.id, key: r.api_key, ip: newServer.value.ip || '',
+      title: r.revived ? 'Server restored — install the agent again' : 'Server registered',
+      rotated: false,
     };
     notice.value = r.revived
       ? `"${r.server.id}" was previously deleted; its registration has been restored and a new key issued.`
       : '';
     newServer.value = { id: '', name: '', ip: '', group_id: '' };
+    addOpen.value = false;
     error.value = '';
     await load();
   } catch (e) { error.value = e.message; }
@@ -161,7 +169,7 @@ async function newKey(s) {
   if (!confirm(`Issue a new agent key for "${s.name}"?\n\nThe current key stops working immediately — the agent will not report again until the new key is installed on that host.`)) return;
   try {
     const r = await api(`/api/v1/servers/${s.id}/keys/rotate`, { method: 'POST' });
-    issuedKey.value = { id: s.id, key: r.api_key, title: 'New agent key' };
+    issuedKey.value = { id: s.id, key: r.api_key, ip: s.ip || '', title: 'New agent key', rotated: true };
     notice.value = '';
     error.value = '';
   } catch (e) { error.value = e.message; }
@@ -184,7 +192,7 @@ async function confirmRemove() {
 async function restore(s) {
   try {
     const r = await api(`/api/v1/servers/${s.id}/restore`, { method: 'POST' });
-    issuedKey.value = { id: s.id, key: r.api_key, title: 'Server restored — new agent key' };
+    issuedKey.value = { id: s.id, key: r.api_key, ip: s.ip || '', title: 'Server restored', rotated: false };
     notice.value = '';
     error.value = '';
     await load();
@@ -197,8 +205,62 @@ async function restore(s) {
   <div v-if="error" class="error-banner">{{ error }}</div>
   <div v-if="notice" class="notice">{{ notice }} <button class="sm" @click="notice = ''">Dismiss</button></div>
 
-  <AgentKey v-if="issuedKey" :server-id="issuedKey.id" :api-key="issuedKey.key" :title="issuedKey.title"
-            @dismiss="issuedKey = null" />
+  <!-- Adding a server is what people come to this page to do, so it opens the
+       page. The inventory below is reference; this is the action. -->
+  <section v-if="auth.isOperator" class="addcard">
+    <div class="addhead">
+      <div>
+        <h2>Add a server to monitor</h2>
+        <p class="sub">
+          Registering here issues the agent key. You then run one command on the central
+          server to install the agent on the machine — the next screen writes it out for you.
+        </p>
+      </div>
+      <button v-if="!addOpen" class="primary" @click="addOpen = true">Add a server</button>
+    </div>
+
+    <form v-if="addOpen" class="addform" @submit.prevent="createServer">
+      <label class="f">
+        Server ID
+        <input v-model="newServer.id" placeholder="mysql-cluster-mysqld2" required
+               pattern="[A-Za-z0-9._\-]+" spellcheck="false" />
+        <span class="fh">Used in commands and alerts. Letters, numbers, dot, dash, underscore.</span>
+      </label>
+      <label class="f">
+        Display name
+        <input v-model="newServer.name" placeholder="MySQL cluster — SQL node 2" required />
+        <span class="fh">What you will read on the Fleet page.</span>
+      </label>
+      <label class="f short">
+        IP address
+        <input v-model="newServer.ip" placeholder="10.1.0.222" spellcheck="false" />
+        <span class="fh">Optional, but it prefills the install command.</span>
+      </label>
+      <label class="f short">
+        Group
+        <select v-model="newServer.group_id">
+          <option value="">— No group —</option>
+          <option v-for="g in groups" :key="g.id" :value="g.id">{{ g.name }}</option>
+        </select>
+        <span class="fh">Can be changed any time.</span>
+      </label>
+      <div class="addactions">
+        <button type="button" @click="addOpen = false">Cancel</button>
+        <button class="primary" type="submit">Register &amp; show install command</button>
+      </div>
+    </form>
+
+    <p v-if="addOpen && !agentUrl" class="warnline">
+      <b>Set the agent address first.</b>
+      Admins: Settings → “Address agents connect to”. Without it the install command
+      cannot be completed — it is the host and port agents post to
+      (e.g. <span class="mono">http://10.1.1.171:8080</span>), not this dashboard's address.
+    </p>
+  </section>
+
+  <AgentSetup v-if="issuedKey" :server-id="issuedKey.id" :api-key="issuedKey.key"
+              :server-ip="issuedKey.ip" :agent-url="agentUrl" :title="issuedKey.title"
+              :rotated="issuedKey.rotated" @dismiss="issuedKey = null" />
 
   <div class="card">
     <div class="row" style="justify-content: space-between; align-items: baseline">
@@ -304,23 +366,6 @@ async function restore(s) {
       </tbody>
     </table>
 
-    <template v-if="auth.isOperator">
-      <h2 style="margin-top: 16px">Register a server</h2>
-      <form class="row" @submit.prevent="createServer">
-        <input v-model="newServer.id" placeholder="server_id (e.g. web-prod-01)" required pattern="[A-Za-z0-9._\-]+" style="flex: 1" />
-        <input v-model="newServer.name" placeholder="Display name" required style="flex: 1" />
-        <input v-model="newServer.ip" placeholder="IP (optional)" style="width: 120px" />
-        <select v-model="newServer.group_id" style="width: 160px">
-          <option value="">— No group —</option>
-          <option v-for="g in groups" :key="g.id" :value="g.id">{{ g.name }}</option>
-        </select>
-        <button class="primary" type="submit">Register</button>
-      </form>
-      <p class="muted" style="font-size: 12px">
-        The <span class="mono">server_id</span> must match <span class="mono">MONIT_SERVER_ID</span> in the agent config.
-        Reusing the ID of a deleted server restores it and issues a new key.
-      </p>
-    </template>
   </div>
 
   <div v-if="auth.isAdmin && archived.length" class="card" style="margin-top: 12px">
@@ -395,6 +440,27 @@ async function restore(s) {
 </template>
 
 <style scoped>
+.addcard {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 12px; padding: 14px 16px; margin-bottom: 12px;
+}
+.addhead { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; }
+.addhead h2 { margin: 0 0 3px; }
+.addhead .sub { margin: 0; font-size: 12px; color: var(--ink-2); max-width: 68ch; line-height: 1.5; }
+.addform {
+  display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-start;
+  margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--grid);
+}
+.addform .f { flex: 1; min-width: 190px; }
+.addform .f.short { flex: 0 1 160px; min-width: 140px; }
+.fh { display: block; font-size: 11px; color: var(--muted); margin-top: 3px; line-height: 1.4; }
+.addactions { flex-basis: 100%; display: flex; justify-content: flex-end; gap: 8px; }
+.warnline {
+  flex-basis: 100%; margin: 12px 0 0; font-size: 12px; line-height: 1.5; color: var(--ink-2);
+  background: color-mix(in oklab, var(--warning) 10%, transparent);
+  border-left: 3px solid var(--warning); border-radius: 0 8px 8px 0; padding: 9px 12px;
+}
+
 .modal-wrap { position: fixed; inset: 0; background: rgba(0,0,0,0.45); display: grid; place-items: center; z-index: 40; }
 .modal { width: 480px; max-width: 94vw; display: flex; flex-direction: column; gap: 10px; }
 .acts { white-space: nowrap; }

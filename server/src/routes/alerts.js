@@ -176,6 +176,66 @@ export default async function alertRoutes(app) {
     return { ok: true };
   });
 
+  // ---- Install settings ----
+  // The address AGENTS use to reach this server, which is not the address the
+  // dashboard is open at: the browser may be on https://poc.example.go.th/monit
+  // while agents post straight to http://10.1.1.171:8080. Nothing in the request
+  // reveals the second one, so an admin sets it once and every "add a server"
+  // screen can then print a command that works as-is.
+  app.get('/api/v1/settings/agent-url', { preHandler: requireRole('viewer') }, async () => {
+    const { rows } = await q(`SELECT value FROM app_settings WHERE key = 'agent_api_url'`);
+    return { agent_api_url: rows[0]?.value || '' };
+  });
+
+  app.put('/api/v1/settings/agent-url', {
+    preHandler: requireRole('admin'),
+    schema: {
+      body: {
+        type: 'object', required: ['agent_api_url'],
+        properties: { agent_api_url: { type: 'string' } },
+      },
+    },
+  }, async (req, reply) => {
+    const url = String(req.body.agent_api_url).trim().replace(/\/+$/, '');
+    if (url && !/^https?:\/\/[^\s/]+/i.test(url)) {
+      return reply.code(400).send({
+        title: 'That is not a URL', status: 400,
+        detail: 'Use the address agents connect to, e.g. http://10.1.1.171:8080',
+      });
+    }
+    await q(
+      `INSERT INTO app_settings (key, value) VALUES ('agent_api_url', $1)
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`, [url]);
+    await audit(req, 'settings.agent_url', 'settings', 'agent_api_url', { url });
+    return { agent_api_url: url };
+  });
+
+  // Checks the URL from where it matters: this process is the one agents talk to.
+  app.post('/api/v1/settings/agent-url/test', {
+    preHandler: requireRole('admin'),
+    schema: { body: { type: 'object', properties: { agent_api_url: { type: 'string' } } } },
+  }, async (req, reply) => {
+    let url = String(req.body?.agent_api_url || '').trim().replace(/\/+$/, '');
+    if (!url) {
+      const { rows } = await q(`SELECT value FROM app_settings WHERE key = 'agent_api_url'`);
+      url = rows[0]?.value || '';
+    }
+    if (!url) return reply.code(400).send({ title: 'No URL to test', status: 400 });
+    try {
+      const res = await fetch(`${url}/api/v1/health`, { signal: AbortSignal.timeout(5000) });
+      const body = await res.text();
+      if (res.ok && body.includes('"ok"')) return { ok: true, status: res.status };
+      return {
+        ok: false, status: res.status,
+        detail: body.trim().startsWith('<')
+          ? 'That address returned the dashboard page, not the API. An agent posting there gets HTML back and fails. Use the app\'s own host and port.'
+          : `Answered HTTP ${res.status} instead of the health endpoint.`,
+      };
+    } catch (e) {
+      return { ok: false, detail: `Could not reach it: ${e.message}` };
+    }
+  });
+
   // Send a test notification through a channel
   app.post('/api/v1/webhooks/test', {
     preHandler: requireRole('admin'),

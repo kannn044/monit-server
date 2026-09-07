@@ -181,6 +181,28 @@ running cluster.
 | Charts empty but server online | wait one aggregate refresh (1 min), or query with `bucket=raw` |
 | Fleet page slow with many servers | make sure migration `009_perf_indexes.sql` has run; without TimescaleDB the rollup views are not materialised, so keep `prune-metrics.sh` on a cron |
 | `getaddrinfo EAI_AGAIN <db-host>` in the app log | `./check-db-network.sh` — it is DNS, not PostgreSQL. See below |
+| Server `offline` but `systemctl status monit-agent` says **active (running)** | the running process is using an older config. See below |
+
+### "active (running)" and still offline
+
+`EnvironmentFile=/etc/monit/agent.conf` is read **once**, when the process
+starts. Re-running the installer to correct a URL or a key rewrites that file
+but does not restart a service that is already up, so the old process keeps
+posting to the old address while systemd cheerfully reports it healthy.
+
+The journal names the address the running process is actually using — compare
+it with the file:
+
+```bash
+sudo journalctl -u monit-agent | grep 'starting loop mode' | tail -1
+#   … starting loop mode, interval=10s, target=http://10.1.1.171:8080/api/v1/ingest
+sudo grep MONIT_API_URL /etc/monit/agent.conf
+#   MONIT_API_URL=https://poc.moph.go.th/monit          ← different: restart it
+sudo systemctl restart monit-agent
+```
+
+`install.sh` now restarts rather than `enable --now`, and warns if the running
+target still disagrees with the config after the restart.
 
 ### `EAI_AGAIN` — the app cannot find the database
 

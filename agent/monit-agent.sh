@@ -555,16 +555,53 @@ EOF
 # ---------------------------------------------------------------------------
 # Transport
 # ---------------------------------------------------------------------------
+# Why this reports a reason instead of just succeeding or failing:
+#
+# It used to be `curl -fsS -o /dev/null … 2>/dev/null` and a bare return code.
+# An agent could then fail every ten seconds for half an hour and leave exactly
+# one line in the journal — the "starting loop mode" line — while the dashboard
+# said "offline" and gave no clue why. The failure is the thing worth knowing,
+# and the HTTP status usually names the cause outright.
+SEND_ERR=""
 curl_send() {
-  local payload=$1
-  [ -z "$MONIT_API_KEY" ] && return 1
-  curl -fsS -o /dev/null \
+  local payload=$1 code errf bodyf msg body
+  SEND_ERR=""
+  [ -z "$MONIT_API_KEY" ] && { SEND_ERR="no MONIT_API_KEY in /etc/monit/agent.conf"; return 1; }
+
+  errf=$(mktemp 2>/dev/null) || errf=""
+  bodyf=$(mktemp 2>/dev/null) || bodyf=/dev/null
+  code=$(curl -sS -o "$bodyf" -w '%{http_code}' \
     --max-time "$MONIT_TIMEOUT" \
     --connect-timeout "$MONIT_CONNECT_TIMEOUT" \
     -H "Authorization: Bearer ${MONIT_API_KEY}" \
     -H "Content-Type: application/json" \
     --data-binary "$payload" \
-    "$INGEST_URL" 2>/dev/null
+    "$INGEST_URL" 2>"${errf:-/dev/null}")
+  msg=""
+  [ -n "$errf" ] && { msg=$(tr -d '\r' < "$errf" | tail -1); rm -f "$errf"; }
+  body=""
+  [ "$bodyf" != /dev/null ] && { body=$(head -c 200 "$bodyf" 2>/dev/null); rm -f "$bodyf"; }
+
+  case "$code" in
+    # 202 specifically, not "any 2xx". A URL that points at the dashboard rather
+    # than the API answers 200 with the SPA's index.html, and treating that as
+    # success is the worst possible outcome: the agent reports healthy, the
+    # journal stays clean, and no metric ever arrives. Ask for the one status the
+    # ingest endpoint actually returns.
+    202) return 0 ;;
+    200)
+      SEND_ERR="HTTP 200 (expected 202) from ${INGEST_URL} — that address is not the ingest endpoint. \
+Behind nginx the URL needs the sub-path, e.g. https://host/monit"
+      ;;
+    000|'') SEND_ERR="cannot reach ${INGEST_URL}${msg:+ — ${msg#curl: }}" ;;
+    401) SEND_ERR="HTTP 401 at ${INGEST_URL} — the agent key is wrong or was revoked; issue a new one in the dashboard" ;;
+    403) SEND_ERR="HTTP 403 — MONIT_SERVER_ID='${MONIT_SERVER_ID}' does not belong to this key" ;;
+    404) SEND_ERR="HTTP 404 at ${INGEST_URL} — wrong address. Behind nginx the URL needs the sub-path, e.g. https://host/monit" ;;
+    429) SEND_ERR="HTTP 429 — rate limited; the interval is too short, or another agent is using this server ID" ;;
+    5*) SEND_ERR="HTTP ${code} from ${INGEST_URL} — the central server is unwell" ;;
+    *) SEND_ERR="HTTP ${code} from ${INGEST_URL}${msg:+ — $msg}" ;;
+  esac
+  return 1
 }
 
 buffer_payload() {
@@ -607,12 +644,25 @@ flush_buffer() {
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+# Consecutive failures, so the log records the state changing rather than the
+# state persisting: the first failure and every 30th after it (five minutes at
+# the default interval), then one line when delivery comes back. Enough to see
+# an outage in `journalctl -u monit-agent` without burying the journal.
+SEND_FAILS=0
 run_once() {
   local payload
   payload=$(build_payload)
   if curl_send "$payload"; then
+    if [ "$SEND_FAILS" -gt 0 ]; then
+      log "delivery resumed after ${SEND_FAILS} failed attempt(s) — sending the backlog"
+      SEND_FAILS=0
+    fi
     flush_buffer
   else
+    SEND_FAILS=$((SEND_FAILS + 1))
+    if [ "$SEND_FAILS" -eq 1 ] || [ $((SEND_FAILS % 30)) -eq 0 ]; then
+      log "send failed (${SEND_FAILS}x): ${SEND_ERR}"
+    fi
     buffer_payload "$payload"
   fi
 }

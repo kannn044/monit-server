@@ -319,10 +319,24 @@ elif command -v systemctl >/dev/null 2>&1; then
     install -m 0644 "$DIR/monit-agent.service" /etc/systemd/system/monit-agent.service
   fi
   systemctl daemon-reload
-  systemctl enable --now monit-agent.service
+  # enable, then RESTART — not `enable --now`.
+  #
+  # The unit reads /etc/monit/agent.conf through EnvironmentFile, which systemd
+  # loads once when the process starts. `enable --now` leaves an already-running
+  # service exactly as it is, so re-installing a host to correct its URL or key
+  # rewrote the file, reported success, and left the old process posting to the
+  # old address — the service looked healthy while the dashboard said offline.
+  systemctl enable monit-agent.service >/dev/null 2>&1 || true
+  systemctl restart monit-agent.service
   sleep 3
   if systemctl is-active --quiet monit-agent; then
     ok "monit-agent running (a sample every ${INTERVAL}s)"
+    # Prove the running process picked up THIS config rather than an older one.
+    RUNNING_URL=$(journalctl -u monit-agent -n 20 --no-pager 2>/dev/null \
+                  | sed -n 's/.*target=\([^ ]*\)\/api\/v1\/ingest.*/\1/p' | tail -1)
+    if [ -n "$RUNNING_URL" ] && [ "$RUNNING_URL" != "$API_URL" ]; then
+      warn "the running agent reports target ${RUNNING_URL}, not ${API_URL} — restart it again and check /etc/monit/agent.conf"
+    fi
   else
     systemctl status monit-agent --no-pager -l | tail -15
     die "the service failed to start — see the status above"

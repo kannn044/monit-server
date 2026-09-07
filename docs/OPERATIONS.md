@@ -180,6 +180,46 @@ running cluster.
 | Ingest 429 | interval too short, or two agents sharing one `server_id` |
 | Charts empty but server online | wait one aggregate refresh (1 min), or query with `bucket=raw` |
 | Fleet page slow with many servers | make sure migration `009_perf_indexes.sql` has run; without TimescaleDB the rollup views are not materialised, so keep `prune-metrics.sh` on a cron |
+| `getaddrinfo EAI_AGAIN <db-host>` in the app log | `./check-db-network.sh` — it is DNS, not PostgreSQL. See below |
+
+### `EAI_AGAIN` — the app cannot find the database
+
+```
+Error: getaddrinfo EAI_AGAIN postgres-db
+  errno: -3001, syscall: 'getaddrinfo', hostname: 'postgres-db'
+```
+
+The app asked Docker's resolver for the database's name and got nothing. That is
+a networking fact, not a database one — PostgreSQL can be perfectly healthy.
+Docker only answers name lookups between containers that **share a user-defined
+network**, and never on the default `bridge`.
+
+```bash
+./check-db-network.sh          # names the exact cause and prints the fix
+./check-db-network.sh --fix    # also attaches the database, when that is the fix
+```
+
+The usual causes, in the order the script checks them:
+
+| Cause | Fix |
+|---|---|
+| the project directory moved, and `.env` did not come with it | put `.env` back, or re-run `./setup-db.sh` |
+| `.env` is readable only by root, and compose runs as someone else | run as that user, or loosen the file |
+| the database container was renamed | `docker rename <new> postgres-db`, or point `DATABASE_URL` at its real name |
+| `PG_NETWORK` names a network the database is not on | `docker network connect $PG_NETWORK <db-container>` |
+| the database is on the default `bridge` | create a named network, attach both, set `PG_NETWORK` |
+
+Moving the project is a common trigger for a different reason worth knowing:
+Compose takes its **project name from the directory name**, so a checkout moved
+from `monit-server/` to `monit-deploy/` builds `monit-deploy_default` instead of
+`monit-server_default` and leaves containers from the old run stranded on the old
+network. `docker-compose.app-only.yml` avoids that by declaring the network
+`external:` and naming it explicitly — one more reason to keep `PG_NETWORK`
+correct in `.env`. Pin the name outright if you prefer:
+
+```bash
+docker compose -p monit -f docker-compose.app-only.yml up -d
+```
 | Alerts fire but nothing arrives | usually the rule has no channel — Alert rules page flags them as **no channel**. See [TELEGRAM.md](TELEGRAM.md) |
 | Notification stuck retrying | pg_boss retries 5× with backoff, then dead-letters; inspect `pgboss.job` |
 | Migration warns about timescaledb | extension missing — the fallback views work, but install TimescaleDB for production |

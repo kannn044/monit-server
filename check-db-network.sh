@@ -129,47 +129,105 @@ if [ -n "$PG_NETWORK" ]; then
   fi
 fi
 
-# --- 4. can something on that network actually resolve the name? -------------
-echo
-info "resolving '$DB_HOST' from inside the network"
-APP_IMG=$(docker ps -a --filter 'name=monit' --format '{{.Image}}' | head -1)
+# --- 4. who is actually attached to that network? ----------------------------
+# Asking the network is better than starting a throwaway container to run a
+# lookup: it needs no image, pulls nothing, and it is the same fact. An earlier
+# version borrowed the app's image by `docker ps --format {{.Image}}`, which on a
+# compose-built image yields a bare ID; `docker run <id>:latest` then failed and
+# the failure text was mistaken for a successful lookup.
 NET=${PG_NETWORK:-${DB_NETS[0]}}
-if [ -n "$APP_IMG" ]; then
-  OUT=$(docker run --rm --network "$NET" --entrypoint sh "$APP_IMG" -c \
-        "getent hosts $DB_HOST || nslookup $DB_HOST 2>/dev/null" 2>&1 | head -3)
-  if [ -n "$OUT" ]; then
-    ok "resolved: $(echo "$OUT" | head -1)"
-  else
-    bad "still cannot resolve '$DB_HOST' on network '$NET'"
-    echo "   Check for a network alias rather than a plain name:"
-    echo "     docker inspect $DB_CT --format '{{json .NetworkSettings.Networks}}' | tr ',' '\\n' | grep -i alias"
-    exit 1
-  fi
-else
-  warn "no monit container to borrow an image from — skipping the live lookup"
-fi
+echo
+info "containers attached to '$NET'"
+docker network inspect "$NET" --format '{{range .Containers}}{{.Name}} {{.IPv4Address}}{{"\n"}}{{end}}' \
+  | sed '/^$/d;s/^/     /' || true
 
 # --- 5. and is the app itself on that network? -------------------------------
 echo
-APP_CT=$(docker ps -a --format '{{.Names}}' | grep -E '^monit(-|_|$)' | head -1)
-if [ -n "$APP_CT" ]; then
-  mapfile -t APP_NETS < <(docker inspect "$APP_CT" --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{"\n"}}{{end}}' | sed '/^$/d')
-  info "app container '$APP_CT' is on: ${APP_NETS[*]:-(none)}"
-  SHARED=""
-  for a in "${APP_NETS[@]:-}"; do for d in "${DB_NETS[@]}"; do [ "$a" = "$d" ] && SHARED=$a; done; done
-  if [ -n "$SHARED" ]; then
-    ok "app and database share '$SHARED'"
-    echo
-    ok "networking looks right — restart the app to pick it up:"
-    echo "     docker compose -f docker-compose.app-only.yml up -d"
-    echo "     docker logs -f $APP_CT"
+# Identify the app container by compose's own labels, not by name. After a
+# directory rename there are usually two sets of containers whose names both
+# start "monit", and `docker ps -a` returns the newest first — so a name match
+# happily picks the abandoned one and reports on the wrong container.
+PROJECT=$(basename "$(pwd)")
+APP_CT=$(docker ps -a \
+  --filter "label=com.docker.compose.project=$PROJECT" \
+  --filter "label=com.docker.compose.service=app" \
+  --format '{{.Names}}' | head -1)
+[ -n "$APP_CT" ] && ok "app container identified by compose label (project '$PROJECT')"
+if [ -z "$APP_CT" ]; then
+  APP_CT=$(docker ps -a --format '{{.Names}}' | grep -E '^monit' | grep -v -- '-db$' | head -1)
+  [ -n "$APP_CT" ] && warn "no compose label matched project '$PROJECT' — falling back to the name '$APP_CT'"
+fi
+if [ -z "$APP_CT" ]; then
+  warn "no app container found (looked for a name starting 'monit')"
+  echo "     docker compose -f docker-compose.app-only.yml up -d"
+  exit 1
+fi
+
+STATE=$(docker inspect "$APP_CT" --format '{{.State.Status}}')
+RESTARTS=$(docker inspect "$APP_CT" --format '{{.RestartCount}}')
+info "app container '$APP_CT' — state: $STATE, restarts: $RESTARTS"
+
+# A container that is not running has released its endpoints, so an empty
+# network list here means nothing on its own. Say so rather than letting it read
+# as "not attached".
+mapfile -t APP_NETS < <(docker inspect "$APP_CT" \
+  --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{"\n"}}{{end}}' | sed '/^$/d')
+CFG_NET=$(docker inspect "$APP_CT" --format '{{.HostConfig.NetworkMode}}')
+
+if [ "${#APP_NETS[@]}" -eq 0 ]; then
+  warn "it is attached to nothing right now — expected while it is $STATE"
+  info "the network it was created with: ${CFG_NET:-unknown}"
+else
+  info "attached to: ${APP_NETS[*]}"
+fi
+
+SHARED=""
+for a in "${APP_NETS[@]:-}" "$CFG_NET"; do
+  for d in "${DB_NETS[@]}"; do [ "$a" = "$d" ] && SHARED=$a; done
+done
+
+if [ -n "$SHARED" ]; then
+  ok "app and database are both on '$SHARED'"
+  echo
+  if [ "$STATE" != "running" ]; then
+    warn "so the network is right, and the app is still $STATE — the cause is elsewhere."
+    echo "   Its last words:"
+    docker logs --tail 12 "$APP_CT" 2>&1 | sed 's/^/     /'
   else
-    bad "app and database share no network."
-    echo "     docker network connect ${PG_NETWORK:-${DB_NETS[0]}} $APP_CT"
-    echo "   or, better, fix PG_NETWORK in .env and recreate it:"
-    echo "     docker compose -f docker-compose.app-only.yml up -d --force-recreate"
-    exit 1
+    ok "nothing to fix here."
   fi
+else
+  bad "the app is not on '$NET', where the database is."
+  echo
+  echo "   Recreate it so compose attaches it (reads PG_NETWORK from .env):"
+  echo "     docker compose -p monit -f docker-compose.app-only.yml up -d --force-recreate"
+  echo
+  echo "   Or attach the existing container and restart it:"
+  echo "     docker network connect $NET $APP_CT && docker restart $APP_CT"
+  if [ "$FIX" = 1 ]; then
+    echo
+    info "--fix: attaching and restarting"
+    docker network connect "$NET" "$APP_CT" 2>&1 | sed 's/^/     /' || true
+    docker restart "$APP_CT" >/dev/null && ok "restarted $APP_CT"
+    sleep 4
+    echo "   Log now:"
+    docker logs --tail 8 "$APP_CT" 2>&1 | sed 's/^/     /'
+  fi
+  exit 1
+fi
+
+# --- 6. leftovers from a previous project name -------------------------------
+# Compose names containers <project>_<service>_N, and the project defaults to the
+# directory name. Moving the checkout renames everything and abandons the old
+# set, which keeps running, keeps its port binding, and confuses every log you
+# read afterwards.
+OLD=$(docker ps -a --format '{{.Names}}\t{{.Status}}' | grep -E '^monit' | grep -v "^$APP_CT" | grep -v -- '-db' || true)
+if [ -n "$OLD" ]; then
+  echo
+  warn "other monit containers exist — probably from the directory's previous name:"
+  printf '%s\n' "$OLD" | sed 's/^/     /'
+  echo "   Once the new one is healthy, remove them:  docker rm -f <name>"
+  echo "   To stop the name moving again, pin the project:  docker compose -p monit …"
 fi
 
 echo

@@ -15,6 +15,7 @@ import serverRoutes from './routes/servers.js';
 import projectRoutes from './routes/projects.js';
 import metricsRoutes from './routes/metrics.js';
 import alertRoutes from './routes/alerts.js';
+import installRoutes from './routes/install.js';
 import { startNotifier } from './workers/notifier.js';
 import { startAlertEngine } from './workers/alert-engine.js';
 import { resolveJwtSecret } from './lib/secrets.js';
@@ -57,6 +58,9 @@ async function main() {
   await app.register(projectRoutes);
   await app.register(metricsRoutes);
   await app.register(alertRoutes);
+  // Registered before the static handler so /install/:token is not mistaken for
+  // a dashboard route and answered with index.html.
+  await app.register(installRoutes);
 
   // Serve the built dashboard (public/) with SPA fallback
   const publicDir = path.join(__dirname, '../public');

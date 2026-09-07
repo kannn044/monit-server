@@ -17,6 +17,10 @@ COPY server/package*.json ./
 RUN npm ci --omit=dev
 COPY server/ ./
 COPY --from=dashboard /build/dist ./public
+# The one-line installer (/install/<token>) embeds these and serves them to the
+# machine being monitored. Without them that route returns 503 and the only way
+# in is ssh + deploy-agent.sh from the central server.
+COPY agent/ ./agent/
 
 # COPY preserves the source tree's mode bits and assigns them to root. A build
 # context taken off a restrictive mount can arrive 0600/0700, which leaves the

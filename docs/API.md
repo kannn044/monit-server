@@ -268,6 +268,44 @@ Outgoing notification payload:
 
 `event` is `alert.fired` · `alert.resolved` · `alert.reminder` · `alert.flapping` · `test`.
 
+## Install links
+
+| Method | Path | Role |
+|---|---|---|
+| `POST` | `/api/v1/servers/:id/install-token` | operator |
+| `GET` | `/install/:token` | none — the token is the credential |
+
+`POST /api/v1/servers` already returns one for the server it just created, so a
+fresh registration needs no extra call:
+
+```json
+{ "server": {...}, "api_key": "sk_agent_…",
+  "install": { "token": "kR7fMx…", "expires_at": "…", "ttl_minutes": 15 } }
+```
+
+`POST /install-token` mints one for a server that already exists. It **replaces
+the server's agent key** — a running agent stops reporting until the link is
+used — and answers with the command to run:
+
+```json
+{ "token": "kR7fMx…", "expires_at": "…", "ttl_minutes": 15, "replaced_key": true,
+  "command": "curl -sSL http://10.1.1.171:8080/install/kR7fMx… | sudo bash" }
+```
+
+`GET /install/:token` returns a self-contained bash installer with the agent
+files embedded and the key filled in, then marks the token spent. One request,
+so there is no second fetch needing its own credentials. It is unauthenticated
+on purpose: requiring an account here is exactly what this route removes.
+
+Refusals (`404` unknown, `410` used or expired, `503` agent files missing from
+the build) answer with a short script that prints the reason and exits 1 — the
+command is piped into bash, and comments or an empty body would show the person
+nothing.
+
+Storage: only `sha256(token)` is kept. The agent key is stored beside it
+encrypted (AES-256-GCM) under a key derived from the raw token, so the row is
+inert without the token the requester holds.
+
 ## Settings
 
 The address agents post to. Stored in `app_settings`; it is what fills `-U` in

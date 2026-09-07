@@ -140,6 +140,9 @@ async function createServer() {
       id: r.server.id, key: r.api_key, ip: newServer.value.ip || '',
       title: r.revived ? 'Server restored — install the agent again' : 'Server registered',
       rotated: false,
+      // Minted alongside the key so the install line is ready immediately; null
+      // if that failed, in which case the panel offers to create one.
+      install: r.install || null,
     };
     notice.value = r.revived
       ? `"${r.server.id}" was previously deleted; its registration has been restored and a new key issued.`
@@ -160,6 +163,26 @@ async function saveServer() {
     });
     editingServer.value = null;
     await load();
+  } catch (e) { error.value = e.message; }
+}
+
+// A fresh install link for a server registered earlier. It issues a new key, so
+// say that plainly first — on a host that is already reporting this is a
+// deliberate replacement, not a read-only action.
+async function installLink(s) {
+  const live = s.health && s.health !== 'offline' && s.health !== 'unknown';
+  const warning = live
+    ? `"${s.name}" is reporting right now.\n\nA new install link replaces its agent key, so the agent on that host stops reporting until the link is run there.\n\nContinue?`
+    : `Create an install link for "${s.name}"?\n\nIt works once, expires in 15 minutes, and issues a new agent key.`;
+  if (!confirm(warning)) return;
+  try {
+    const r = await api(`/api/v1/servers/${s.id}/install-token`, { method: 'POST' });
+    issuedKey.value = {
+      id: s.id, key: '', ip: s.ip || '', title: `Install ${s.name}`, rotated: false,
+      install: { token: r.token, expires_at: r.expires_at },
+    };
+    notice.value = '';
+    error.value = '';
   } catch (e) { error.value = e.message; }
 }
 
@@ -212,8 +235,9 @@ async function restore(s) {
       <div>
         <h2>Add a server to monitor</h2>
         <p class="sub">
-          Registering here issues the agent key. You then run one command on the central
-          server to install the agent on the machine — the next screen writes it out for you.
+          Registering issues the agent key and an install link. The next screen gives you one
+          line to run on the machine itself — no account on this server needed, and no key to
+          copy by hand.
         </p>
       </div>
       <button v-if="!addOpen" class="primary" @click="addOpen = true">Add a server</button>
@@ -260,7 +284,8 @@ async function restore(s) {
 
   <AgentSetup v-if="issuedKey" :server-id="issuedKey.id" :api-key="issuedKey.key"
               :server-ip="issuedKey.ip" :agent-url="agentUrl" :title="issuedKey.title"
-              :rotated="issuedKey.rotated" @dismiss="issuedKey = null" />
+              :rotated="issuedKey.rotated" :install="issuedKey.install || null"
+              @dismiss="issuedKey = null" />
 
   <div class="card">
     <div class="row" style="justify-content: space-between; align-items: baseline">
@@ -349,6 +374,11 @@ async function restore(s) {
           <td class="acts">
             <button v-if="auth.isOperator" class="sm"
                     @click="editingServer = { ...s, group_id: groupOf(s)?.id || '', ip: s.ip || '' }">Edit</button>
+            <!-- The way back for "I registered it last week and never installed
+                 the agent", and the only route for a machine whose key is lost. -->
+            <button v-if="auth.isOperator" class="sm"
+                    title="Get a one-line install command for this server"
+                    @click="installLink(s)">Install</button>
             <!-- Issuing a key stops the running agent until the new one is
                  installed, and Delete can erase the metric history, so both
                  stay with admins even though operators manage servers. -->

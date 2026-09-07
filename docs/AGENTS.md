@@ -1,12 +1,59 @@
 # Rolling out and maintaining agents
 
-Three scripts cover the whole lifecycle:
-
 | Script | Runs on | For |
 |---|---|---|
+| the install link | target | one line, from the dashboard — no account here |
 | `deploy-agent.sh` | central server | push + install on a target over ssh |
 | `agent/install.sh` | target | first install, asks step by step |
 | `/opt/monit/monit-config.sh` | target | change settings afterwards |
+
+## The install link — one line, no account on this server
+
+Register the server in the dashboard (Groups → **Add a server**), or press
+**Install** on a server that is already listed. Either gives you a line to run
+on the machine being monitored:
+
+```bash
+curl -sSL http://10.1.1.171:8080/install/kR7fMx…  | sudo bash
+```
+
+That is the whole procedure. It downloads the agent, installs it, sends one real
+sample to prove the address and key work, and enables the service. The person
+running it needs root **on that machine only** — no login on the central server,
+no ssh hop, and no agent key to carry.
+
+### What the link is
+
+* **Good once.** Redeeming it marks it spent; a second run is refused.
+* **Expires after 15 minutes.** Press **Install** again for a new one.
+* **It carries the key.** That is the point: nobody has to copy a key into a
+  file, a chat message, or their shell history. The key reaches
+  `/etc/monit/agent.conf` (root:monit, 0640) and exists nowhere else.
+* **Asking for one issues a new key.** On a host that is already reporting, its
+  agent stops until the link is run there. The dashboard warns before doing it.
+
+The token is stored only as a SHA-256, and the key it hands back is held
+encrypted under a value derived from the token itself — so the database has the
+ciphertext but not the means to open it. A database dump cannot be replayed into
+a working agent key.
+
+If the link is wrong or stale, the message says so in the terminal:
+
+```
+✗ this install token has already been used
+
+  An install link works on one machine and expires 15 minutes after it is created.
+  In the dashboard, open the server and press "Install command" for a fresh one.
+```
+
+Note the command has no `-f`. With `curl -f`, a 4xx throws the body away and the
+person sees nothing at all — the reason above never reaches them.
+
+### When to use ssh instead
+
+The link needs the target to reach the central server over HTTP, and it does one
+host at a time. For a batch of hosts, or a target that cannot reach the
+dashboard's address, use `deploy-agent.sh` below.
 
 ## Adding a host, from the central server
 
@@ -53,6 +100,38 @@ that carries the right `-U`.
 
 **Values go in flags, never positionally.** `./deploy-agent.sh host api-server sk_…`
 is rejected rather than quietly ignoring the ID and key.
+
+### deploy-agent.sh does not need root here
+
+Every `sudo` in the script runs on the **target**, over ssh. On the central
+server it only reads `agent/` and writes to `/tmp`, so any account can run it:
+
+```
+$ id -un; sudo -n true || echo "no sudo"
+deployer
+no sudo
+$ ./deploy-agent.sh target@10.1.0.222 -i api-01 -k sk_agent_… -U http://10.1.1.171:8080
+✓ ssh to target@10.1.0.222 works
+✓ sudo available without a password        ← on the target, not here
+✓ files staged in /home/target/.monit-agent-deploy
+```
+
+What actually stops other people is the directory: a checkout under
+`/home/gdata/` is not readable by anyone else. To let a team use it without
+handing out root, put it somewhere shared and gate it with a group:
+
+```bash
+sudo mv /home/gdata/monit-server /opt/monit-deploy
+sudo groupadd -f monit-deploy
+sudo usermod -aG monit-deploy alice
+sudo chgrp -R monit-deploy /opt/monit-deploy
+sudo chmod -R g+rX /opt/monit-deploy
+```
+
+Leave `.env` out of it — `sudo chmod 600 /opt/monit-deploy/.env`. It holds the
+database password and the JWT secret, and the script does not need it once
+**Settings → Address agents connect to** is set, because the dashboard then
+supplies `-U` in the command it writes for you.
 
 ### Deploying as an ordinary user
 

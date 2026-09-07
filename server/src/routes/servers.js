@@ -2,6 +2,7 @@ import { q, pool } from '../db/pool.js';
 import { requireRole, audit, generateAgentKey, sha256 } from '../lib/auth.js';
 import { computeHealth } from '../lib/health.js';
 import { extractMetric } from '../lib/metrics.js';
+import { mintInstallToken } from '../lib/install-token.js';
 
 async function serversWithHealth(filters = {}) {
   const { project, env, status, archived } = filters;
@@ -114,8 +115,22 @@ export default async function serverRoutes(app) {
       await client.query('INSERT INTO api_keys (server_id, key_hash) VALUES ($1,$2)', [id, sha256(apiKey)]);
       await client.query('COMMIT');
       await audit(req, revived ? 'server.restore' : 'server.create', 'server', id, { name, revived });
+
+      // Mint the install token here, from the key that was just issued, so the
+      // key never has to travel back from the browser to get one. If minting
+      // fails the registration still stands — the ssh route works without it.
+      let install = null;
+      try {
+        const { token, expiresAt, ttlMinutes } = await mintInstallToken({
+          serverId: id, apiKey, userId: req.user?.sub || null,
+        });
+        install = { token, expires_at: expiresAt, ttl_minutes: ttlMinutes };
+      } catch (e) {
+        req.log.error(e, 'could not mint an install token');
+      }
+
       // The plaintext key is returned ONCE — store it in the agent config now.
-      return reply.code(201).send({ server: { id, name, ip }, api_key: apiKey, revived });
+      return reply.code(201).send({ server: { id, name, ip }, api_key: apiKey, revived, install });
     } catch (e) {
       await client.query('ROLLBACK');
       if (e.code === '23505') return reply.code(409).send({ title: 'Server ID already exists', status: 409 });

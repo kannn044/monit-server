@@ -11,6 +11,7 @@ import IncidentsView from './views/IncidentsView.vue';
 import RulesView from './views/RulesView.vue';
 import ProjectsView from './views/ProjectsView.vue';
 import SettingsView from './views/SettingsView.vue';
+import ChatView from './views/ChatView.vue';
 import { useAuth } from './stores/auth.js';
 
 const router = createRouter({
@@ -23,6 +24,7 @@ const router = createRouter({
     { path: '/rules', component: RulesView },
     { path: '/projects', component: ProjectsView },
     { path: '/settings', component: SettingsView },
+    { path: '/chat', component: ChatView },
   ],
 });
 

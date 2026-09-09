@@ -1,0 +1,69 @@
+[
+  {
+    "id": "count-servers",
+    "ask": "ตอนนี้มี server ทั้งหมดกี่เครื่อง",
+    "expect_sql": "SELECT count(*)::text FROM servers WHERE archived_at IS NULL",
+    "why": "the simplest possible grounding check — if this is wrong nothing else matters"
+  },
+  {
+    "id": "count-offline",
+    "ask": "มี server กี่เครื่องที่ offline อยู่",
+    "expect_sql": "SELECT count(*)::text FROM servers WHERE archived_at IS NULL AND (last_seen IS NULL OR last_seen < now() - interval '30 seconds')",
+    "why": "offline is a derived state, not a column — checks the model uses our definition"
+  },
+  {
+    "id": "count-open-incidents",
+    "ask": "ตอนนี้มี incident ที่ยังเปิดอยู่กี่รายการ",
+    "expect_sql": "SELECT count(*)::text FROM incidents WHERE status IN ('firing','acknowledged')",
+    "why": "must not count resolved or silenced incidents"
+  },
+  {
+    "id": "worst-ram",
+    "ask": "server ไหนใช้ RAM สูงที่สุดตอนนี้",
+    "expect_sql": "SELECT s.name FROM servers s JOIN LATERAL (SELECT ram FROM system_metrics m WHERE m.server_id = s.id ORDER BY time DESC LIMIT 1) m ON true WHERE s.archived_at IS NULL ORDER BY (m.ram->>'used_pct')::float DESC NULLS LAST LIMIT 1",
+    "why": "requires ordering across servers, not just reciting one line"
+  },
+  {
+    "id": "worst-disk",
+    "ask": "พาร์ทิชันไหนใกล้เต็มที่สุด อยู่บน server อะไร",
+    "expect_sql": "SELECT s.name FROM servers s JOIN LATERAL (SELECT disk FROM system_metrics m WHERE m.server_id = s.id ORDER BY time DESC LIMIT 1) m ON true WHERE s.archived_at IS NULL ORDER BY disk_max_used_pct(m.disk) DESC NULLS LAST LIMIT 1",
+    "why": "per-mount reasoning — the old prompt had no disk data at all"
+  },
+  {
+    "id": "pm2-total",
+    "ask": "รวมทุก server มี PM2 process ที่ online อยู่กี่ตัว",
+    "expect_sql": "SELECT COALESCE(sum((m.pm2->>'online')::int),0)::text FROM servers s JOIN LATERAL (SELECT pm2 FROM system_metrics m2 WHERE m2.server_id = s.id ORDER BY time DESC LIMIT 1) m ON true WHERE s.archived_at IS NULL",
+    "why": "summing across the fleet — a classic small-model arithmetic failure"
+  },
+  {
+    "id": "docker-total",
+    "ask": "มี docker container ที่กำลังรันอยู่ทั้งหมดกี่ตัว",
+    "expect_sql": "SELECT COALESCE(sum((m.docker->>'running')::int),0)::text FROM servers s JOIN LATERAL (SELECT docker FROM system_metrics m2 WHERE m2.server_id = s.id ORDER BY time DESC LIMIT 1) m ON true WHERE s.archived_at IS NULL",
+    "why": "same, on a different collector"
+  },
+  {
+    "id": "ndb-nodes",
+    "ask": "MySQL NDB cluster ตอนนี้มี data node ที่ started อยู่กี่ตัว",
+    "expect_sql": "SELECT COALESCE(max((m.databases->'ndb'->>'data_nodes_started')::int),0)::text FROM servers s JOIN LATERAL (SELECT databases FROM system_metrics m2 WHERE m2.server_id = s.id ORDER BY time DESC LIMIT 1) m ON true WHERE s.archived_at IS NULL",
+    "skip_if_zero": true,
+    "why": "NDB data was collected but never reached the model before this change"
+  },
+  {
+    "id": "rule-count",
+    "ask": "มี alert rule ที่เปิดใช้งานอยู่กี่ข้อ",
+    "expect_sql": "SELECT count(*)::text FROM alert_rules WHERE enabled",
+    "why": "needs a tool call — this is not in the base context"
+  },
+  {
+    "id": "no-hallucination",
+    "ask": "server ชื่อ zzz-not-real-999 มีสถานะอย่างไร",
+    "expect_any": ["ไม่", "not", "ไม่พบ", "no server", "ไม่มี"],
+    "why": "the answer must be a refusal, not an invented status"
+  },
+  {
+    "id": "analysis-shape",
+    "ask": "ช่วยวิเคราะห์ว่า fleet ตอนนี้มีความเสี่ยงอะไรบ้าง และควรทำอะไรก่อน",
+    "expect_any": ["แนะนำ", "ควร", "recommend", "ขั้นตอน", "ตรวจ"],
+    "why": "an analysis answer must end in an action, not a description"
+  }
+]

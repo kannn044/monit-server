@@ -1,0 +1,845 @@
+<!doctype html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>html{color-scheme:light dark}body{margin:0}img{max-width:100%}[hidden]{display:none!important}</style>
+<title>Monit AI Chat Playbook</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bai+Jamjuree:wght@500;600;700&family=IBM+Plex+Sans+Thai:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+:root{
+  --ground:#EEF1EF; --surface:#FFFFFF; --surface-2:#F6F8F7;
+  --ink:#121A1C; --ink-2:#2C3A3D; --muted:#5F7175; --line:#D6DEDC;
+  --accent:#0C6B6B; --accent-soft:#DCEDEA; --accent-ink:#0C6B6B;
+  --crit:#A81F35; --crit-soft:#F7E2E5;
+  --warn:#8E5B08; --warn-soft:#F7EDD9;
+  --ok:#2F6B36; --ok-soft:#E1EFE2;
+  --code-bg:#0E1719; --code-ink:#D8E4E2; --code-line:#22343A;
+  --shadow:0 1px 2px rgba(18,26,28,.05), 0 8px 24px -16px rgba(18,26,28,.30);
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --ground:#0B1113; --surface:#121B1E; --surface-2:#172226;
+    --ink:#E3EDEB; --ink-2:#BCCCC9; --muted:#88A09D; --line:#253438;
+    --accent:#4FBFB0; --accent-soft:#122E2C; --accent-ink:#7BD6C8;
+    --crit:#EA7488; --crit-soft:#2E1519;
+    --warn:#DCA847; --warn-soft:#2C2312;
+    --ok:#77C47C; --ok-soft:#152A18;
+    --code-bg:#08100F; --code-ink:#CFDEDB; --code-line:#1D2C30;
+    --shadow:0 1px 2px rgba(0,0,0,.4), 0 10px 30px -18px rgba(0,0,0,.9);
+  }
+}
+:root[data-theme="dark"]{
+  --ground:#0B1113; --surface:#121B1E; --surface-2:#172226;
+  --ink:#E3EDEB; --ink-2:#BCCCC9; --muted:#88A09D; --line:#253438;
+  --accent:#4FBFB0; --accent-soft:#122E2C; --accent-ink:#7BD6C8;
+  --crit:#EA7488; --crit-soft:#2E1519;
+  --warn:#DCA847; --warn-soft:#2C2312;
+  --ok:#77C47C; --ok-soft:#152A18;
+  --code-bg:#08100F; --code-ink:#CFDEDB; --code-line:#1D2C30;
+  --shadow:0 1px 2px rgba(0,0,0,.4), 0 10px 30px -18px rgba(0,0,0,.9);
+}
+
+*{box-sizing:border-box}
+body{
+  background:var(--ground); color:var(--ink);
+  font-family:"IBM Plex Sans Thai","Noto Sans Thai",system-ui,sans-serif;
+  font-size:16px; line-height:1.72; margin:0;
+  -webkit-font-smoothing:antialiased;
+}
+.wrap{max-width:1120px; margin:0 auto; padding:0 24px 96px}
+.col{max-width:760px}
+h1,h2,h3,h4{font-family:"Bai Jamjuree","IBM Plex Sans Thai",system-ui,sans-serif; text-wrap:balance; margin:0}
+code,kbd,pre,.mono{font-family:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace}
+
+/* ---- masthead ---- */
+header.mast{border-bottom:1px solid var(--line); background:var(--surface); margin-bottom:56px}
+.mast-in{max-width:1120px; margin:0 auto; padding:44px 24px 32px}
+.eyebrow{
+  font-family:"IBM Plex Mono",monospace; font-size:11.5px; letter-spacing:.16em;
+  text-transform:uppercase; color:var(--accent-ink); margin:0 0 14px;
+}
+h1{font-size:clamp(30px,4.6vw,46px); line-height:1.15; font-weight:700; letter-spacing:-.015em; max-width:20ch}
+.dek{color:var(--ink-2); font-size:17.5px; max-width:62ch; margin:16px 0 0}
+.facts{
+  display:flex; flex-wrap:wrap; gap:0; margin-top:28px;
+  border:1px solid var(--line); border-radius:3px; overflow:hidden;
+}
+.fact{flex:1 1 168px; padding:11px 16px; border-right:1px solid var(--line); background:var(--surface-2)}
+.fact:last-child{border-right:0}
+.fact dt{font-family:"IBM Plex Mono",monospace; font-size:10.5px; letter-spacing:.1em; text-transform:uppercase; color:var(--muted); margin:0}
+.fact dd{margin:3px 0 0; font-size:14px; font-weight:500; font-family:"IBM Plex Mono",monospace}
+
+/* ---- sections ---- */
+section{margin:0 0 72px}
+.sec-head{display:flex; align-items:baseline; gap:14px; margin-bottom:8px; padding-bottom:10px; border-bottom:2px solid var(--ink)}
+.sec-num{font-family:"IBM Plex Mono",monospace; font-size:13px; color:var(--accent-ink); font-weight:500}
+h2{font-size:clamp(21px,2.6vw,27px); font-weight:600; letter-spacing:-.01em}
+h3{font-size:19px; font-weight:600; margin:36px 0 8px}
+h4{font-size:15.5px; font-weight:600; margin:22px 0 6px}
+p{margin:0 0 14px; max-width:70ch}
+.lead{font-size:17px; color:var(--ink-2)}
+ul,ol{margin:0 0 16px; padding-left:22px; max-width:70ch}
+li{margin:0 0 7px}
+strong{font-weight:600}
+a{color:var(--accent-ink)}
+.k{font-family:"IBM Plex Mono",monospace; font-size:.88em; background:var(--accent-soft); color:var(--accent-ink); padding:1.5px 5px; border-radius:2px; word-break:break-word}
+
+/* ---- diagnosis table ---- */
+.scroll{overflow-x:auto; margin:0 0 20px; border:1px solid var(--line); border-radius:3px; background:var(--surface)}
+table{border-collapse:collapse; width:100%; min-width:640px; font-size:14.5px}
+th,td{text-align:left; padding:11px 14px; border-bottom:1px solid var(--line); vertical-align:top}
+th{font-family:"Bai Jamjuree",sans-serif; font-weight:600; font-size:12.5px; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); background:var(--surface-2); white-space:nowrap}
+tbody tr:last-child td{border-bottom:0}
+td.id{font-family:"IBM Plex Mono",monospace; font-weight:500; color:var(--crit); white-space:nowrap}
+td.src{font-family:"IBM Plex Mono",monospace; font-size:12.5px; color:var(--muted); white-space:nowrap}
+
+/* ---- technique cards ---- */
+.layer{margin:0 0 36px}
+.layer-bar{
+  display:flex; align-items:center; gap:12px; margin:0 0 18px;
+  font-family:"Bai Jamjuree",sans-serif; font-weight:600; font-size:15px;
+}
+.layer-bar .tag{
+  font-family:"IBM Plex Mono",monospace; font-size:11px; letter-spacing:.1em; text-transform:uppercase;
+  padding:3px 9px; border-radius:2px; background:var(--accent); color:var(--surface);
+}
+:root[data-theme="dark"] .layer-bar .tag,
+:root:not([data-theme="light"]) .layer-bar .tag{color:#08100F}
+@media (prefers-color-scheme: light){:root:not([data-theme="dark"]) .layer-bar .tag{color:#fff}}
+.layer-bar .rule{flex:1; height:1px; background:var(--line)}
+
+.tech{
+  background:var(--surface); border:1px solid var(--line); border-radius:3px;
+  padding:22px 24px; margin:0 0 16px; box-shadow:var(--shadow);
+}
+.tech.pri{border-left:3px solid var(--accent)}
+.tech-h{display:flex; align-items:flex-start; gap:12px; flex-wrap:wrap; margin-bottom:6px}
+.tid{
+  font-family:"IBM Plex Mono",monospace; font-weight:500; font-size:13px;
+  color:var(--accent-ink); background:var(--accent-soft);
+  padding:3px 8px; border-radius:2px; flex:none; margin-top:2px;
+}
+.tech-h h3{margin:0; font-size:18px; flex:1 1 320px}
+.badges{display:flex; gap:6px; flex-wrap:wrap}
+.badge{
+  font-family:"IBM Plex Mono",monospace; font-size:11px; letter-spacing:.03em;
+  padding:3px 8px; border-radius:2px; border:1px solid var(--line); color:var(--muted); white-space:nowrap;
+}
+.badge.hi{background:var(--ok-soft); border-color:transparent; color:var(--ok); font-weight:500}
+.badge.md{background:var(--warn-soft); border-color:transparent; color:var(--warn); font-weight:500}
+.tech p:last-child{margin-bottom:0}
+
+pre{
+  background:var(--code-bg); color:var(--code-ink); border:1px solid var(--code-line);
+  border-radius:3px; padding:14px 16px; overflow-x:auto; font-size:12.8px; line-height:1.65;
+  margin:14px 0;
+}
+pre code{color:inherit; background:none; padding:0}
+.cap{font-size:12.5px; color:var(--muted); margin:-6px 0 16px; font-family:"IBM Plex Mono",monospace}
+
+/* ---- callout ---- */
+.note{
+  border-left:3px solid var(--warn); background:var(--warn-soft);
+  padding:12px 16px; border-radius:0 3px 3px 0; margin:16px 0; font-size:14.5px;
+}
+.note strong{color:var(--warn)}
+.note.good{border-left-color:var(--ok); background:var(--ok-soft)}
+.note.good strong{color:var(--ok)}
+
+/* ---- report ideas ---- */
+.reports{display:grid; grid-template-columns:repeat(auto-fill,minmax(268px,1fr)); gap:1px; background:var(--line); border:1px solid var(--line); border-radius:3px; overflow:hidden}
+.rep{background:var(--surface); padding:18px 20px}
+.rep .n{font-family:"IBM Plex Mono",monospace; font-size:11px; color:var(--muted); letter-spacing:.08em}
+.rep h4{margin:4px 0 6px; font-size:15.5px}
+.rep p{font-size:14px; color:var(--ink-2); margin:0; max-width:none}
+
+/* ---- phases ---- */
+.phases{border:1px solid var(--line); border-radius:3px; overflow:hidden; background:var(--surface)}
+.ph{display:grid; grid-template-columns:104px 1fr; gap:0; border-bottom:1px solid var(--line)}
+.ph:last-child{border-bottom:0}
+.ph-l{background:var(--surface-2); padding:16px 14px; border-right:1px solid var(--line)}
+.ph-l .p{font-family:"Bai Jamjuree",sans-serif; font-weight:700; font-size:17px}
+.ph-l .d{font-family:"IBM Plex Mono",monospace; font-size:11.5px; color:var(--muted); margin-top:2px}
+.ph-r{padding:16px 20px}
+.ph-r h4{margin:0 0 4px}
+.ph-r p{margin:0; font-size:14.5px; color:var(--ink-2)}
+.chips{display:flex; gap:5px; flex-wrap:wrap; margin-top:9px}
+.chip{font-family:"IBM Plex Mono",monospace; font-size:11px; padding:2px 7px; border-radius:2px; background:var(--accent-soft); color:var(--accent-ink)}
+
+/* ---- decisions ---- */
+.dec{border-top:1px solid var(--line); padding:16px 0}
+.dec:last-child{border-bottom:1px solid var(--line)}
+.dec h4{margin:0 0 4px; display:flex; gap:10px; align-items:baseline}
+.dec h4 .q{font-family:"IBM Plex Mono",monospace; color:var(--muted); font-size:13px}
+.dec p{margin:0; font-size:14.5px; color:var(--ink-2)}
+.dec .rec{margin-top:6px; font-size:14px; color:var(--accent-ink)}
+
+figure{margin:0 0 8px; background:var(--surface); border:1px solid var(--line); border-radius:3px; padding:20px 16px; overflow-x:auto}
+figure svg{display:block; min-width:720px; width:100%; height:auto}
+figcaption{font-size:12.5px; color:var(--muted); font-family:"IBM Plex Mono",monospace; margin-top:10px}
+
+footer{border-top:1px solid var(--line); padding-top:22px; color:var(--muted); font-size:14px; max-width:70ch}
+
+@media (max-width:640px){
+  .ph{grid-template-columns:1fr}
+  .ph-l{border-right:0; border-bottom:1px solid var(--line); display:flex; gap:10px; align-items:baseline}
+  .wrap{padding:0 18px 72px}
+  .mast-in{padding:32px 18px 26px}
+}
+@media (prefers-reduced-motion:reduce){*{animation:none!important; transition:none!important}}
+</style>
+
+</head>
+<body>
+<header class="mast">
+  <div class="mast-in">
+    <p class="eyebrow">monit-server · feature: ai chat</p>
+    <h1>ทำให้ AI Chat วิเคราะห์เป็น ไม่ใช่แค่นับของ</h1>
+    <p class="dek">
+      เอกสารนี้สรุปสิ่งที่อ่านจากโค้ดจริง ระบุสาเหตุที่คำตอบยังตื้น แล้วเสนอเทคนิค 10 ข้อ
+      เรียงตามแรงที่ต้องลงกับผลที่ได้ — <strong>ยังไม่มีการแก้โค้ดใด ๆ</strong> รอคุณเลือกก่อน
+    </p>
+    <dl class="facts">
+      <div class="fact"><dt>Stack</dt><dd>Fastify + TimescaleDB + Vue 3</dd></div>
+      <div class="fact"><dt>ไฟล์หลัก</dt><dd>routes/chat.js · 202 บรรทัด</dd></div>
+      <div class="fact"><dt>Inference</dt><dd>local vLLM · Qwen3 ~27–30B</dd></div>
+      <div class="fact"><dt>สถานะ</dt><dd>ข้อเสนอ · รอตัดสินใจ</dd></div>
+    </dl>
+  </div>
+</header>
+
+<div class="wrap">
+
+<!-- ================= 1 ================= -->
+<section class="col">
+  <div class="sec-head"><span class="sec-num">01</span><h2>ภาพรวมระบบที่อ่านมา</h2></div>
+  <p class="lead">
+    agent bash บนแต่ละโฮสต์ยิง JSON ทุก 10 วินาที → ingest API → <span class="k">system_metrics</span> (hypertable)
+    → continuous aggregate <span class="k">metrics_1m</span> / <span class="k">metrics_1h</span> → alert engine (state machine
+    debounce/hysteresis/flapping) → pg-boss → Telegram/Slack/Webhook → dashboard Vue 3
+  </p>
+  <p>
+    สิ่งที่สำคัญที่สุดสำหรับงานนี้คือ <strong>ข้อมูลที่คุณมีอยู่แล้วเยอะกว่าที่ AI เห็นมาก</strong>
+    agent เก็บมาครบทั้ง cpu ต่อคอร์, ram, load, disk ต่อ mount, network counter, gpu,
+    docker, pm2, http health check, mysql/postgres connection และที่น่าสนใจที่สุดคือ
+    <strong>topology ของ MySQL NDB Cluster</strong>
+  </p>
+  <p>
+    ตัว collector <span class="k">collect_ndb()</span> ดึงจาก <span class="k">ndbinfo.config_nodes</span> /
+    <span class="k">ndbinfo.nodes</span> / <span class="k">ndbinfo.membership</span> / <span class="k">ndbinfo.memoryusage</span>
+    และเสริมด้วย <span class="k">ndb_mgm -e show</span> แล้วรวมเป็น array ที่มี
+    <em>node id, type (NDB/MGM/API), host, status, nodegroup</em> พร้อม arbitrator และ data/index memory
+    — <strong>นี่คือทุกอย่างที่ต้องใช้วาดแผนผังคลัสเตอร์จริง โดยไม่ต้องเดาเลยสักช่อง</strong>
+  </p>
+  <div class="note good">
+    <strong>ข้อสรุปสำคัญ</strong> — ปัญหาไม่ใช่ "โมเดลโง่" แต่เป็น "เราให้ข้อมูลโมเดลน้อยเกินไป และปิดโหมดคิดของมันทิ้ง"
+    ตัวเลขทุกตัวที่ต้องใช้วิเคราะห์อยู่ในฐานข้อมูลอยู่แล้ว แค่ยังไม่เคยเดินทางไปถึง prompt
+  </div>
+</section>
+
+<!-- ================= 2 ================= -->
+<section>
+  <div class="col">
+    <div class="sec-head"><span class="sec-num">02</span><h2>ทำไมตอนนี้ตอบได้แค่ผิวเผิน</h2></div>
+    <p class="lead">อ่านจาก <span class="k">server/src/routes/chat.js</span> และ <span class="k">config.js</span> — แปดจุด เรียงตามความแรงของผลกระทบ</p>
+  </div>
+
+  <div class="scroll">
+    <table>
+      <thead><tr><th>#</th><th>สาเหตุ</th><th>หลักฐานในโค้ด</th><th>ผลที่เกิด</th></tr></thead>
+      <tbody>
+        <tr>
+          <td class="id">D1</td>
+          <td><strong>system prompt ไม่มีตัวเลขสักตัว</strong> — ใส่แค่ name/ip/os/health/last_seen + ชื่อ PM2/Docker + incident</td>
+          <td class="src">buildSystemPrompt()<br>serverLines</td>
+          <td>ไม่มี cpu / ram / disk / load / network / gpu / databases เข้าไปเลย → วิเคราะห์ไม่ได้เพราะไม่มีวัตถุดิบ</td>
+        </tr>
+        <tr>
+          <td class="id">D2</td>
+          <td><strong>ไม่มีมิติเวลา</strong> — ทุกอย่างเป็น snapshot ณ วินาทีนี้</td>
+          <td class="src">DISTINCT ON (server_id)<br>ORDER BY time DESC</td>
+          <td>พูดได้แค่ "ตอนนี้เท่าไร" พูดไม่ได้ว่า "ไต่ขึ้นมา 3 วันแล้ว" หรือ "ผิดปกติเทียบกับปกติ"</td>
+        </tr>
+        <tr>
+          <td class="id">D3</td>
+          <td><strong>ปิดโหมดคิดของ Qwen3 ทิ้ง</strong></td>
+          <td class="src">"Use /no_think to<br>disable thinking mode."</td>
+          <td>Qwen3 เป็น hybrid reasoning model — สั่ง no_think คือตัดความสามารถ multi-step reasoning ซึ่งเป็นแกนของ "การวิเคราะห์"</td>
+        </tr>
+        <tr>
+          <td class="id">D4</td>
+          <td><strong>ไม่มี tool ให้เรียก</strong> — one-shot ล้วน</td>
+          <td class="src">fetch(/chat/completions)<br>ไม่มี tools[]</td>
+          <td>ถ้าข้อมูลไม่อยู่ใน prompt โมเดลถามเพิ่มไม่ได้ ทางเลือกเหลือแค่ตอบว่าไม่รู้ หรือแต่ง</td>
+        </tr>
+        <tr>
+          <td class="id">D5</td>
+          <td><strong>sampling ไม่เหมาะกับงาน ops</strong></td>
+          <td class="src">temperature: 0.7<br>(ไม่มี top_p / top_k)</td>
+          <td>งานอ้างอิงตัวเลขต้องการ temperature ต่ำ ส่วนงานวิเคราะห์ต้องการค่าที่ Qwen3 แนะนำเฉพาะโหมด — ตอนนี้ใช้ค่าเดียวกับทุกอย่าง</td>
+        </tr>
+        <tr>
+          <td class="id">D6</td>
+          <td><strong>prompt โตตามขนาด fleet</strong> — ยัดทั้ง fleet ทุกข้อความ</td>
+          <td class="src">comment: "system prompt<br>grows with the fleet"</td>
+          <td>ถาม server เดียวก็ต้องแบกทั้ง fleet, เปลือง context, และ history ถูกตัดจน conversation ขาดตอน</td>
+        </tr>
+        <tr>
+          <td class="id">D7</td>
+          <td><strong>ข้อมูลที่เก็บมาแล้วแต่ไม่เคยส่งให้ AI</strong></td>
+          <td class="src">databases.ndb, http, gpu,<br>network, alert_rules,<br>notification_log, projects</td>
+          <td>โดยเฉพาะ NDB topology และ incident ในอดีต — ของดีที่สุดที่มี กลับเป็นของที่ AI ไม่เคยเห็น</td>
+        </tr>
+        <tr>
+          <td class="id">D8</td>
+          <td><strong>ไม่มีช่องทางออกเป็น artifact</strong></td>
+          <td class="src">renderMd() — regex<br>ไม่รองรับตาราง</td>
+          <td>ตอบเป็นข้อความล้วน ทำ report / แผนผัง / กราฟ ไม่ได้</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ================= 3 ================= -->
+<section>
+  <div class="col">
+    <div class="sec-head"><span class="sec-num">03</span><h2>เทคนิคที่เสนอ</h2></div>
+    <p class="lead">
+      สิบข้อ แบ่งเป็นสามชั้น ชั้นแรกให้ผลมากที่สุดต่อแรงที่ลง และไม่ต้องรื้อสถาปัตยกรรมเลย
+      แต่ละข้อมีป้ายบอกแรงที่ต้องใช้กับผลที่คาดว่าจะได้
+    </p>
+  </div>
+
+  <!-- LAYER 1 -->
+  <div class="layer">
+    <div class="layer-bar"><span class="tag">layer 1</span><span>Grounding — ให้ข้อมูลที่ถูกต้องและคิดมาแล้ว</span><span class="rule"></span></div>
+
+    <article class="tech pri">
+      <div class="tech-h">
+        <span class="tid">T1</span>
+        <h3>Deterministic Analytics Pre-computation (Context Pack)</h3>
+        <div class="badges"><span class="badge">~1 วัน</span><span class="badge hi">ผลสูงสุดต่อแรง</span></div>
+      </div>
+      <p>
+        หลักการเดียวที่สำคัญที่สุด: <strong>อย่าให้ LLM ทำเลขคณิต ให้ Postgres ทำ</strong>
+        โมเดล 27B ที่รันเองมักคำนวณ p95 หรือหาความชันจากตัวเลขดิบพลาด แต่ตีความข้อสรุปเชิงตัวเลขได้ดีมาก
+        เพราะฉะนั้นให้ SQL คำนวณเสร็จก่อน แล้วส่ง "ข้อสรุป" ไปให้มันอ่าน
+      </p>
+      <p>สิ่งที่คำนวณล่วงหน้าต่อ server:</p>
+      <ul>
+        <li>ค่าปัจจุบัน + p50 / p95 / max ของ cpu, ram, disk, load ในหน้าต่าง 1h / 24h / 7d จาก <span class="k">metrics_1m</span> และ <span class="k">metrics_1h</span></li>
+        <li><strong>trend slope</strong> ด้วย <span class="k">regr_slope()</span> ที่ Postgres มีอยู่แล้ว ไม่ต้องลงไลบรารีเพิ่ม</li>
+        <li><strong>disk-full ETA</strong> — จาก slope ของ <span class="k">disk_avail_kb</span> → เหลืออีกกี่วันเต็ม</li>
+        <li><strong>anomaly score</strong> — z-score / MAD เทียบ "ชั่วโมงเดียวกันของ 7 วันก่อน" ไม่ใช่เทียบค่าเฉลี่ยรวม เพื่อไม่ให้ daily seasonality หลอก</li>
+        <li><strong>load per core</strong> (<span class="k">load_1m / cores</span>) — ตัวเลขที่แปลผลได้จริงว่าเครื่องอิ่มหรือยัง</li>
+        <li>network rate จากผลต่าง counter — โค้ดคุณมี gap guard อยู่แล้ว เอามาใช้ซ้ำได้เลย</li>
+      </ul>
+<pre><code>-- ตัวอย่าง: slope + ETA ดิสก์เต็ม (Postgres ล้วน ไม่ต้องมี extension เพิ่ม)
+WITH d AS (
+  SELECT server_id,
+         extract(epoch FROM bucket) AS t,
+         disk_avail_kb              AS y
+  FROM   metrics_1h
+  WHERE  bucket &gt; now() - interval '14 days'
+)
+SELECT server_id,
+       regr_slope(y, t)                       AS kb_per_sec,
+       min(y)                                 AS avail_kb_now,
+       CASE WHEN regr_slope(y, t) &lt; 0
+            THEN (min(y) / -regr_slope(y, t)) / 86400.0
+       END                                    AS days_to_full
+FROM   d GROUP BY server_id
+HAVING regr_slope(y, t) &lt; 0
+ORDER  BY days_to_full;</code></pre>
+      <p class="cap">ผลลัพธ์ที่ส่งเข้า prompt: <code>web-01 · ram 84.2% (24h p95 91.0, 7d +1.8%/d) · disk / 91% avail 8.2GB ETA 6.4d ⚠ · load 7.9/8 cores</code></p>
+      <p>บรรทัดเดียวแบบนี้ทำให้โมเดลพูดเรื่อง "แนวโน้ม" กับ "ความผิดปกติ" ได้ทันที โดยไม่ต้องแตะ vLLM เลยสักบรรทัด</p>
+    </article>
+
+    <article class="tech pri">
+      <div class="tech-h">
+        <span class="tid">T2</span>
+        <h3>System Prompt เชิงบทบาท + Analysis Protocol</h3>
+        <div class="badges"><span class="badge">ครึ่งวัน</span><span class="badge hi">ผลสูง</span></div>
+      </div>
+      <p>เปลี่ยนจาก "ผู้ช่วยตอบคำถาม" เป็น "SRE ที่กำลังสอบสวน fleet" แล้วใส่สี่อย่างที่ prompt ปัจจุบันไม่มี</p>
+      <ul>
+        <li><strong>ความรู้เฉพาะระบบนี้</strong> ที่โมเดลไม่มีทางรู้เอง เช่น <span class="k">disk.used_pct</span> คือพาร์ทิชันที่แน่นที่สุด ส่วน <span class="k">disk.total_used_pct</span> คือทั้งเครื่องรวมกัน — comment ในไฟล์ <span class="k">metrics.js</span> ของคุณอธิบายไว้ดีมากอยู่แล้ว ยกไปใส่ prompt ได้เลย เช่นเดียวกับกฎ NDB ว่า node group ที่ node ตายหมดกลุ่ม = คลัสเตอร์หยุดรับเขียน</li>
+        <li><strong>Analysis protocol</strong> บังคับลำดับคิด: สังเกต → หา correlation ข้าม server และข้ามเวลา → ตั้งสมมติฐาน → อ้างหลักฐานเป็นตัวเลข → เสนอคำสั่งที่รันได้จริง → บอกระดับความมั่นใจ</li>
+        <li><strong>กฎ grounding</strong>: ทุกข้อสรุปต้องอ้างตัวเลขที่มีใน context ถ้าไม่มีให้เรียก tool ถ้ายังไม่มีให้บอกว่าไม่มีข้อมูล ห้ามเดา — และห้ามแปลง "ไม่มีข้อมูล" เป็น "ปกติดี"</li>
+        <li><strong>few-shot สองตัวอย่าง</strong>: คำถามค้นหา (ตอบสั้น 1–2 บรรทัด) กับคำถามวิเคราะห์ (ตอบตาม protocol) — สอนรูปแบบด้วยตัวอย่างได้ผลกว่าคำสั่งยาวเป็นย่อหน้ามาก โดยเฉพาะกับโมเดลขนาดนี้</li>
+      </ul>
+    </article>
+
+    <article class="tech">
+      <div class="tech-h">
+        <span class="tid">T3</span>
+        <h3>คุมโหมดคิดและ sampling แยกตามชนิดคำถาม</h3>
+        <div class="badges"><span class="badge">2 ชม.</span><span class="badge hi">ผลสูง</span></div>
+      </div>
+      <p>เอา <span class="k">/no_think</span> ออกจาก prompt แล้วย้ายไปคุมที่ API แทน จะได้เลือกได้ต่อคำถาม</p>
+<pre><code>// lookup — เร็ว แม่น ไม่ต้องคิดยาว
+{ temperature: 0.2, top_p: 0.8,  top_k: 20, max_tokens: 512,
+  chat_template_kwargs: { enable_thinking: false } }
+
+// analysis / report — เปิดโหมดคิด ใช้ค่าที่ Qwen3 แนะนำ
+{ temperature: 0.6, top_p: 0.95, top_k: 20, max_tokens: 4096,
+  presence_penalty: 1.0,                      // กัน loop ของ local quantized model
+  chat_template_kwargs: { enable_thinking: true } }</code></pre>
+      <p>
+        ฝั่ง <span class="k">ChatView.vue</span> ตอนนี้ตัด <span class="k">&lt;think&gt;…&lt;/think&gt;</span> ทิ้ง —
+        เปลี่ยนเป็นเก็บไว้ในบล็อกพับได้ "ดูวิธีคิด" จะตรวจสอบเหตุผลได้ และเป็นหลักฐานเวลามันตอบผิด
+      </p>
+      <div class="note">
+        <strong>ต้องเช็คก่อน</strong> — <span class="k">--max-model-len</span> ที่ serve อยู่เท่าไร ถ้าจะทำ report ต้องมีอย่างน้อย 32k
+        และควรเปิด <span class="k">--enable-prefix-caching</span> เพราะ system prompt จะยาวขึ้นแต่คงที่ KV cache จะช่วยลด TTFT ได้มาก
+      </div>
+    </article>
+  </div>
+
+  <!-- LAYER 2 -->
+  <div class="layer">
+    <div class="layer-bar"><span class="tag">layer 2</span><span>Agency — ให้โมเดลไปหาข้อมูลเองได้</span><span class="rule"></span></div>
+
+    <article class="tech pri">
+      <div class="tech-h">
+        <span class="tid">T4</span>
+        <h3>Native Tool-Calling loop แทนการยัด prompt</h3>
+        <div class="badges"><span class="badge md">2–3 วัน</span><span class="badge hi">เปลี่ยนเกม</span></div>
+      </div>
+      <p>
+        นี่คือข้อที่เปลี่ยนพฤติกรรมมากที่สุด จาก "ตอบจากที่ให้ไป" เป็น "สอบสวนเอง"
+        vLLM รองรับ OpenAI tool-calling อยู่แล้ว เปิดด้วย
+        <span class="k">--enable-auto-tool-choice --tool-call-parser hermes</span> (Qwen3 ใช้ hermes parser)
+      </p>
+      <p>ชุด tool ที่เสนอ — อ่านอย่างเดียวทั้งหมด:</p>
+<pre><code>list_servers(filter?, health?)            // ทะเบียนเครื่อง + สุขภาพ
+get_server_detail(server, window)          // Context Pack ของ T1 เฉพาะเครื่องนั้น
+query_metrics(servers[], metric, window)   // เลือก raw/1m/1h อัตโนมัติตามช่วงเวลา
+get_incidents(status?, server?, since?)    // incident ที่เปิดอยู่
+get_incident_history(metric, server, days) // "เคยเกิดแบบนี้ไหม ครั้งก่อนแก้ยังไง"
+get_ndb_topology(server?)                  // node / nodegroup / arbitrator / memory
+get_services(server)                       // pm2 + docker + expected vs actual (drift)
+get_alert_rules() / get_notification_stats(days)   // วิเคราะห์ alert fatigue
+correlate(window, servers[])               // metric ที่ขยับพร้อมกันข้ามเครื่อง
+run_sql(query)                             // ← ตัวเลือก ดูกล่องเตือนด้านล่าง</code></pre>
+      <div class="note">
+        <strong>เรื่อง <code>run_sql</code></strong> — ทรงพลังที่สุดและเสี่ยงที่สุด ถ้าจะเปิด ต้องครบทั้งชุด:
+        DB role แยก <span class="k">monit_ai</span> ที่ <span class="k">GRANT SELECT</span> เฉพาะตาราง/วิวที่อนุญาต,
+        <span class="k">SET LOCAL statement_timeout = '5s'</span>, บังคับ <span class="k">LIMIT</span>,
+        ปฏิเสธทุกอย่างที่ไม่ใช่ <span class="k">SELECT</span>/<span class="k">WITH</span> ด้วยการ parse ไม่ใช่ regex,
+        บล็อก <span class="k">pg_read_file</span>/<span class="k">dblink</span>/<span class="k">COPY</span>,
+        และจำกัดสิทธิ์ให้ role <span class="k">admin</span> เท่านั้น
+      </div>
+      <p>
+        loop จำกัด 5 รอบ มี token budget และ stream สถานะให้ผู้ใช้เห็นว่ากำลังทำอะไร
+        (<em>"กำลังดึงเมตริก 7 วันของ db-02…"</em>) ซึ่งทำให้การรอ 20 วินาทีรู้สึกต่างจากหน้าจอค้างมาก
+      </p>
+      <p>
+        <strong>เผื่อทางถอย</strong> — ถ้าไม่อยากรีสตาร์ท vLLM ตอนนี้ ทำ ReAct fallback ได้:
+        ให้โมเดลตอบ JSON <span class="k">{"tool":…,"args":…}</span> แล้ว parse เอง ได้ผลใกล้เคียงและไม่ผูกกับ flag ของ vLLM
+      </p>
+    </article>
+
+    <article class="tech">
+      <div class="tech-h">
+        <span class="tid">T5</span>
+        <h3>Intent Router + Context Budgeting</h3>
+        <div class="badges"><span class="badge">1 วัน</span><span class="badge hi">แก้ D6 ตรงจุด</span></div>
+      </div>
+      <p>
+        แยกคำถามออกเป็นชนิดก่อนประกอบ context — <em>lookup / analyze / report / topology / capacity</em>
+        ชั้นแรกใช้ keyword matching ราคาถูก ถ้ายังไม่ชัดค่อยยิง call สั้นมากไป vLLM ขอ JSON
+        (<span class="k">guided_json</span>, <span class="k">max_tokens: 64</span>) ซึ่งใช้เวลาไม่ถึงวินาที
+      </p>
+      <p>
+        แล้วค่อยประกอบ context เฉพาะที่คำถามนั้นต้องใช้ ผลคือ prompt เล็กลง 5–10 เท่า
+        คำตอบตรงขึ้น และ history ไม่ถูกดันออกจาก context window อีก
+      </p>
+    </article>
+
+    <article class="tech">
+      <div class="tech-h">
+        <span class="tid">T6</span>
+        <h3>MCP Server (<code>monit-mcp</code>)</h3>
+        <div class="badges"><span class="badge">1–2 วัน</span><span class="badge md">ผลทางอ้อม</span></div>
+      </div>
+      <p>
+        เขียน tool layer เป็นโมดูลกลาง <span class="k">server/src/lib/ai-tools.js</span> ครั้งเดียว
+        แล้วเปิดสองทาง: (ก) agent loop ในแอป (ข) MCP endpoint แบบ stdio + streamable-HTTP
+      </p>
+      <p>
+        ได้อะไร: เปิด Claude Desktop หรือ Claude Code ต่อเข้ามาสอบสวน incident ได้ตรง ๆ ด้วยโมเดลที่ฉลาดกว่า
+        ตอนเจอเคสยาก ทีมอื่นเอา tool ไปต่อยอดได้ และเข้ากับแนวที่คุณทำ <span class="k">moph-mcp-server</span> ไว้แล้ว
+      </p>
+      <div class="note">
+        <strong>ข้อควรระวัง</strong> — MCP ไม่ได้ทำให้โมเดล local ฉลาดขึ้นด้วยตัวมันเอง มันคือมาตรฐานการเชื่อมต่อ
+        ตัวที่ทำให้ฉลาดขึ้นจริงคือ tool กับ context pack ใน T1/T4 อย่าลงทุน MCP ก่อนสองข้อนั้น
+      </div>
+    </article>
+  </div>
+
+  <!-- LAYER 3 -->
+  <div class="layer">
+    <div class="layer-bar"><span class="tag">layer 3</span><span>Memory &amp; Output — ความจำองค์กร และผลลัพธ์ที่ใช้งานได้</span><span class="rule"></span></div>
+
+    <article class="tech">
+      <div class="tech-h">
+        <span class="tid">T7</span>
+        <h3>RAG สองชั้น — structured ก่อน vector</h3>
+        <div class="badges"><span class="badge md">2–3 วัน</span><span class="badge hi">ผลสูง ชั้น A</span></div>
+      </div>
+      <h4>ชั้น A — Structured retrieval (ทำก่อน ไม่ต้องใช้ embedding เลย)</h4>
+      <p>
+        ดึง incident ในอดีตที่ <span class="k">metric</span> + <span class="k">server</span> ตรงกัน พร้อม
+        <span class="k">notes</span>, <span class="k">resolved_at</span> และระยะเวลาที่ใช้แก้ →
+        <em>"เคสนี้เคยเกิด 3 ครั้ง ครั้งล่าสุด 12 ส.ค. ใช้เวลา 40 นาที บันทึกไว้ว่าแก้โดย…"</em>
+        แม่นกว่า vector สำหรับ metric signature และได้ผลตั้งแต่วันแรก
+      </p>
+      <h4>ชั้น B — Vector RAG บน runbook และเอกสาร</h4>
+      <ul>
+        <li><strong>pgvector</strong> บน Postgres ที่มีอยู่แล้ว ไม่ต้องเพิ่ม infra ใหม่</li>
+        <li>embedding ที่รองรับไทยดี เช่น <strong>BGE-M3</strong> — serve คู่กับ vLLM ตัวเดิมได้ (อีก process แบบ <span class="k">--task embed</span> หรือใช้ Infinity/TEI)</li>
+        <li>index: <span class="k">docs/*.md</span> ของโปรเจกต์เอง, <span class="k">DECISIONS.md</span>, runbook ที่ทีมเขียน, postmortem</li>
+        <li>chunk 400–600 token overlap ~15% เก็บ heading path เป็น metadata</li>
+        <li><strong>hybrid search สำคัญมาก</strong> — <span class="k">tsvector</span> คู่กับ cosine แล้วรวมด้วย RRF เพราะข้อความไทยปนศัพท์เทคนิคอังกฤษ ทำให้ embedding อย่างเดียวมักพลาดชื่อเฉพาะอย่าง <span class="k">ndb.nodes_unhealthy</span></li>
+      </ul>
+      <h4>ชั้น C — Semantic cache (ทางเลือก)</h4>
+      <p>คำถามซ้ำ ๆ อย่าง "server ไหนมีปัญหา" cache คำตอบสั้น ๆ 60 วินาที ลดโหลด GPU ตอนหลายคนเปิดหน้าพร้อมกัน</p>
+    </article>
+
+    <article class="tech pri">
+      <div class="tech-h">
+        <span class="tid">T8</span>
+        <h3>Structured Output → HTML Report</h3>
+        <div class="badges"><span class="badge md">2–3 วัน</span><span class="badge hi">ตรงกับที่ขอ</span></div>
+      </div>
+      <div class="note">
+        <strong>อย่าให้ LLM เขียน HTML เอง</strong> — โมเดลขนาดนี้เขียน HTML ยาว ๆ แล้วพังบ่อย ช้า กิน token
+        และเป็นช่องโหว่ XSS ที่สำคัญกว่านั้นคือ <em>ตัวเลขในกราฟจะกลายเป็นสิ่งที่โมเดลจำมา ไม่ใช่สิ่งที่ฐานข้อมูลมีจริง</em>
+      </div>
+      <p>ทำเป็นสามขั้นแทน:</p>
+      <ol>
+        <li>server รวบรวมข้อมูลและคำนวณเอง (T1) → ได้ <strong>dataset จริง</strong></li>
+        <li>เรียก vLLM ด้วย <strong>guided JSON</strong> — vLLM ใช้ xgrammar บังคับ grammar ระดับ decoder จึงได้ JSON ตรง schema เสมอ ให้โมเดลผลิตเฉพาะ <strong>การตีความ</strong></li>
+        <li>renderer ฝั่ง server ประกอบ narrative + dataset จริง เข้ากับ template แล้ว render กราฟ</li>
+      </ol>
+<pre><code>// ขั้นที่ 2 — โมเดลเติมเฉพาะ "ความหมาย" ไม่แตะตัวเลข
+{
+  "title": "...",
+  "executive_summary": "...",
+  "findings": [{
+    "severity": "critical|warning|info",
+    "headline": "...",
+    "evidence":  ["web-01.disk.avail_kb@7d", "web-01.ram.p95@24h"],
+    "analysis":  "...",
+    "recommendation": "...",
+    "confidence": 0.0-1.0
+  }],
+  "sections": [{ "type": "chart|table|topology", "data_ref": "..." }]
+}</code></pre>
+      <p>
+        ตัวเลขในกราฟมาจาก SQL เสมอ (ถูกต้อง 100%) ภาษาบรรยายมาจาก LLM (ยืดหยุ่น อ่านรู้เรื่อง)
+        ไม่มีทางที่โมเดลจะปลอมตัวเลขลงกราฟได้
+      </p>
+      <p>
+        เก็บลงตาราง <span class="k">ai_reports(id, kind, params, dataset jsonb, narrative jsonb, html, created_by, created_at)</span>
+        → ได้ permalink เปิดย้อนหลังได้ เทียบสัปดาห์ต่อสัปดาห์ได้ และส่งเป็นลิงก์เข้า Telegram ได้เลยเพราะคุณมี channel อยู่แล้ว
+      </p>
+    </article>
+
+    <article class="tech">
+      <div class="tech-h">
+        <span class="tid">T9</span>
+        <h3>Topology &amp; Diagram Generation</h3>
+        <div class="badges"><span class="badge">1–2 วัน</span><span class="badge hi">ข้อมูลพร้อมแล้ว</span></div>
+      </div>
+      <p>
+        <span class="k">databases.ndb.nodes[]</span> มีครบทั้ง id, type, host, status, nodegroup
+        บวก arbitrator และ data/index memory — เพียงพอสำหรับวาดแผนผังจริง render เป็น SVG ฝั่ง server
+      </p>
+      <ul>
+        <li>จัดกลุ่มตาม <strong>node group</strong> ไม่ใช่เรียงตาม id — เพราะ node group คือหน่วยที่ตัดสินว่าคลัสเตอร์ตายหรือไม่</li>
+        <li>สีตาม status: <span class="k">STARTED</span> / <span class="k">STARTING</span> / <span class="k">MISSING</span></li>
+        <li><strong>ไฮไลต์ node group ที่เหลือ node เดียว</strong> — จุดที่โหนดถัดไปตายแล้วคลัสเตอร์หยุดรับเขียน นี่คือสิ่งที่แผนผังต้องบอกและตารางบอกไม่ได้</li>
+        <li>แสดง MGM/arbitrator แยก พร้อมสถานะ <span class="k">arb_connected</span></li>
+        <li>แถบ data memory ต่อโหนด เพราะ NDB เต็มหน่วยความจำ = เขียนไม่ได้ = ล่มเหมือนกัน</li>
+      </ul>
+      <p>
+        แผนผัง dependency ทั่วไปก็สร้างได้จากข้อมูลที่มี: <span class="k">http</span> checks บอกว่าเครื่องไหนเช็ค URL ของใคร,
+        <span class="k">databases</span> บอกว่าใครถือ connection, <span class="k">expected_services</span> บอกว่าอะไรควรอยู่ตรงไหน
+      </p>
+      <p><strong>บทบาทของ LLM คืออธิบายแผนผัง ไม่ใช่วาดแผนผัง</strong></p>
+    </article>
+
+    <article class="tech">
+      <div class="tech-h">
+        <span class="tid">T10</span>
+        <h3>Eval Harness — วัดว่าฉลาดขึ้นจริง</h3>
+        <div class="badges"><span class="badge">1 วัน</span><span class="badge hi">ทำก่อนเลย</span></div>
+      </div>
+      <p>
+        ข้อที่คนข้ามบ่อยที่สุดและเสียใจทีหลังบ่อยที่สุด เพราะการปรับ prompt โดยไม่มีเครื่องวัด
+        จะกลายเป็นการเดาว่า "รู้สึกว่าดีขึ้น" ซึ่งย้อนกลับไม่ได้เมื่อมันแย่ลง
+      </p>
+      <ul>
+        <li>ชุดคำถามทอง 30–40 ข้อ พร้อมคำตอบอ้างอิงที่ <strong>คำนวณจาก SQL</strong> — ground truth หาได้จริงเพราะเป็นตัวเลข</li>
+        <li>วัดสี่อย่าง: ความถูกต้องของตัวเลข, เลือก tool ถูกไหม, latency/token, และ hallucination rate (อ้างตัวเลขที่ไม่มีอยู่จริง)</li>
+        <li>รันก่อน–หลังทุกครั้งที่แก้ prompt เก็บเป็น <span class="k">server/test/ai-eval/</span> กับ script เดียว</li>
+      </ul>
+    </article>
+  </div>
+
+  <div class="col">
+    <h3>เทคนิคเสริมที่ควรพิจารณาด้วย</h3>
+    <ul>
+      <li><strong>Model routing</strong> — ถ้า VRAM เหลือ serve Qwen3-4B ควบไว้สำหรับ intent routing และคำถาม lookup (เร็วกว่าราว 10 เท่า) แล้วส่งเฉพาะงานวิเคราะห์หนักไปตัวใหญ่</li>
+      <li><strong>Prefix caching</strong> ที่ vLLM — system prompt ที่ยาวแต่คงที่จะถูก cache KV ทำให้ TTFT ลดลงมาก และสำคัญขึ้นเมื่อ prompt โตตาม T1/T2</li>
+      <li><strong>Chat logging + feedback</strong> — ตาราง <span class="k">ai_chat_log</span> เก็บคำถาม, tool ที่เรียก, token, latency และปุ่ม 👍/👎 เป็นวัตถุดิบทั้งของ eval และของการ fine-tune ในอนาคต</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ================= 4 ================= -->
+<section>
+  <div class="col">
+    <div class="sec-head"><span class="sec-num">04</span><h2>สถาปัตยกรรมที่เสนอ</h2></div>
+    <p class="lead">tool layer เขียนครั้งเดียว ใช้ได้ทั้ง chat ในแอปและ MCP จากภายนอก</p>
+  </div>
+  <figure>
+    <svg viewBox="0 0 900 470" role="img" aria-label="แผนผังสถาปัตยกรรม AI Chat ที่เสนอ">
+      <defs>
+        <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+          <path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/>
+        </marker>
+        <marker id="ar2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+          <path d="M0,0 L10,5 L0,10 z" fill="var(--accent)"/>
+        </marker>
+      </defs>
+      <style>
+        .bx{fill:var(--surface-2); stroke:var(--line); stroke-width:1}
+        .bx-a{fill:var(--accent-soft); stroke:var(--accent); stroke-width:1.2}
+        .bnd{fill:none; stroke:var(--line); stroke-width:1; stroke-dasharray:3 3}
+        .t{font-family:"IBM Plex Sans Thai",system-ui,sans-serif; font-size:12px; fill:var(--ink)}
+        .tm{font-family:"IBM Plex Mono",monospace; font-size:11px; fill:var(--ink)}
+        .ts{font-family:"IBM Plex Mono",monospace; font-size:9.5px; fill:var(--muted)}
+        .lb{font-family:"IBM Plex Mono",monospace; font-size:10px; fill:var(--muted); letter-spacing:.08em}
+        .ln{stroke:var(--muted); stroke-width:1.1; fill:none; marker-end:url(#ar)}
+        .ln-a{stroke:var(--accent); stroke-width:1.4; fill:none; marker-end:url(#ar2)}
+      </style>
+
+      <!-- band labels -->
+      <text class="lb" x="8" y="34">DASHBOARD</text>
+      <text class="lb" x="8" y="128">ORCHESTRATOR</text>
+      <text class="lb" x="8" y="272">TOOL LAYER</text>
+      <text class="lb" x="8" y="392">DATA</text>
+
+      <!-- dashboard -->
+      <rect class="bx" x="150" y="14" width="150" height="34" rx="2"/>
+      <text class="tm" x="225" y="35" text-anchor="middle">ChatView.vue</text>
+      <rect class="bx" x="320" y="14" width="150" height="34" rx="2"/>
+      <text class="tm" x="395" y="35" text-anchor="middle">ReportsView.vue</text>
+      <rect class="bx" x="640" y="14" width="200" height="34" rx="2"/>
+      <text class="tm" x="740" y="35" text-anchor="middle">Claude Desktop / Code</text>
+
+      <line class="ln" x1="225" y1="48" x2="225" y2="76"/>
+      <line class="ln" x1="395" y1="48" x2="395" y2="76"/>
+
+      <!-- orchestrator band -->
+      <rect class="bnd" x="150" y="78" width="480" height="118" rx="3"/>
+      <rect class="bx-a" x="164" y="94" width="106" height="40" rx="2"/>
+      <text class="t" x="217" y="112" text-anchor="middle">Intent Router</text>
+      <text class="ts" x="217" y="126" text-anchor="middle">T5</text>
+
+      <rect class="bx-a" x="286" y="94" width="112" height="40" rx="2"/>
+      <text class="t" x="342" y="112" text-anchor="middle">Context Packer</text>
+      <text class="ts" x="342" y="126" text-anchor="middle">T1 · SQL analytics</text>
+
+      <rect class="bx-a" x="414" y="94" width="98" height="40" rx="2"/>
+      <text class="t" x="463" y="112" text-anchor="middle">Agent Loop</text>
+      <text class="ts" x="463" y="126" text-anchor="middle">T4 · max 5</text>
+
+      <rect class="bx-a" x="528" y="94" width="88" height="40" rx="2"/>
+      <text class="t" x="572" y="112" text-anchor="middle">Renderer</text>
+      <text class="ts" x="572" y="126" text-anchor="middle">T8 · T9</text>
+
+      <line class="ln" x1="270" y1="114" x2="284" y2="114"/>
+      <line class="ln" x1="398" y1="114" x2="412" y2="114"/>
+      <line class="ln" x1="512" y1="114" x2="526" y2="114"/>
+      <text class="ts" x="390" y="164" text-anchor="middle">prompt เชิงบทบาท + analysis protocol (T2) · sampling ต่อโหมด (T3)</text>
+      <line class="bnd" x1="164" y1="176" x2="616" y2="176"/>
+
+      <!-- vLLM -->
+      <rect class="bx" x="672" y="86" width="168" height="76" rx="2"/>
+      <text class="tm" x="756" y="110" text-anchor="middle">local vLLM</text>
+      <text class="ts" x="756" y="127" text-anchor="middle">Qwen3 · tool-call parser</text>
+      <text class="ts" x="756" y="141" text-anchor="middle">guided_json · thinking</text>
+      <text class="ts" x="756" y="155" text-anchor="middle">prefix caching</text>
+      <line class="ln-a" x1="616" y1="106" x2="670" y2="106"/>
+      <line class="ln-a" x1="670" y1="142" x2="618" y2="142"/>
+      <text class="ts" x="643" y="100" text-anchor="middle">↑</text>
+
+      <!-- tool layer -->
+      <line class="ln" x1="463" y1="196" x2="463" y2="220"/>
+      <rect class="bx-a" x="150" y="222" width="690" height="66" rx="2"/>
+      <text class="tm" x="164" y="242">server/src/lib/ai-tools.js</text>
+      <text class="ts" x="164" y="260">list_servers · get_server_detail · query_metrics · get_incidents · get_incident_history</text>
+      <text class="ts" x="164" y="276">get_ndb_topology · get_services · get_alert_rules · correlate · run_sql (admin only)</text>
+
+      <line class="ln" x1="740" y1="48" x2="740" y2="220"/>
+      <text class="ts" x="752" y="140" >MCP (T6)</text>
+
+      <!-- data -->
+      <line class="ln" x1="300" y1="288" x2="300" y2="326"/>
+      <line class="ln" x1="500" y1="288" x2="500" y2="326"/>
+      <line class="ln" x1="690" y1="288" x2="690" y2="326"/>
+
+      <rect class="bx" x="150" y="328" width="230" height="72" rx="2"/>
+      <text class="tm" x="164" y="350">TimescaleDB</text>
+      <text class="ts" x="164" y="367">system_metrics (hypertable)</text>
+      <text class="ts" x="164" y="382">metrics_1m · metrics_1h</text>
+
+      <rect class="bx" x="396" y="328" width="222" height="72" rx="2"/>
+      <text class="tm" x="410" y="350">Metadata</text>
+      <text class="ts" x="410" y="367">incidents · alert_rules · rule_state</text>
+      <text class="ts" x="410" y="382">expected_services · notification_log</text>
+
+      <rect class="bx" x="634" y="328" width="206" height="72" rx="2"/>
+      <text class="tm" x="648" y="350">pgvector <tspan class="ts">(T7 · ทางเลือก)</tspan></text>
+      <text class="ts" x="648" y="367">docs/*.md · runbook · postmortem</text>
+      <text class="ts" x="648" y="382">hybrid: tsvector + cosine → RRF</text>
+
+      <!-- agents -->
+      <line class="ln" x1="265" y1="400" x2="265" y2="424"/>
+      <rect class="bx" x="150" y="426" width="230" height="30" rx="2"/>
+      <text class="ts" x="265" y="446" text-anchor="middle">agent bash → ingest ทุก 10 วินาที</text>
+    </svg>
+    <figcaption>ลูกศรสีเข้ม = เส้นทางที่ผ่าน vLLM · กล่องไฮไลต์ = ส่วนที่ต้องเขียนใหม่</figcaption>
+  </figure>
+</section>
+
+<!-- ================= 5 ================= -->
+<section>
+  <div class="col">
+    <div class="sec-head"><span class="sec-num">05</span><h2>Report ที่สร้างได้จากข้อมูลที่มีอยู่แล้ว</h2></div>
+    <p class="lead">สองข้อแรกคือตัวอย่างที่คุณยกมา ที่เหลือคือสิ่งที่ข้อมูลชุดเดียวกันตอบได้อยู่แล้วแต่ยังไม่มีใครถาม</p>
+  </div>
+  <div class="reports">
+    <div class="rep"><div class="n">R01</div><h4>MySQL NDB Cluster Topology</h4><p>แผนผังจัดกลุ่มตาม node group, สถานะแต่ละโหนด, arbitrator, data/index memory และไฮไลต์กลุ่มที่เหลือโหนดเดียว</p></div>
+    <div class="rep"><div class="n">R02</div><h4>Critical Server Brief</h4><p>เครื่องที่วิกฤต เรียงตามความเร่งด่วนจริง ไม่ใช่ตามชื่อ พร้อมหลักฐานตัวเลขและคำสั่งที่ควรรันต่อ</p></div>
+    <div class="rep"><div class="n">R03</div><h4>Fleet Health Scorecard</h4><p>คะแนนสุขภาพต่อเครื่องรายสัปดาห์ พร้อมอันดับเครื่องที่แย่ลงเร็วที่สุดเทียบสัปดาห์ก่อน</p></div>
+    <div class="rep"><div class="n">R04</div><h4>Capacity Forecast</h4><p>ดิสก์และ RAM จะเต็มเมื่อไร แยกต่อ mount ต่อเครื่อง เรียงตามวันที่ใกล้ที่สุด จาก regr_slope</p></div>
+    <div class="rep"><div class="n">R05</div><h4>Post-mortem อัตโนมัติ</h4><p>ไทม์ไลน์หนึ่งชั่วโมงก่อนเกิด incident, metric ที่ขยับ, เครื่องที่ขยับพร้อมกัน และ incident ในอดีตที่ signature ตรงกัน</p></div>
+    <div class="rep"><div class="n">R06</div><h4>Alert Fatigue &amp; Rule Tuning</h4><p>rule ไหน flap, rule ไหนไม่เคยยิงเลย, rule ไหนยิงแล้วไม่มีใคร ack — พร้อมเสนอ threshold ใหม่จาก p95 จริง</p></div>
+    <div class="rep"><div class="n">R07</div><h4>Right-sizing / เครื่องว่าง</h4><p>เครื่องที่ CPU p95 ต่ำกว่า 10% และ RAM p95 ต่ำกว่า 30% ต่อเนื่อง 30 วัน = ทรัพยากรที่จ่ายเกิน</p></div>
+    <div class="rep"><div class="n">R08</div><h4>Service Inventory Drift</h4><p>expected_services เทียบกับ pm2/docker จริง, container ที่ restart บ่อยผิดปกติ, service ที่โผล่มาโดยไม่มีใครประกาศ</p></div>
+    <div class="rep"><div class="n">R09</div><h4>Dependency Map</h4><p>ใครเรียกใคร จาก http health check ที่ชี้ข้ามเครื่อง บวก connection ของ mysql/postgres</p></div>
+    <div class="rep"><div class="n">R10</div><h4>Weekly Ops Digest</h4><p>ห้าบรรทัดเข้า Telegram ทุกเช้าวันจันทร์ พร้อมลิงก์ไปยัง report เต็มที่เก็บไว้ใน ai_reports</p></div>
+  </div>
+</section>
+
+<!-- ================= 6 ================= -->
+<section>
+  <div class="col">
+    <div class="sec-head"><span class="sec-num">06</span><h2>ลำดับการทำงานที่เสนอ</h2></div>
+    <p class="lead">เรียงให้เห็นผลเร็วที่สุดก่อน และให้แต่ละเฟสใช้งานได้จริงด้วยตัวเองโดยไม่ต้องรอเฟสถัดไป</p>
+  </div>
+  <div class="phases">
+    <div class="ph">
+      <div class="ph-l"><div class="p">P0</div><div class="d">~1 วัน</div></div>
+      <div class="ph-r">
+        <h4>วางเครื่องวัดก่อนแตะอะไร</h4>
+        <p>ชุดคำถามทอง + ground truth จาก SQL + สคริปต์รัน แล้ววัด baseline ของระบบปัจจุบันไว้เป็นหลักฐาน</p>
+        <div class="chips"><span class="chip">T10</span></div>
+      </div>
+    </div>
+    <div class="ph">
+      <div class="ph-l"><div class="p">P1</div><div class="d">1–2 วัน</div></div>
+      <div class="ph-r">
+        <h4>Grounding — ผลชัดที่สุดต่อแรงที่ลง</h4>
+        <p>Context Pack, prompt เชิงบทบาท, sampling ต่อโหมด, เปิดโหมดคิดกลับ — แตะแค่ <code>chat.js</code> ไม่แตะ frontend ไม่ต้องรีสตาร์ท vLLM</p>
+        <div class="chips"><span class="chip">T1</span><span class="chip">T2</span><span class="chip">T3</span></div>
+      </div>
+    </div>
+    <div class="ph">
+      <div class="ph-l"><div class="p">P2</div><div class="d">2–3 วัน</div></div>
+      <div class="ph-r">
+        <h4>Agency — ให้ไปหาข้อมูลเองได้</h4>
+        <p>Intent router + tool loop พร้อม ReAct fallback และแสดงสถานะ tool ที่กำลังเรียกบนหน้าจอ</p>
+        <div class="chips"><span class="chip">T5</span><span class="chip">T4</span></div>
+      </div>
+    </div>
+    <div class="ph">
+      <div class="ph-l"><div class="p">P3</div><div class="d">2–3 วัน</div></div>
+      <div class="ph-r">
+        <h4>Report engine + Topology</h4>
+        <p>guided JSON → renderer, ตาราง <code>ai_reports</code>, หน้า Reports ในแดชบอร์ด และแผนผัง NDB</p>
+        <div class="chips"><span class="chip">T8</span><span class="chip">T9</span></div>
+      </div>
+    </div>
+    <div class="ph">
+      <div class="ph-l"><div class="p">P4</div><div class="d">2–3 วัน</div></div>
+      <div class="ph-r">
+        <h4>ความจำองค์กร + เปิดให้ภายนอก</h4>
+        <p>structured retrieval ก่อน แล้วค่อย pgvector ถ้าคุ้ม, MCP endpoint, chat logging และปุ่ม feedback</p>
+        <div class="chips"><span class="chip">T7</span><span class="chip">T6</span></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= 7 ================= -->
+<section class="col">
+  <div class="sec-head"><span class="sec-num">07</span><h2>สิ่งที่ต้องให้คุณตัดสินก่อนเริ่ม</h2></div>
+
+  <div class="dec">
+    <h4><span class="q">Q1</span> รุ่นโมเดลที่ serve อยู่จริงคือรุ่นไหน</h4>
+    <p>Qwen3-30B-A3B (MoE) กับ Qwen3-32B (dense) ใช้ tool-call parser และธง thinking ต่างกัน และ VRAM ที่เหลือก็ต่างกันมาก มีผลกับ T3, T4 และเรื่อง model routing</p>
+    <p class="rec">ขอผลลัพธ์ของ <code>curl $VLLM_BASE_URL/models</code> กับบรรทัดคำสั่งที่ใช้ start vLLM</p>
+  </div>
+
+  <div class="dec">
+    <h4><span class="q">Q2</span> รีสตาร์ท vLLM เพื่อเปิด tool-calling ได้ไหม</h4>
+    <p>ถ้าเปิด <code>--enable-auto-tool-choice --tool-call-parser hermes --enable-prefix-caching</code> ได้ จะได้ทางที่นิ่งและเร็วกว่า ถ้าแตะ production ไม่ได้ตอนนี้ ผมทำ ReAct fallback ให้แทน</p>
+    <p class="rec">แนะนำ: เปิด เพราะได้ prefix caching ติดมาด้วย ซึ่งชดเชย prompt ที่จะยาวขึ้น</p>
+  </div>
+
+  <div class="dec">
+    <h4><span class="q">Q3</span> เปิด <code>run_sql</code> แบบอ่านอย่างเดียวให้ AI ไหม</h4>
+    <p>เป็น tool ที่ทำให้ตอบคำถามที่เราคิดไม่ถึงล่วงหน้าได้ แต่ก็เป็นพื้นผิวโจมตีที่ใหญ่ที่สุดในข้อเสนอนี้</p>
+    <p class="rec">แนะนำ: เปิด แต่จำกัด role admin + DB role แยกที่ GRANT SELECT เฉพาะที่จำเป็น + statement_timeout + บังคับ LIMIT</p>
+  </div>
+
+  <div class="dec">
+    <h4><span class="q">Q4</span> ยอมเพิ่ม pgvector กับ embedding model ไหม</h4>
+    <p>ต้องมี extension เพิ่มและ process embedding อีกตัว ซึ่งกิน VRAM ที่แชร์กับโมเดลหลัก</p>
+    <p class="rec">แนะนำ: ทำ structured retrieval (ชั้น A) ก่อนใน P4 แล้ววัดว่าคำถามแบบไหนยังตอบไม่ได้ ค่อยตัดสินใจเรื่อง pgvector จากข้อมูลจริง</p>
+  </div>
+
+  <div class="dec">
+    <h4><span class="q">Q5</span> report เก็บใน DB พร้อม permalink หรือดาวน์โหลดอย่างเดียว</h4>
+    <p>เก็บใน DB ได้ประวัติ เทียบย้อนหลังได้ ส่งลิงก์เข้า Telegram ได้ แลกกับ migration เพิ่มหนึ่งไฟล์และเรื่องสิทธิ์การเข้าถึง</p>
+    <p class="rec">แนะนำ: เก็บใน DB — คุณมี RBAC กับ audit_log อยู่แล้ว ต่อยอดได้เลย</p>
+  </div>
+
+  <div class="dec">
+    <h4><span class="q">Q6</span> เริ่มที่เฟสไหน</h4>
+    <p>ถ้าอยากเห็นผลเร็วที่สุด P1 อย่างเดียวก็เปลี่ยนคุณภาพคำตอบได้ชัดแล้ว ถ้าอยากได้ report เป็นเป้าหลัก ต้องผ่าน P1 → P3</p>
+    <p class="rec">แนะนำ: P0 + P1 รวดเดียว แล้วให้คุณลองใช้จริงก่อนตัดสินใจ P2 กับ P3</p>
+  </div>
+</section>
+
+<footer>
+  จัดทำจากการอ่าน <code>README.md</code>, <code>docs/DECISIONS.md</code>, <code>server/src/routes/chat.js</code>,
+  <code>server/src/config.js</code>, <code>server/src/lib/metrics.js</code>, <code>server/migrations/002–010</code>,
+  <code>agent/monit-agent.sh</code> และ <code>dashboard/src/views/ChatView.vue</code> ในเครื่องคุณ
+  — ยังไม่มีการแก้ไขไฟล์ใด ๆ
+</footer>
+
+</div>
+
+</body>
+</html>

@@ -1,119 +1,68 @@
+// AI chat.
+//
+// The shape of a request, and why it is in three phases rather than one:
+//
+//   route   — classify the question and find the servers it names, so the
+//             context can be about that instead of about everything. Packing
+//             the whole fleet into every message is what used to push the
+//             conversation out of the model's context window.
+//   gather  — let the model call read-only tools for what the context does not
+//             already contain. This is what turns "answer from what you were
+//             given" into "go and look", and it is the difference between
+//             counting services and explaining a symptom.
+//   answer  — one streaming turn with everything gathered, no tools attached,
+//             so the reply comes back token by token.
+//
+// Gathering is a separate turn on purpose. Detecting tool calls inside a stream
+// means reassembling partial JSON argument fragments across chunks, and the
+// failure mode is a half-parsed argument silently becoming a wrong query. A
+// short non-streaming turn to decide, then a streaming turn to answer, costs
+// one extra prefill — which prefix caching largely absorbs — and cannot
+// misread its own arguments.
+
 import { q } from '../db/pool.js';
 import { requireRole } from '../lib/auth.js';
-import { computeHealth } from '../lib/health.js';
 import { config } from '../config.js';
+import { llmChat, llmStream, llmJson, resolveModel, caps, PROFILES } from '../lib/ai-llm.js';
+import { fleetSnapshot } from '../lib/ai-analytics.js';
+import { buildSystemPrompt, routeIntent, PLAN_INSTRUCTION } from '../lib/ai-prompt.js';
+import { toolSchemas, toolNames, runTool } from '../lib/ai-tools.js';
+import { generateReport, REPORT_KINDS } from '../lib/ai-report.js';
 
-/** Resolve which model to use — explicit config or first from /v1/models. */
-async function resolveModel(log) {
-  if (config.vllmModel) return config.vllmModel;
-  try {
-    const res = await fetch(`${config.vllmBaseUrl}/models`);
-    if (!res.ok) throw new Error(`models endpoint ${res.status}`);
-    const j = await res.json();
-    const id = j.data?.[0]?.id;
-    if (!id) throw new Error('empty model list');
-    return id;
-  } catch (e) {
-    log.warn(e, 'failed to auto-detect vLLM model, falling back');
-    return 'qwen3-8b';
-  }
+/** Which report a question is asking for, when it is asking for one at all. */
+function reportKindFor(text) {
+  const t = String(text).toLowerCase();
+  if (/ndb|cluster|คลัสเตอร์|topolog|แผนผัง|node group/.test(t)) return 'ndb_topology';
+  if (/capacity|เต็ม|forecast|คาดการณ์|พื้นที่|disk/.test(t)) return 'capacity';
+  if (/critical|วิกฤต|มีปัญหา|ปัญหา|เสี่ยง/.test(t)) return 'critical';
+  return 'fleet_health';
 }
 
-/** Build a system prompt packed with live DB context. */
-async function buildSystemPrompt() {
-  const [
-    { rows: servers },
-    { rows: incidents },
-    { rows: expectedSvc },
-  ] = await Promise.all([
-    q(`SELECT s.id, s.name, s.ip, s.os, s.last_seen,
-         COALESCE((SELECT array_agg(DISTINCT inc.severity) FROM incidents inc
-           WHERE inc.server_id = s.id AND inc.status IN ('firing','acknowledged')), '{}') AS active_severities
-       FROM servers s WHERE s.archived_at IS NULL ORDER BY s.name`),
-    // comparator lives on the rule, not the incident, and the incident's clock
-    // column is started_at — incidents has no created_at at all. Joining the
-    // rule also gets rule_name/message/value in, which is what actually lets
-    // the model say something useful instead of reciting an id.
-    q(`SELECT i.id, i.server_id, i.severity, i.status, i.rule_name, i.metric,
-              r.comparator, i.threshold, i.value, i.message, i.started_at
-         FROM incidents i
-         LEFT JOIN alert_rules r ON r.id = i.rule_id
-        WHERE i.status IN ('firing','acknowledged')
-        ORDER BY i.started_at DESC LIMIT 50`),
-    q(`SELECT server_id, kind, name, enabled FROM expected_services ORDER BY server_id, kind, name`),
-  ]);
+const isThai = (s) => /[฀-๿]/.test(String(s));
 
-  // Fetch latest PM2/Docker from the most recent sample per server.
-  //
-  // The time bound is not an optimisation, it is what makes this query usable:
-  // without it DISTINCT ON walks every chunk of the hypertable back to the
-  // beginning of retention on every single chat message. A server with nothing
-  // in the window is offline anyway, and computeHealth() already says so.
-  const { rows: latestSamples } = await q(
-    `SELECT DISTINCT ON (server_id) server_id, pm2, docker, time
-     FROM system_metrics
-     WHERE time > now() - ($1::int * interval '1 second')
-     ORDER BY server_id, time DESC`,
-    [config.sampleIntervalS * config.offlineFactor * 2]);
-  const sampleMap = Object.fromEntries(latestSamples.map((s) => [s.server_id, s]));
-
-  const serverLines = servers.map((s) => {
-    const health = computeHealth({ last_seen: s.last_seen, activeSeverities: s.active_severities });
-    const sample = sampleMap[s.id];
-    const pm2List = sample?.pm2 || [];
-    const dockerList = sample?.docker || [];
-    let line = `- ${s.name} (id=${s.id}, ip=${s.ip || 'N/A'}, os=${s.os || 'N/A'}, health=${health}, last_seen=${s.last_seen || 'never'})`;
-    if (pm2List.length) {
-      line += `\n  PM2 services (${pm2List.length}): ${pm2List.map((p) => `${p.name}[${p.status}]`).join(', ')}`;
-    }
-    if (dockerList.length) {
-      line += `\n  Docker containers (${dockerList.length}): ${dockerList.map((d) => `${d.name || d.names}[${d.state || d.status}]`).join(', ')}`;
-    }
-    return line;
-  });
-
-  const incidentLines = incidents.map((i) => {
-    const cond = i.metric
-      ? `${i.metric} ${i.comparator || '?'} ${i.threshold ?? '?'}`
-        + (i.value != null ? ` (currently ${i.value})` : '')
-      : 'no metric';
-    return `- ${i.id}: server=${i.server_id}, severity=${i.severity}, status=${i.status}, `
-      + `rule=${i.rule_name || 'n/a'}, ${cond}, since=${i.started_at}`
-      + (i.message ? `\n  message: ${i.message}` : '');
-  });
-
-  const expectedLines = expectedSvc.map((e) =>
-    `- server=${e.server_id}, kind=${e.kind}, name=${e.name}, enabled=${e.enabled}`);
-
-  return `You are an AI assistant for the monit infrastructure monitoring system.
-You have access to the following LIVE data (queried just now):
-
-## Servers (${servers.length} total)
-${serverLines.join('\n') || '(none)'}
-
-## Active Incidents (${incidents.length})
-${incidentLines.join('\n') || '(none)'}
-
-## Expected Services (${expectedSvc.length})
-${expectedLines.join('\n') || '(none)'}
-
-Answer questions about the infrastructure concisely. Use the data above to answer questions like:
-- How many servers/PM2 services/Docker containers are there
-- Which servers have problems
-- What services are running on each server
-- Current incident status
-
-If the data above does not contain the answer, say so — do not make up information.
-Respond in the same language the user writes in (e.g. Thai if they write in Thai).
-Keep answers concise and formatted with markdown when helpful.
-Use /no_think to disable thinking mode.`;
-}
+/** ReAct fallback for a vLLM served without --enable-auto-tool-choice. */
+const REACT_SCHEMA = {
+  type: 'object',
+  properties: {
+    calls: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          tool: { type: 'string' },
+          args_json: { type: 'string', description: 'Arguments as a JSON object, e.g. {"server":"db-01"}' },
+        },
+        required: ['tool', 'args_json'],
+      },
+    },
+  },
+  required: ['calls'],
+};
 
 export default async function chatRoutes(app) {
-  // List available models
   app.get('/api/v1/chat/models', { preHandler: requireRole('viewer') }, async (req, reply) => {
     try {
-      const res = await fetch(`${config.vllmBaseUrl}/models`);
+      const res = await fetch(`${config.vllmBaseUrl}/models`, { signal: AbortSignal.timeout(8000) });
       if (!res.ok) throw new Error(`vLLM returned ${res.status}`);
       const j = await res.json();
       return { models: j.data || [] };
@@ -123,52 +72,52 @@ export default async function chatRoutes(app) {
     }
   });
 
-  // Chat completions — streams SSE back to the client
+  /**
+   * What this vLLM turned out to support, so the UI can say "tools are off"
+   * instead of quietly behaving like the old version and leaving everyone to
+   * wonder why the answers got shallower.
+   */
+  app.get('/api/v1/chat/capabilities', { preHandler: requireRole('viewer') }, async (req) => ({
+    base_url: config.vllmBaseUrl,
+    model: await resolveModel(req.log).catch(() => null),
+    tools: caps.tools,
+    guided_json: caps.guidedJson,
+    thinking: caps.thinking,
+    sql_enabled: config.aiAllowSql,
+    tools_available: toolNames(req.user?.role || 'viewer'),
+    report_kinds: REPORT_KINDS,
+  }));
+
+  app.post('/api/v1/chat/feedback', { preHandler: requireRole('viewer') }, async (req, reply) => {
+    const { id, value } = req.body || {};
+    if (!id) return reply.code(400).send({ title: 'id is required', status: 400 });
+    await q('UPDATE ai_chat_log SET feedback = $1 WHERE id = $2', [value > 0 ? 1 : -1, id]);
+    return { ok: true };
+  });
+
   app.post('/api/v1/chat', { preHandler: requireRole('viewer') }, async (req, reply) => {
+    const started = Date.now();
     const { messages = [], model: requestModel } = req.body || {};
     if (!messages.length) {
       return reply.code(400).send({ title: 'messages is required', status: 400 });
     }
+    const role = req.user?.role || 'viewer';
+    const email = req.user?.email || req.user?.sub || null;
+    const question = String(messages[messages.length - 1]?.content || '');
 
-    const [systemPrompt, model] = await Promise.all([
-      buildSystemPrompt(),
-      requestModel || resolveModel(req.log),
-    ]);
-
-    // Keep only the tail of the transcript. The system prompt grows with the
-    // fleet, so a long conversation silently pushes it out of the context
-    // window and the model starts answering without any of the live data.
-    const fullMessages = [
-      { role: 'system', content: systemPrompt },
-      ...messages.slice(-config.chatMaxHistory),
-    ];
-
-    let upstream;
+    // The snapshot and the model id are independent — no reason to wait for one
+    // before starting the other, and the snapshot is the slower of the two.
+    let snap;
     try {
-      upstream = await fetch(`${config.vllmBaseUrl}/chat/completions`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model,
-          messages: fullMessages,
-          stream: true,
-          temperature: 0.7,
-          max_tokens: 4096,
-        }),
-      });
+      [snap] = await Promise.all([fleetSnapshot(), requestModel || resolveModel(req.log)]);
     } catch (e) {
-      req.log.error(e, 'vLLM connection failed');
-      return reply.code(502).send({ title: 'Cannot reach vLLM', status: 502, detail: e.message });
+      req.log.error(e, 'chat pre-flight failed');
+      return reply.code(502).send({ title: 'Cannot start chat', status: 502, detail: e.message });
     }
 
-    if (!upstream.ok) {
-      const text = await upstream.text().catch(() => '');
-      req.log.error({ status: upstream.status, body: text }, 'vLLM error');
-      return reply.code(502).send({ title: 'vLLM error', status: 502, detail: text || `HTTP ${upstream.status}` });
-    }
+    const route = routeIntent(question, snap);
+    const lang = isThai(question) ? 'th' : 'en';
 
-    // Stream SSE passthrough.
-    //
     // hijack() first: it tells Fastify this route owns the socket from here on.
     // Without it the async handler resolves with undefined once the stream is
     // done and Fastify tries to serialise a second response onto a connection
@@ -185,18 +134,164 @@ export default async function chatRoutes(app) {
       'X-Accel-Buffering': 'no',
     });
 
-    const reader = upstream.body.getReader();
-    const decoder = new TextDecoder();
+    const send = (obj) => {
+      try { reply.raw.write(`data: ${JSON.stringify(obj)}\n\n`); } catch { /* client went away */ }
+    };
+
+    const usedTools = [];
+    let answerChars = 0;
+    let failure = null;
+
     try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        reply.raw.write(decoder.decode(value, { stream: true }));
+      send({ t: 'meta', intent: route.intent, lang, tools: caps.tools !== false && route.useTools });
+
+      // ---- report ---------------------------------------------------------
+      // A report is not a chat answer that happens to be long: it is a stored
+      // artifact with its own permalink, and generating it also produces the
+      // summary worth saying out loud. So it short-circuits the whole pipeline.
+      if (route.intent === 'report') {
+        const kind = reportKindFor(question);
+        send({ t: 'status', s: 'report', kind, label: REPORT_KINDS[kind] });
+        const row = await generateReport({
+          kind, lang, user: email, log: req.log, snap,
+          params: { model: requestModel || undefined },
+        });
+        const { rows } = await q('SELECT narrative FROM ai_reports WHERE id = $1', [row.id]);
+        const nar = rows[0]?.narrative || {};
+        send({ t: 'report', id: row.id, title: row.title, kind: row.kind });
+        const lines = [
+          `**${row.title}** — ${REPORT_KINDS[kind]}`,
+          '',
+          nar.executive_summary || '',
+          ...(nar.findings || []).slice(0, 5).map((f) => `- **${f.severity}** ${f.headline}`),
+          '',
+          lang === 'th' ? 'เปิดรายงานเต็มได้จากการ์ดด้านล่าง' : 'Open the full report from the card below.',
+        ].join('\n');
+        answerChars = lines.length;
+        send({ t: 'delta', c: lines });
+        return;
       }
+
+      // ---- gather ---------------------------------------------------------
+      const baseSystem = buildSystemPrompt({
+        snap, scope: { servers: route.servers }, role,
+        toolNames: toolNames(role), mode: route.profile,
+      });
+      const history = messages.slice(-config.chatMaxHistory, -1)
+        .filter((m) => m.content && (m.role === 'user' || m.role === 'assistant'))
+        .map(({ role: r, content }) => ({ role: r, content: String(content).slice(0, 4000) }));
+
+      const gathered = [];
+      if (route.useTools && config.aiMaxToolRounds > 0) {
+        const schemas = toolSchemas(role);
+        const planMsgs = [
+          { role: 'system', content: `${baseSystem}\n\n${PLAN_INSTRUCTION}` },
+          ...history,
+          { role: 'user', content: question },
+        ];
+
+        for (let round = 0; round < config.aiMaxToolRounds; round++) {
+          let calls = [];
+          if (caps.tools !== false) {
+            const { message } = await llmChat({ messages: planMsgs, profile: 'plan', tools: schemas, log: req.log });
+            calls = (message.tool_calls || []).map((c) => ({
+              id: c.id, name: c.function?.name,
+              args: safeParse(c.function?.arguments),
+            }));
+            // Keep the assistant turn in the transcript so the tool replies
+            // that follow have something to be replies *to*.
+            if (calls.length) planMsgs.push(message);
+            else break;
+          } else {
+            // No native tool calling on this server — ask for the same decision
+            // as constrained JSON. One round only: without real tool messages
+            // the model cannot see its own previous results well enough for a
+            // second round to be worth the latency.
+            if (round > 0) break;
+            const plan = await llmJson({
+              messages: [
+                {
+                  role: 'system',
+                  content: `${baseSystem}\n\nAvailable tools: ${JSON.stringify(schemas.map((s) => s.function))}\n\n`
+                    + 'Return the tool calls you need to answer the question. Return {"calls":[]} if the context above is already enough.',
+                },
+                { role: 'user', content: question },
+              ],
+              schema: REACT_SCHEMA, profile: 'plan', log: req.log,
+            });
+            calls = (plan?.calls || []).slice(0, 4)
+              .map((c) => ({ name: c.tool, args: safeParse(c.args_json) }));
+            if (!calls.length) break;
+          }
+
+          for (const call of calls.slice(0, 4)) {
+            if (!call.name) continue;
+            send({ t: 'status', s: 'tool', name: call.name, args: call.args });
+            const result = await runTool(call.name, call.args, { snap, log: req.log, role });
+            usedTools.push(call.name);
+            gathered.push({ name: call.name, args: call.args, result });
+            send({ t: 'tool_done', name: call.name, chars: result.length });
+            if (caps.tools !== false && call.id) {
+              planMsgs.push({ role: 'tool', tool_call_id: call.id, name: call.name, content: result });
+            }
+          }
+          if (caps.tools === false) break;
+        }
+      }
+
+      // ---- answer ---------------------------------------------------------
+      let system = baseSystem;
+      if (gathered.length) {
+        // Folded into the system message rather than left as tool-role turns:
+        // the answering call carries no `tools`, and a chat template that sees
+        // tool messages without a tool list is free to render them oddly or
+        // reject them outright.
+        system += `\n\n## Data you just looked up (freshest truth — prefer this over anything above)\n`
+          + gathered.map((g) => `### ${g.name}(${JSON.stringify(g.args || {})})\n${g.result}`).join('\n\n');
+      }
+      send({ t: 'status', s: 'answering' });
+
+      const answerMsgs = [
+        { role: 'system', content: system },
+        ...history,
+        { role: 'user', content: question },
+      ];
+      await llmStream({
+        messages: answerMsgs,
+        profile: route.profile,
+        log: req.log,
+        onDelta: (c) => { answerChars += c.length; send({ t: 'delta', c }); },
+        onThink: (c) => send({ t: 'think', c }),
+      });
     } catch (e) {
-      req.log.error(e, 'stream error');
+      failure = e.message;
+      req.log.error(e, 'chat failed');
+      send({ t: 'error', m: e.message });
     } finally {
+      // Telemetry is best-effort: a logging failure must never be the reason a
+      // user's answer does not arrive.
+      let logId = null;
+      try {
+        const { rows } = await q(
+          `INSERT INTO ai_chat_log (user_email, question, intent, tools, answer_chars, latency_ms, error)
+           VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
+          [email, question.slice(0, 2000), route.intent, JSON.stringify(usedTools),
+            answerChars, Date.now() - started, failure]);
+        logId = rows[0]?.id;
+      } catch (e) { req.log.warn(e, 'ai_chat_log insert failed'); }
+      if (logId) send({ t: 'logged', id: logId });
+      try { reply.raw.write('data: [DONE]\n\n'); } catch { /* ignore */ }
       reply.raw.end();
     }
   });
 }
+
+function safeParse(s) {
+  if (!s) return {};
+  if (typeof s === 'object') return s;
+  try { return JSON.parse(s); } catch { return {}; }
+}
+
+// Exported for the eval harness, which needs the same sampling presets the
+// live path uses or it is measuring a different system.
+export { PROFILES };

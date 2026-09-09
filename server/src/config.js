@@ -115,4 +115,22 @@ export const config = {
   // whole fleet, so an unbounded transcript is what overflows a local model's
   // context window — and it fails as a confusing truncated reply, not an error.
   chatMaxHistory: Number(process.env.CHAT_MAX_HISTORY || 20),
+
+  // Qwen3 is a hybrid reasoning model and the old prompt pinned its reasoning
+  // off for every question. It is now chosen per request instead — but only if
+  // the served chat template understands the flag, which ai-llm.js probes once.
+  aiThinking: !/^(0|false|no)$/i.test(process.env.AI_THINKING || '1'),
+  // Rounds of tool calling before the model has to answer. Two is enough to
+  // look something up and then follow it; more mostly buys latency. 0 turns
+  // tool use off entirely and falls back to answering from the context pack.
+  aiMaxToolRounds: Number(process.env.AI_MAX_TOOL_ROUNDS || 2),
+  // Letting the model write its own SELECT answers questions nobody predicted,
+  // and is the largest attack surface in the feature. Off unless asked for, and
+  // admin-only even then. See docs/AI-CHAT.md for the database role to pair it
+  // with — the in-process guard should not be the only thing standing there.
+  aiAllowSql: /^(1|true|yes)$/i.test(process.env.AI_ALLOW_SQL || ''),
+  aiSqlTimeoutMs: Number(process.env.AI_SQL_TIMEOUT_MS || 5000),
+  // A local model generating a full report legitimately takes minutes; fetch's
+  // default would abandon it long before it finished.
+  aiRequestTimeoutMs: Number(process.env.AI_REQUEST_TIMEOUT_MS || 180_000),
 };

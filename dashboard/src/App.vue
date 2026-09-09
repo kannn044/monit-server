@@ -44,6 +44,7 @@ async function changePassword() {
       <router-link class="navlink" to="/rules">Alert rules</router-link>
       <router-link class="navlink" to="/projects">Groups</router-link>
       <router-link class="navlink" to="/chat">AI Chat</router-link>
+      <router-link class="navlink" to="/reports">Reports</router-link>
       <router-link v-if="auth.isAdmin" class="navlink" to="/settings">Settings</router-link>
       <div class="foot">
         <div>{{ auth.user?.email }}</div>

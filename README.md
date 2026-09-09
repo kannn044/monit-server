@@ -117,7 +117,7 @@ Servers are organised into **groups** (`projects` in the API): one group per
 server, shown as collapsible sections on the Fleet page and managed in bulk from
 the Groups page.
 
-| `docs/` | [API](docs/API.md) · [agents](docs/AGENTS.md) · [operations](docs/OPERATIONS.md) · [telegram](docs/TELEGRAM.md) · [nginx](docs/NGINX.md) · [decisions](docs/DECISIONS.md) |
+| `docs/` | [AI chat](docs/AI-CHAT.md) · [API](docs/API.md) · [agents](docs/AGENTS.md) · [operations](docs/OPERATIONS.md) · [telegram](docs/TELEGRAM.md) · [nginx](docs/NGINX.md) · [decisions](docs/DECISIONS.md) |
 | `setup-db.sh` | one-command setup against an existing PostgreSQL container |
 | `deploy-agent.sh` | push + install the agent on a target host over ssh |
 | `prune-metrics.sh` | cron-friendly retention when not using TimescaleDB |

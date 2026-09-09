@@ -17,6 +17,7 @@ import metricsRoutes from './routes/metrics.js';
 import alertRoutes from './routes/alerts.js';
 import installRoutes from './routes/install.js';
 import chatRoutes from './routes/chat.js';
+import reportRoutes from './routes/reports.js';
 import { startNotifier } from './workers/notifier.js';
 import { startAlertEngine } from './workers/alert-engine.js';
 import { resolveJwtSecret } from './lib/secrets.js';
@@ -76,6 +77,7 @@ async function main() {
   await app.register(metricsRoutes);
   await app.register(alertRoutes);
   await app.register(chatRoutes);
+  await app.register(reportRoutes);
   // Registered before the static handler so /install/:token is not mistaken for
   // a dashboard route and answered with index.html.
   await app.register(installRoutes);

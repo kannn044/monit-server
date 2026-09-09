@@ -49,6 +49,54 @@ docker port postgres-db
 `--dump` deliberately checks only the source, so you can take the dump before
 the native server exists at all.
 
+## If the names differ on the two sides
+
+The container's database and the one you created on the host do not have to
+share a name:
+
+```bash
+export MONIT_DB_NAME=monit            # in the container
+export MONIT_TARGET_DB=monit_server   # on the native server
+```
+
+| Variable | Default | |
+|---|---|---|
+| `MONIT_DB_CONTAINER` | `postgres-db` | the container to read from |
+| `MONIT_DB_NAME` | `monit` | database inside it |
+| `MONIT_DB_USER` | `monit` | role on both sides |
+| `MONIT_TARGET_DB` | same as `MONIT_DB_NAME` | database on the host |
+| `MONIT_TARGET_HOST` / `MONIT_TARGET_PORT` | `127.0.0.1` / `5432` | |
+| `MONIT_DUMP_DIR` | `/var/backups/monit` | |
+
+## If the native server is on 5433
+
+Set it once and every command below picks it up:
+
+```bash
+export MONIT_TARGET_PORT=5433
+export PGPASSWORD='the monit password on the native server'
+```
+
+Two things on Rocky 9 that only bite on a non-default port:
+
+**SELinux only knows 5432.** If PostgreSQL refuses to start with
+`could not bind IPv4 address … Permission denied`, that is the label, not the
+firewall:
+
+```bash
+sudo semanage port -a -t postgresql_port_t -p tcp 5433   # policycoreutils-python-utils
+sudo semanage port -l | grep postgresql                  # confirm
+```
+
+**`psql` still defaults to 5432**, so every manual check needs `-p 5433` or it
+quietly talks to the container's server instead — the confusing kind of wrong.
+
+The port also has to appear in `DATABASE_URL` after the cutover:
+
+```dotenv
+DATABASE_URL=postgres://monit:PASSWORD@172.17.0.1:5433/monit
+```
+
 ## Before anything else: two things decide whether this is easy
 
 **TimescaleDB.** If the source has it, a plain dump/restore does **not** carry

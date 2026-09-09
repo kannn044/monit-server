@@ -14,6 +14,10 @@ cd "$(dirname "$0")"
 
 CONTAINER=${MONIT_DB_CONTAINER:-postgres-db}
 DB=${MONIT_DB_NAME:-monit}
+# The two names need not match. A database created ahead of time is often called
+# something else — monit_server, say — and assuming one name for both sides made
+# the script insist on creating a database that already existed under another.
+TARGET_DB=${MONIT_TARGET_DB:-$DB}
 DBUSER=${MONIT_DB_USER:-monit}
 TARGET_HOST=${MONIT_TARGET_HOST:-127.0.0.1}
 TARGET_PORT=${MONIT_TARGET_PORT:-5432}
@@ -74,9 +78,12 @@ csql() { docker exec -i "$CONTAINER" psql -U "$DBUSER" -d "$DB" -Atc "$1" 2>/dev
 # version string. Validate the shape of what came back.
 csql_num() {
   local out; out=$(csql "$1")
-  case $out in
-    ''|*[!0-9.\ ]*) return 1 ;;
-    *) printf '%s' "$out" ;;
+  # A real server answers "16.3 (Debian 16.3-1.pgdg120+1)", so the whole string
+  # is not numeric and must not be required to be — take the leading number and
+  # check THAT. Demanding digits end to end rejected every genuine answer.
+  case ${out%% *} in
+    ''|*[!0-9.]*) return 1 ;;
+    *) printf '%s' "${out%% *}" ;;
   esac
 }
 
@@ -96,7 +103,8 @@ do_check() {
   local sver
   if ! sver=$(csql_num "show server_version"); then
     bad "cannot read a version from '$CONTAINER'. What came back:"
-    csql "show server_version" | sed 's/^/     /' | head -3
+    local raw; raw=$(csql "show server_version")
+    printf '%s\n' "${raw:-(nothing on stdout — psql wrote only to stderr)}" | sed 's/^/     /' | head -3
     echo "     · is psql on PATH in that container?   docker exec $CONTAINER which psql"
     echo "     · is the user right?                   MONIT_DB_USER=… (now: $DBUSER)"
     echo "     · is the database right?               MONIT_DB_NAME=… (now: $DB)"
@@ -159,36 +167,51 @@ do_check() {
   fi
 
   echo
-  info "target: $TARGET_HOST:$TARGET_PORT"
-  if ! "${TARGET_PSQL[@]}" -d postgres -Atc 'select 1' >/dev/null 2>&1; then
-    bad "cannot connect to the target as '$DBUSER'."
-    echo "     On the host, as postgres:"
-    echo "       sudo -u postgres createuser --pwprompt $DBUSER"
-    echo "       sudo -u postgres createdb -O $DBUSER $DB"
-    echo "     Put the password in ~/.pgpass or PGPASSWORD before running this."
+  info "target: $TARGET_HOST:$TARGET_PORT, database '$TARGET_DB'"
+  local terr
+  terr=$("${TARGET_PSQL[@]}" -d postgres -Atc 'select 1' 2>&1 >/dev/null)
+  if [ -n "$terr" ]; then
+    bad "cannot connect to the target as '$DBUSER'. psql said:"
+    printf '%s\n' "$terr" | sed 's/^/     /' | head -4
+    echo
+    # Every one of these needs -p: psql and its friends default to 5432, so on a
+    # server running anywhere else they fail with a confusing socket error that
+    # has nothing to do with the real problem.
+    echo "     The port is not optional — these tools all default to 5432:"
+    echo "       sudo -u postgres psql -p $TARGET_PORT -c '\\du'          # does the role exist?"
+    echo "       sudo -u postgres psql -p $TARGET_PORT -c '\\l'           # what databases are there?"
+    echo
+    echo "     Create them if they are missing:"
+    echo "       sudo -u postgres createuser -p $TARGET_PORT --pwprompt $DBUSER"
+    echo "       sudo -u postgres createdb   -p $TARGET_PORT -O $DBUSER $TARGET_DB"
+    echo
+    echo "     If the role exists, it is the password or pg_hba.conf:"
+    echo "       export PGPASSWORD='…'   (or put it in ~/.pgpass)"
+    echo "       sudo -u postgres psql -p $TARGET_PORT -c \"ALTER ROLE $DBUSER PASSWORD '…'\""
     fatal=1
   else
     local tver
     tver=$("${TARGET_PSQL[@]}" -d postgres -Atc 'show server_version')
+    tver=${tver%% *}
     ok "target PostgreSQL $tver"
     # Restoring into an OLDER server is the case that breaks; the other way is fine.
     if [ "${tver%%.*}" -lt "${sver%%.*}" ]; then
       bad "the target ($tver) is older than the source ($sver) — a dump from $sver may not restore"
       fatal=1
     fi
-    if "${TARGET_PSQL[@]}" -d "$DB" -Atc 'select 1' >/dev/null 2>&1; then
+    if "${TARGET_PSQL[@]}" -d "$TARGET_DB" -Atc 'select 1' >/dev/null 2>&1; then
       local n
-      n=$("${TARGET_PSQL[@]}" -d "$DB" -Atc "select count(*) from information_schema.tables where table_schema not in ('pg_catalog','information_schema')")
+      n=$("${TARGET_PSQL[@]}" -d "$TARGET_DB" -Atc "select count(*) from information_schema.tables where table_schema not in ('pg_catalog','information_schema')")
       if [ "${n:-0}" -gt 0 ]; then
-        bad "the target database '$DB' already has $n table(s) — refusing to restore over it"
-        echo "     Drop and recreate it, or point MONIT_DB_NAME somewhere empty."
+        bad "the target database '$TARGET_DB' already has $n table(s) — refusing to restore over it"
+        echo "     Drop and recreate it, or set MONIT_TARGET_DB to an empty one."
         fatal=1
       else
-        ok "target database '$DB' exists and is empty"
+        ok "target database '$TARGET_DB' exists and is empty"
       fi
     else
-      warn "target database '$DB' does not exist yet — create it:"
-      echo "       sudo -u postgres createdb -O $DBUSER $DB"
+      warn "target database '$TARGET_DB' does not exist yet — create it:"
+      echo "       sudo -u postgres createdb -p $TARGET_PORT -O $DBUSER $TARGET_DB"
       fatal=1
     fi
   fi
@@ -242,7 +265,7 @@ COUNT_SQL="select 'servers='||(select count(*) from servers)
 do_verify() {
   local src tgt
   src=$(csql "$COUNT_SQL")
-  tgt=$("${TARGET_PSQL[@]}" -d "$DB" -Atc "$COUNT_SQL" 2>/dev/null | tr -d '\r')
+  tgt=$("${TARGET_PSQL[@]}" -d "$TARGET_DB" -Atc "$COUNT_SQL" 2>/dev/null | tr -d '\r')
   echo "  container : $src"
   echo "  native    : $tgt"
   if [ -n "$tgt" ] && [ "$src" = "$tgt" ]; then
@@ -273,10 +296,10 @@ do_cutover() {
   dump_now
   local dump; dump=$(cat "$OUTDIR/.latest")
 
-  info "restoring into $TARGET_HOST:$TARGET_PORT/$DB"
+  info "restoring into $TARGET_HOST:$TARGET_PORT/$TARGET_DB"
   # --single-transaction so a failure leaves the target empty rather than half
   # populated; --exit-on-error so it stops at the first real problem.
-  if ! pg_restore -h "$TARGET_HOST" -p "$TARGET_PORT" -U "$DBUSER" -d "$DB" \
+  if ! pg_restore -h "$TARGET_HOST" -p "$TARGET_PORT" -U "$DBUSER" -d "$TARGET_DB" \
        --no-owner --no-acl --single-transaction --exit-on-error "$dump" 2>/tmp/monit-restore.err; then
     sed 's/^/     /' /tmp/monit-restore.err >&2
     die "restore failed — the app is still stopped and the container still holds the data"
@@ -297,7 +320,7 @@ do_cutover() {
      "127.0.0.1" there means the container itself, not this host. Use the
      host's address on the docker bridge:
 
-       DATABASE_URL=postgres://$DBUSER:PASSWORD@172.17.0.1:$TARGET_PORT/$DB
+       DATABASE_URL=postgres://$DBUSER:PASSWORD@172.17.0.1:$TARGET_PORT/$TARGET_DB
 
      (check it: docker network inspect bridge -f '{{(index .IPAM.Config 0).Gateway}}')
      or this machine's LAN address, e.g. 10.1.1.171.
@@ -305,7 +328,7 @@ do_cutover() {
   2. Let PostgreSQL accept it — as postgres, on this host:
 
        listen_addresses = '*'                       # postgresql.conf
-       host  $DB  $DBUSER  172.17.0.0/16  scram-sha-256   # pg_hba.conf
+       host  $TARGET_DB  $DBUSER  172.17.0.0/16  scram-sha-256   # pg_hba.conf
        sudo systemctl reload postgresql
 
   3. Start the app and watch it come up:

@@ -135,7 +135,11 @@ export default async function chatRoutes(app) {
     const email = req.user?.email || req.user?.sub || null;
     const question = String(messages[messages.length - 1]?.content || '');
 
-    const lang = isThai(question) ? 'th' : 'en';
+    // The language of the answer is a setting, not a guess. AI_LANG=auto
+    // restores the old behaviour of following the question.
+    const lang = config.aiLanguage === 'auto'
+      ? (isThai(question) ? 'th' : 'en')
+      : (config.aiLanguage === 'en' ? 'en' : 'th');
 
     // Take the socket BEFORE any slow work.
     //
@@ -167,6 +171,16 @@ export default async function chatRoutes(app) {
       try { reply.raw.write(`data: ${JSON.stringify(obj)}\n\n`); } catch { /* client went away */ }
     };
 
+    // An SSE comment every 15 seconds.
+    //
+    // nginx's proxy_read_timeout counts silence, not total duration, and a
+    // report or a long analysis can think for longer than 60 seconds without
+    // emitting a token. One byte resets the clock; the client's parser ignores
+    // any line that is not "data:", so this costs nothing but the newline.
+    const heartbeat = setInterval(() => {
+      try { reply.raw.write(': keepalive\n\n'); } catch { /* ignore */ }
+    }, 15_000);
+
     const usedTools = [];
     let answerChars = 0;
     let failure = null;
@@ -195,10 +209,9 @@ export default async function chatRoutes(app) {
         send({ t: 'status', s: 'report', kind, label: REPORT_KINDS[kind] });
         const row = await generateReport({
           kind, lang, user: email, log: req.log, snap,
-          params: { model: requestModel || undefined },
+          params: { lang, model: requestModel || undefined },
         });
-        const { rows } = await q('SELECT narrative FROM ai_reports WHERE id = $1', [row.id]);
-        const nar = rows[0]?.narrative || {};
+        const nar = row.narrative || {};
         send({ t: 'report', id: row.id, title: row.title, kind: row.kind });
         const lines = [
           `**${row.title}** — ${REPORT_KINDS[kind]}`,
@@ -216,7 +229,7 @@ export default async function chatRoutes(app) {
       // ---- gather ---------------------------------------------------------
       const baseSystem = buildSystemPrompt({
         snap, scope: { servers: route.servers }, role,
-        toolNames: toolNames(role), mode: route.profile,
+        toolNames: toolNames(role), mode: route.profile, lang,
       });
       const history = messages.slice(-config.chatMaxHistory, -1)
         .filter((m) => m.content && (m.role === 'user' || m.role === 'assistant'))
@@ -316,6 +329,7 @@ export default async function chatRoutes(app) {
       req.log.error(e, 'chat failed');
       send({ t: 'error', m: e.message });
     } finally {
+      clearInterval(heartbeat);
       // Telemetry is best-effort: a logging failure must never be the reason a
       // user's answer does not arrive.
       let logId = null;

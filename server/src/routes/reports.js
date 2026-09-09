@@ -9,13 +9,13 @@
 
 import { q } from '../db/pool.js';
 import { requireRole } from '../lib/auth.js';
-import { generateReport, REPORT_KINDS } from '../lib/ai-report.js';
+import { createPendingReport, fillReport, REPORT_KINDS } from '../lib/ai-report.js';
 
 export default async function reportRoutes(app) {
   app.get('/api/v1/reports', { preHandler: requireRole('viewer') }, async (req) => {
     const limit = Math.min(Number(req.query?.limit) || 50, 200);
     const { rows } = await q(
-      `SELECT id, kind, title, created_by, created_at,
+      `SELECT id, kind, title, status, error, created_by, created_at,
               (dataset->>'subtitle')            AS subtitle,
               jsonb_array_length(COALESCE(narrative->'findings','[]'::jsonb)) AS findings
          FROM ai_reports ORDER BY created_at DESC LIMIT $1`, [limit]);
@@ -37,18 +37,19 @@ export default async function reportRoutes(app) {
       });
     }
     const lang = req.body?.lang === 'en' ? 'en' : 'th';
-    try {
-      // Generation runs a model call, so it is slow by nature — seconds, not
-      // milliseconds. It stays a plain request rather than a job because the
-      // caller is a person who clicked a button and is watching a spinner.
-      const row = await generateReport({
-        kind, lang, user: req.user?.email || req.user?.sub, log: req.log,
-      });
-      return reply.code(201).send(row);
-    } catch (e) {
-      req.log.error(e, 'report generation failed');
-      return reply.code(502).send({ title: 'Report generation failed', status: 502, detail: e.message });
-    }
+    const params = { lang };
+
+    // Claim the row, answer immediately, then do the work.
+    //
+    // The model call takes a minute or more on a local GPU. Holding the request
+    // open for it gave the page nothing to show but a disabled button, and
+    // anything slower than nginx's proxy_read_timeout came back as a 504 —
+    // which looked like the report had failed even though the server went on to
+    // finish and store it. The client polls GET /reports/:id instead.
+    const row = await createPendingReport({ kind, params, user: req.user?.email || req.user?.sub });
+    fillReport(row.id, { kind, params, lang, log: req.log })
+      .catch(() => { /* fillReport already recorded the reason on the row */ });
+    return reply.code(202).send(row);
   });
 
   app.delete('/api/v1/reports/:id', { preHandler: requireRole('admin') }, async (req, reply) => {

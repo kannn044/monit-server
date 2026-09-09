@@ -306,7 +306,9 @@ export async function narrate(dataset, { lang = 'th', log } = {}) {
       role: 'system',
       content: `You are an SRE writing the interpretation section of an infrastructure report.
 You are given figures that are already computed and correct. Do NOT recompute them and do NOT invent any figure that is not below.
-Write in ${lang === 'th' ? 'Thai' : 'English'}, keeping metric names, units and server names as they are.
+${lang === 'th'
+    ? 'LANGUAGE: write every string value in Thai (ภาษาไทย). headline, analysis, recommendation, executive_summary and next_actions must all be Thai sentences. Keep metric names, units, server names, commands and identifiers in their original Latin form. Do not write an English sentence anywhere.'
+    : 'LANGUAGE: write every string value in English.'}
 Each finding must cite the server and the number it is about. Recommend a concrete action, never "monitor the situation".
 If the data shows nothing wrong, say so plainly and return a short findings list rather than manufacturing concerns.
 Return JSON only.`,
@@ -329,9 +331,12 @@ Return JSON only.`,
     log?.warn(e, 'report narration failed');
   }
   // A report whose numbers are right and whose prose is missing is still a
-  // useful report — much more useful than an error page.
+  // useful report — much more useful than an error page. Said in the report's
+  // own language, since this line is the first thing the reader sees.
   return {
-    executive_summary: '(AI narration unavailable — the figures below are complete and were computed directly from the database.)',
+    executive_summary: lang === 'th'
+      ? '(ยังไม่มีบทวิเคราะห์จากโมเดล — ตัวเลข กราฟ และตารางด้านล่างครบถ้วน คำนวณจากฐานข้อมูลโดยตรง)'
+      : '(AI narration unavailable — the figures below are complete and were computed directly from the database.)',
     findings: [],
     next_actions: [],
   };
@@ -552,15 +557,49 @@ The narrative was written by a language model from those figures and may be wron
 </div></body></html>`;
 }
 
-/** Build, narrate, render and store one report. Returns the stored row. */
-export async function generateReport({ kind, params = {}, lang = 'th', user, log, snap }) {
-  const dataset = await buildDataset(kind, params, snap);
-  const narrative = await narrate(dataset, { lang, log });
-  const html = renderHtml(dataset, narrative, { model: params.model });
+/**
+ * Claim a row before doing any work.
+ *
+ * Generation runs a model call that takes a minute or more on a local GPU. When
+ * that happened inside the request, the browser held an open POST for the whole
+ * time with nothing to show, and anything slower than nginx's
+ * proxy_read_timeout came back as a 504 — discarding, from the user's point of
+ * view, a report the server had finished writing. Creating the row first gives
+ * the page something to poll and makes a slow model merely slow.
+ */
+export async function createPendingReport({ kind, params = {}, user }) {
   const { rows } = await q(
-    `INSERT INTO ai_reports (kind, title, params, dataset, narrative, html, created_by)
-     VALUES ($1,$2,$3,$4,$5,$6,$7)
-     RETURNING id, kind, title, created_at`,
-    [kind, dataset.title, params, dataset, narrative, html, user || null]);
+    `INSERT INTO ai_reports (kind, title, params, html, status, created_by)
+     VALUES ($1,$2,$3,'','pending',$4)
+     RETURNING id, kind, title, status, created_at`,
+    [kind, REPORT_KINDS[kind] || kind, params, user || null]);
   return rows[0];
+}
+
+/** Do the work and fill the row in. Marks it failed rather than throwing away why. */
+export async function fillReport(id, { kind, params = {}, lang = 'th', log, snap }) {
+  try {
+    const dataset = await buildDataset(kind, params, snap);
+    const narrative = await narrate(dataset, { lang, log });
+    const html = renderHtml(dataset, narrative, { model: params.model });
+    await q(
+      `UPDATE ai_reports SET title=$2, dataset=$3, narrative=$4, html=$5, status='ready', error=NULL
+        WHERE id=$1`,
+      [id, dataset.title, dataset, narrative, html]);
+    return { id, title: dataset.title, narrative };
+  } catch (e) {
+    log?.error(e, `report ${kind} failed`);
+    // The row stays, carrying the reason. A report that failed silently and
+    // vanished from the list is the worst of both worlds.
+    await q(`UPDATE ai_reports SET status='failed', error=$2 WHERE id=$1`,
+      [id, String(e.message).slice(0, 500)]).catch(() => {});
+    throw e;
+  }
+}
+
+/** Build, narrate, render and store one report, start to finish. */
+export async function generateReport({ kind, params = {}, lang = 'th', user, log, snap }) {
+  const row = await createPendingReport({ kind, params, user });
+  const done = await fillReport(row.id, { kind, params, lang, log, snap });
+  return { ...row, title: done.title, status: 'ready', narrative: done.narrative };
 }

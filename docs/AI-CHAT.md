@@ -66,6 +66,56 @@ The NDB diagram lays nodes out **by node group**, because that is the thing that
 decides survival: a group down to one live node is one failure from taking the
 whole cluster offline, and an id-ordered list hides exactly that.
 
+## When the chat request hangs
+
+A `POST /api/v1/chat` that sits pending and then returns **504** with an idle
+GPU means the request never reached the model. Ask the endpoint, do not guess:
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" \
+  https://your-host/monit/api/v1/chat/diag | python3 -m json.tool
+```
+
+It times every snapshot query separately and then probes vLLM:
+
+```json
+{"total_db_ms": 87,
+ "steps": [{"step":"servers","ms":3,"rows":8},
+           {"step":"latest_sample","ms":3,"rows":8},
+           {"step":"stats_24h","ms":21,"rows":8},
+           {"step":"week_trend_baseline","ms":19,"rows":8}, …],
+ "vllm": {"ok": true, "ms": 12, "models": ["qwen3.8-27b"]}}
+```
+
+- **`total_db_ms` in the thousands** — the database is the problem. Almost
+  always this means TimescaleDB is not enabled, so `metrics_1h` is a plain view
+  aggregating the whole table. The queries here no longer read it (they sample
+  raw rows through the `(server_id, time DESC)` index instead), but the
+  dashboard's own charts still do. `docker compose logs app | grep migrate`
+  says which path the migration runner chose.
+- **`vllm.ok: false`** — the endpoint is unreachable from inside the container.
+  `VLLM_BASE_URL` pointing at `127.0.0.1` is the usual cause: a container's
+  loopback is its own.
+- **both fine, still slow** — it is the model. Watch `nvtop` while asking.
+
+### nginx
+
+The chat reply is a Server-Sent Events stream, and it must not be buffered:
+
+```nginx
+proxy_read_timeout 120s;
+proxy_buffering off;
+proxy_cache off;
+```
+
+`docs/NGINX.md` has the full block. A 504 at almost exactly 60 seconds is
+nginx's default `proxy_read_timeout` — the deployed config is missing these
+lines even if the documented one has them. Without `proxy_buffering off` the
+symptom is different and easy to misread: the answer works, but arrives in one
+lump at the end instead of streaming, so the page looks frozen. The app also
+sends `X-Accel-Buffering: no` on that response, which covers the case where
+nobody edited the site config.
+
 ## Measuring whether a change helped
 
 ```bash

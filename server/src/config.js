@@ -140,6 +140,12 @@ export const config = {
   // How long one fleet snapshot is reused. Long enough that a conversation does
   // not re-query the fleet on every message, short enough that "now" is now.
   aiSnapshotTtlMs: Number(process.env.AI_SNAPSHOT_TTL_MS || 15_000),
+  // Which language the assistant answers in: 'th', 'en', or 'auto' to follow
+  // whatever the question was written in. Not left on auto by default: the
+  // system prompt, the metric names and every tool result are English, and a
+  // model reading three thousand English tokens answers in English however the
+  // question was phrased.
+  aiLanguage: (process.env.AI_LANG || 'th').toLowerCase(),
   // A local model generating a full report legitimately takes minutes; fetch's
   // default would abandon it long before it finished.
   aiRequestTimeoutMs: Number(process.env.AI_REQUEST_TIMEOUT_MS || 180_000),

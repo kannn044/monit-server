@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted, watch, computed } from 'vue';
+import { ref, onMounted, onUnmounted, watch, computed } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { api } from '../api.js';
 import { useAuth } from '../stores/auth.js';
@@ -15,35 +15,78 @@ const loading = ref(false);
 const busy = ref('');
 const error = ref('');
 const lang = ref('th');
+const elapsed = ref(0);
+
+let poll = null;
+let tick = null;
 
 const openId = computed(() => route.params.id || null);
+const pending = computed(() => current.value?.status === 'pending');
+const failed = computed(() => current.value?.status === 'failed');
 
 async function loadList() {
-  loading.value = true;
   try {
     const r = await api('/api/v1/reports');
     kinds.value = r.kinds;
     reports.value = r.reports;
-  } catch (e) { error.value = e.message; } finally { loading.value = false; }
+  } catch (e) { error.value = e.message; }
 }
 
-async function loadOne(id) {
-  if (!id) { current.value = null; return; }
-  loading.value = true;
-  try { current.value = await api(`/api/v1/reports/${id}`); }
-  catch (e) { error.value = e.message; } finally { loading.value = false; }
+async function loadOne(id, quiet = false) {
+  if (!id) { current.value = null; stopPolling(); return; }
+  if (!quiet) loading.value = true;
+  try {
+    current.value = await api(`/api/v1/reports/${id}`);
+    if (current.value.status === 'pending') startPolling(id);
+    else stopPolling();
+  } catch (e) { error.value = e.message; stopPolling(); }
+  finally { loading.value = false; }
+}
+
+/**
+ * Poll while a report is being written.
+ *
+ * Generation is a model call that runs for a minute or more on a local GPU, so
+ * the server hands back a row immediately and fills it in afterwards. Polling
+ * is what turns that into something the page can show: a live elapsed count
+ * instead of a disabled button and no explanation.
+ */
+function startPolling(id) {
+  stopPolling();
+  const t0 = Date.now() - (elapsed.value * 1000);
+  tick = setInterval(() => { elapsed.value = Math.round((Date.now() - t0) / 1000); }, 1000);
+  poll = setInterval(async () => {
+    try {
+      const r = await api(`/api/v1/reports/${id}`);
+      current.value = r;
+      if (r.status !== 'pending') { stopPolling(); await loadList(); }
+    } catch { /* a dropped poll is not worth an error banner; the next one retries */ }
+  }, 2500);
+}
+
+function stopPolling() {
+  if (poll) { clearInterval(poll); poll = null; }
+  if (tick) { clearInterval(tick); tick = null; }
 }
 
 async function generate(kind) {
   error.value = '';
   busy.value = kind;
+  elapsed.value = 0;
   try {
+    // 202 with a pending row — the work carries on server-side.
     const row = await api('/api/v1/reports', { method: 'POST', body: { kind, lang: lang.value } });
     await loadList();
     router.push(`/reports/${row.id}`);
+    current.value = row;
+    startPolling(row.id);
   } catch (e) {
     error.value = e.message;
   } finally { busy.value = ''; }
+}
+
+async function retry() {
+  if (current.value) await generate(current.value.kind);
 }
 
 async function remove(id) {
@@ -60,7 +103,7 @@ async function remove(id) {
  * fetch on its own without inventing a second auth mechanism for it.
  */
 function download() {
-  if (!current.value) return;
+  if (!current.value?.html) return;
   const blob = new Blob([current.value.html], { type: 'text/html' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
@@ -70,9 +113,11 @@ function download() {
 }
 
 const when = (t) => new Date(t).toLocaleString('sv-SE').slice(0, 16);
+const mmss = (s) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
 
 onMounted(async () => { await loadList(); await loadOne(openId.value); });
-watch(openId, (id) => loadOne(id));
+onUnmounted(stopPolling);
+watch(openId, (id) => { elapsed.value = 0; loadOne(id); });
 </script>
 
 <template>
@@ -94,19 +139,26 @@ watch(openId, (id) => loadOne(id));
 
     <div class="gen">
       <button v-for="(label, kind) in kinds" :key="kind" class="genbtn"
-              :disabled="!!busy" @click="generate(kind)">
+              :class="{ working: busy === kind }" :disabled="!!busy" @click="generate(kind)">
         <span class="gl">{{ label }}</span>
-        <span class="gs">{{ busy === kind ? 'กำลังสร้าง…' : 'สร้างรายงาน' }}</span>
+        <span class="gs">
+          <span v-if="busy === kind" class="spin"></span>
+          {{ busy === kind ? 'กำลังเริ่ม…' : 'สร้างรายงาน' }}
+        </span>
       </button>
     </div>
 
     <div class="split">
       <aside class="list card">
         <h2>รายงานที่มี</h2>
-        <p v-if="!reports.length && !loading" class="muted" style="font-size: 13px">ยังไม่มีรายงาน — กดปุ่มด้านบนเพื่อสร้าง</p>
+        <p v-if="!reports.length" class="muted" style="font-size: 13px">ยังไม่มีรายงาน — กดปุ่มด้านบนเพื่อสร้าง</p>
         <router-link v-for="r in reports" :key="r.id" class="item" :class="{ on: r.id === openId }"
                      :to="`/reports/${r.id}`">
-          <div class="it">{{ r.title }}</div>
+          <div class="it">
+            {{ r.title }}
+            <span v-if="r.status === 'pending'" class="pill wait">กำลังสร้าง</span>
+            <span v-else-if="r.status === 'failed'" class="pill bad">ล้มเหลว</span>
+          </div>
           <div class="is">{{ when(r.created_at) }} · {{ r.findings }} findings</div>
           <button v-if="auth.isAdmin" class="del" title="ลบ" @click.prevent.stop="remove(r.id)">×</button>
         </router-link>
@@ -117,6 +169,22 @@ watch(openId, (id) => loadOne(id));
           เลือกรายงานจากรายการ หรือสร้างใหม่จากปุ่มด้านบน
         </div>
         <div v-else-if="loading" class="card empty">กำลังโหลด…</div>
+
+        <!-- being written: this is the state the page used to have no words for -->
+        <div v-else-if="pending" class="card progress">
+          <div class="spin big"></div>
+          <div class="pt">{{ current.title }}</div>
+          <div class="pm">กำลังให้โมเดลเขียนบทวิเคราะห์ — ใช้เวลาราว 1–3 นาทีบน GPU เครื่องนี้</div>
+          <div class="pe">{{ mmss(elapsed) }}</div>
+          <div class="pn">ตัวเลขและกราฟคำนวณเสร็จแล้ว ที่รออยู่คือคำอธิบาย · ปิดหน้านี้ไปทำอย่างอื่นได้ รายงานจะถูกบันทึกไว้ให้</div>
+        </div>
+
+        <div v-else-if="failed" class="card progress fail">
+          <div class="pt">สร้างรายงานไม่สำเร็จ</div>
+          <div class="pm">{{ current.error || 'ไม่ทราบสาเหตุ' }}</div>
+          <button class="primary" style="margin-top: 12px" @click="retry">ลองใหม่</button>
+        </div>
+
         <div v-else-if="current" class="card frame-card">
           <div class="row" style="justify-content: space-between; margin-bottom: 10px">
             <div>
@@ -144,9 +212,15 @@ watch(openId, (id) => loadOne(id));
 .gen { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; margin-bottom: 18px; }
 .genbtn { text-align: left; background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 12px 14px; cursor: pointer; display: flex; flex-direction: column; gap: 3px; color: var(--ink); }
 .genbtn:hover:not(:disabled) { border-color: var(--accent); }
-.genbtn:disabled { opacity: 0.55; cursor: default; }
+.genbtn:disabled { opacity: 0.5; cursor: default; }
+.genbtn.working { opacity: 1; border-color: var(--accent); }
 .gl { font-weight: 600; font-size: 13.5px; }
-.gs { font-size: 12px; color: var(--accent); }
+.gs { font-size: 12px; color: var(--accent); display: flex; align-items: center; gap: 6px; }
+
+.spin { width: 11px; height: 11px; border: 2px solid color-mix(in oklab, var(--accent) 30%, transparent); border-top-color: var(--accent); border-radius: 50%; animation: sp 0.7s linear infinite; flex: none; }
+.spin.big { width: 26px; height: 26px; border-width: 3px; margin-bottom: 14px; }
+@keyframes sp { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .spin { animation-duration: 2.4s; } }
 
 .split { display: grid; grid-template-columns: 280px 1fr; gap: 14px; align-items: start; }
 @media (max-width: 900px) { .split { grid-template-columns: 1fr; } }
@@ -157,10 +231,20 @@ watch(openId, (id) => loadOne(id));
 .item.on { background: color-mix(in oklab, var(--accent) 14%, transparent); }
 .it { font-size: 13px; font-weight: 500; }
 .is { font-size: 11.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.pill { font-size: 10px; padding: 1px 6px; border-radius: 999px; margin-left: 6px; font-weight: 600; vertical-align: 1px; }
+.pill.wait { color: var(--warning); background: color-mix(in oklab, var(--warning) 16%, transparent); }
+.pill.bad { color: var(--critical); background: color-mix(in oklab, var(--critical) 14%, transparent); }
 .del { position: absolute; right: 6px; top: 8px; background: transparent; border: 0; color: var(--muted); cursor: pointer; font-size: 15px; line-height: 1; padding: 2px 4px; }
 .del:hover { color: var(--critical); }
 
 .empty { color: var(--muted); text-align: center; padding: 48px 20px; }
+.progress { display: flex; flex-direction: column; align-items: center; text-align: center; padding: 52px 24px; }
+.progress.fail { border-left: 3px solid var(--critical); }
+.pt { font-weight: 600; font-size: 15px; }
+.pm { color: var(--ink-2); font-size: 13px; margin-top: 6px; max-width: 46ch; }
+.pe { font-size: 30px; font-weight: 700; font-variant-numeric: tabular-nums; margin: 16px 0 4px; color: var(--accent); }
+.pn { color: var(--muted); font-size: 12px; max-width: 52ch; line-height: 1.6; }
+
 .frame-card { padding: 12px; }
 .frame { width: 100%; height: calc(100vh - 260px); min-height: 460px; border: 1px solid var(--border); border-radius: 8px; background: var(--page); }
 </style>

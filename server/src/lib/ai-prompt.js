@@ -38,8 +38,28 @@ const PROTOCOL = `## How to answer an analysis question
 - Missing data is never good news. "No sample" means unknown, never healthy.
 - Do not invent server names, incident ids, thresholds, file paths or log lines.
 - Do not restate the whole context. Answer the question that was asked.
-- Reply in the language the user wrote in. Keep Thai natural; keep metric names, units and identifiers in their original form.
 - Prefer a short answer. Use a markdown table when comparing several servers on the same fields.`;
+
+/**
+ * The language rule.
+ *
+ * "Reply in the language the user wrote in" was not enough. Everything around
+ * it — the domain notes, the protocol, the tool results, the metric names — is
+ * English, and a model reading three thousand English tokens answers in English
+ * however the question was phrased. So the language is decided server-side and
+ * stated as an instruction, twice: once at the top where it frames the task,
+ * once as the very last line, because the end of a long prompt is what a model
+ * weighs most.
+ */
+function languageRule(lang) {
+  if (lang === 'en') return 'LANGUAGE: write your entire reply in English.';
+  return 'LANGUAGE: เขียนคำตอบทั้งหมดเป็นภาษาไทย — write your ENTIRE reply in Thai (ภาษาไทย). '
+    + 'This is not optional and does not depend on what language the question was written in. '
+    + 'Every sentence, heading, bullet, table header and label must be Thai. '
+    + 'Keep only these unchanged: metric names (cpu.total, ram.used_pct), units (GB, %, ms), '
+    + 'server names, incident ids, shell commands and file paths. '
+    + 'Do not write an English sentence anywhere in the answer.';
+}
 
 /**
  * Two worked examples, carried in the system message rather than as extra
@@ -76,10 +96,11 @@ CPU 41% ปกติ, disk / 62% ไม่มีปัญหา, load 2.1/8 core
  * server gets that server in full and the rest as one line each, which is both
  * cheaper and more accurate than the old "everything, always".
  */
-export function buildSystemPrompt({ snap, scope, role, toolNames = [], mode = 'analysis' }) {
+export function buildSystemPrompt({ snap, scope, role, toolNames = [], mode = 'analysis', lang = 'th' }) {
   const parts = [
     `You are the SRE assistant built into monit, a self-hosted server monitoring system. `
     + `You are talking to a ${role} of this installation. Everything below was queried from the live database moments ago.`,
+    languageRule(lang),
     DOMAIN,
   ];
 
@@ -120,6 +141,9 @@ export function buildSystemPrompt({ snap, scope, role, toolNames = [], mode = 'a
 
   parts.push(PROTOCOL);
   if (mode !== 'lookup') parts.push(FEWSHOT);
+  // Last word, deliberately: this is the instruction most often ignored, and
+  // the end of the prompt is the part a model weighs most heavily.
+  parts.push(languageRule(lang));
   return parts.join('\n\n');
 }
 

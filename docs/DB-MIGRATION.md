@@ -154,6 +154,33 @@ Safe while the app is running. It writes to `/var/backups/monit`, checks the
 dump is readable with `pg_restore -l`, and stops if it is truncated. Do this
 once before the real thing so the cutover has no surprises left in it.
 
+## 3b. Rehearse the restore, not just the dump
+
+Especially when the two servers are more than one major version apart (16 → 18,
+say), or the database is measured in gigabytes:
+
+```bash
+./migrate-db-to-native.sh --rehearse
+```
+
+It restores the dump into `<target>_rehearsal`, times it, and compares row
+counts — without stopping the app or touching the real target database. Old
+dump into a newer server is the supported direction, but this is the difference
+between finding a problem now and finding it with production stopped.
+
+```
+✓ created scratch database 'monit_server_rehearsal'
+▸ restoring into it (this is the slow part — time it)
+✓ restored in 1s
+  container : servers=18 users=5 … system_metrics=1182
+  rehearsal : servers=18 users=5 … system_metrics=1182
+✓ identical
+```
+
+The restore time it prints is the number to plan the cutover window around. The
+role needs `CREATEDB` for this; the script says so if it is missing. Drop the
+scratch database when you are done — it prints the command.
+
 ## 4. Cut over
 
 ```bash

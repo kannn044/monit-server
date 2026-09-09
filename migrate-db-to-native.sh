@@ -5,6 +5,7 @@
 #
 #   ./migrate-db-to-native.sh --check     # what would move, and what would stop it
 #   ./migrate-db-to-native.sh --dump      # dump only (app keeps running)
+#   ./migrate-db-to-native.sh --rehearse  # restore the dump into a scratch db and check
 #   ./migrate-db-to-native.sh --cutover   # stop app, final dump, restore, verify
 #
 # Nothing is deleted. The container and its volume are left exactly as they are,
@@ -30,6 +31,7 @@ while [ $# -gt 0 ]; do
   case $1 in
     --check) MODE=check ;;
     --dump) MODE=dump ;;
+    --rehearse) MODE=rehearse ;;
     --cutover) MODE=cutover ;;
     --verify) MODE=verify ;;
     -h|--help) sed -n '3,12p' "$0"; exit 0 ;;
@@ -198,6 +200,13 @@ do_check() {
     if [ "${tver%%.*}" -lt "${sver%%.*}" ]; then
       bad "the target ($tver) is older than the source ($sver) — a dump from $sver may not restore"
       fatal=1
+    elif [ $(( ${tver%%.*} - ${sver%%.*} )) -ge 2 ]; then
+      # Old dump into a newer server is the supported direction, but two majors
+      # is far enough that "supported" should be demonstrated rather than
+      # assumed — especially before stopping production to do it once.
+      warn "that is $(( ${tver%%.*} - ${sver%%.*} )) major versions ahead of the source ($sver)."
+      echo "     Supported direction, but prove it before the cutover:"
+      echo "       $0 --rehearse    # restores into a scratch database, app untouched"
     fi
     if "${TARGET_PSQL[@]}" -d "$TARGET_DB" -Atc 'select 1' >/dev/null 2>&1; then
       local n
@@ -342,8 +351,62 @@ do_cutover() {
 EOF
 }
 
+# ---------------------------------------------------------------------------
+# rehearse — the real restore, into a database nobody is using
+# ---------------------------------------------------------------------------
+# Answers the only question that matters before a cutover: does THIS dump go
+# into THIS server cleanly? It costs a copy of the data and no downtime, and it
+# is the difference between finding a problem now and finding it with the app
+# stopped and the clock running.
+do_rehearse() {
+  local scratch="${TARGET_DB}_rehearsal"
+  do_check source-only || exit 1
+  echo
+  [ -f "$OUTDIR/.latest" ] || dump_now
+  local dump; dump=$(cat "$OUTDIR/.latest")
+  info "using $dump"
+
+  "${TARGET_PSQL[@]}" -d postgres -Atc "DROP DATABASE IF EXISTS \"$scratch\"" >/dev/null 2>&1
+  if ! "${TARGET_PSQL[@]}" -d postgres -Atc "CREATE DATABASE \"$scratch\"" >/dev/null 2>&1; then
+    die "could not create $scratch — '$DBUSER' needs CREATEDB:
+   sudo -u postgres psql -p $TARGET_PORT -c 'ALTER ROLE $DBUSER CREATEDB'"
+  fi
+  ok "created scratch database '$scratch'"
+
+  info "restoring into it (this is the slow part — time it)"
+  local t0 t1; t0=$(date +%s)
+  if ! pg_restore -h "$TARGET_HOST" -p "$TARGET_PORT" -U "$DBUSER" -d "$scratch" \
+       --no-owner --no-acl --exit-on-error "$dump" 2>/tmp/monit-rehearse.err; then
+    sed 's/^/     /' /tmp/monit-rehearse.err >&2 | head -20
+    bad "the restore FAILED — do not cut over. The scratch database is left for inspection:"
+    echo "       psql -h $TARGET_HOST -p $TARGET_PORT -U $DBUSER -d $scratch"
+    exit 1
+  fi
+  t1=$(date +%s)
+  ok "restored in $(( t1 - t0 ))s"
+  [ -s /tmp/monit-rehearse.err ] && { warn "pg_restore also said:"; sed 's/^/     /' /tmp/monit-rehearse.err | head -8; }
+
+  echo
+  info "comparing the scratch copy with the container"
+  local src tgt
+  src=$(csql "$COUNT_SQL")
+  tgt=$("${TARGET_PSQL[@]}" -d "$scratch" -Atc "$COUNT_SQL" 2>/dev/null | tr -d '\r')
+  echo "  container : $src"
+  echo "  rehearsal : $tgt"
+  if [ "$src" = "$tgt" ]; then
+    ok "identical — the cutover will work the same way, minus the rows written since the dump"
+  else
+    warn "different, which is expected if the app is still writing. Re-run --dump and compare again if you want a stricter check."
+  fi
+
+  echo
+  echo "  When you are satisfied, drop it:"
+  echo "    psql -h $TARGET_HOST -p $TARGET_PORT -U $DBUSER -d postgres -c 'DROP DATABASE \"$scratch\"'"
+}
+
 case $MODE in
   check)   do_check ;;
+  rehearse) do_rehearse ;;
   dump)    do_check source-only && dump_now ;;
   verify)  do_verify ;;
   cutover) do_cutover ;;

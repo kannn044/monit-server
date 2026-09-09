@@ -213,14 +213,24 @@ export default async function chatRoutes(app) {
         });
         const nar = row.narrative || {};
         send({ t: 'report', id: row.id, title: row.title, kind: row.kind });
+        // The findings come from a model filling a schema, so a field can be
+        // missing however carefully the schema was written — and a bullet that
+        // reads "- **undefined** undefined" is worse than no bullet at all.
+        // Same reason the heading is guarded: title and kind label are usually
+        // the same string, and printing both gave "X — X".
+        const findingLines = (Array.isArray(nar.findings) ? nar.findings : [])
+          .filter((f) => f && typeof f === 'object' && f.headline)
+          .slice(0, 5)
+          .map((f) => `- **${f.severity || 'info'}** ${f.headline}`);
+        const label = REPORT_KINDS[kind];
         const lines = [
-          `**${row.title}** — ${REPORT_KINDS[kind]}`,
+          row.title && row.title !== label ? `**${row.title}** — ${label}` : `**${label}**`,
           '',
           nar.executive_summary || '',
-          ...(nar.findings || []).slice(0, 5).map((f) => `- **${f.severity}** ${f.headline}`),
+          ...findingLines,
           '',
           lang === 'th' ? 'เปิดรายงานเต็มได้จากการ์ดด้านล่าง' : 'Open the full report from the card below.',
-        ].join('\n');
+        ].filter((l, i, a) => !(l === '' && a[i - 1] === '')).join('\n');
         answerChars = lines.length;
         send({ t: 'delta', c: lines });
         return;

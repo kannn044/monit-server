@@ -318,14 +318,47 @@ export const TOOLS = {
     admin: false,
     schema: {
       name: 'get_ndb_topology',
-      description: 'MySQL NDB Cluster layout as last reported: every node with its id, type, host, status and node group, plus arbitrator and data/index memory.',
+      description: 'MySQL NDB Cluster layout: every node with its id, type, host, status and node group, plus arbitrator and data/index memory. '
+        + 'If ndbinfo is not readable, falls back to the cluster server group the operator configured, with roles guessed from host names.',
       parameters: { type: 'object', properties: { server: { type: 'string', description: 'Omit to get every host that sees a cluster.' } } },
     },
     run: async (args, { snap }) => {
       const hosts = snap.list.filter((s) => s.ndb?.present
         && (!args.server || s.id === findServer(snap, args.server)?.id));
-      if (!hosts.length) return 'no server is reporting an NDB cluster. The agent collects it only when MONIT_NDB is enabled and ndbinfo or ndb_mgm is reachable.';
-      return clip(hosts.map((s) => `From ${s.name}:\n${ndbSummary(s.ndb)}`).join('\n\n'));
+      if (hosts.length) return clip(hosts.map((s) => `From ${s.name}:\n${ndbSummary(s.ndb)}`).join('\n\n'));
+
+      // No ndbinfo. But the operator may have grouped the cluster's hosts
+      // together, which records the topology just as surely — answering from
+      // that beats "no data" for a fleet where the data is plainly there.
+      const groups = new Map();
+      for (const s of snap.list) for (const g of s.groups || []) {
+        if (!groups.has(g)) groups.set(g, []);
+        groups.get(g).push(s);
+      }
+      const match = [...groups.entries()].find(([name]) => /ndb|cluster|คลัสเตอร์|mysql/i.test(name));
+      if (!match) {
+        return 'ไม่มีเครื่องใดรายงานข้อมูล NDB และไม่พบกลุ่มที่ชื่อสื่อถึงคลัสเตอร์. '
+          + `กลุ่มที่มีอยู่: ${[...groups.keys()].join(', ') || '(ยังไม่ได้สร้างกลุ่ม)'}. `
+          + 'agent เก็บ NDB เมื่ออ่าน ndbinfo ผ่าน mysql ได้ หรือมี ndb_mgm บนเครื่องนั้นเท่านั้น (MONIT_NDB=auto).';
+      }
+      const [name, servers] = match;
+      const role = (n) => {
+        const x = String(n).toLowerCase();
+        if (/\b(mgm|mgmd|manage(ment)?|master|arbit)/.test(x)) return 'MGM';
+        if (/\b(ndbd?|data|storage)/.test(x) || /-d\d/.test(x)) return 'DATA';
+        if (/\b(sql|mysqld|api|app)/.test(x)) return 'SQL';
+        return 'NODE';
+      };
+      const lines = servers.map((s) => {
+        const my = s.sample?.databases?.mysql;
+        return `- ${s.name} [${role(s.name)} — เดาจากชื่อ] ip=${s.ip || '?'} health=${s.health}`
+          + (my?.present ? ` mysql ${my.active}/${my.max} active` : '')
+          + (s.health === 'offline' ? ' ← ไม่ส่ง sample' : '');
+      });
+      return clip(`ยังอ่าน ndbinfo ไม่ได้ จึงตอบจากกลุ่ม "${name}" ที่ผู้ใช้จัดไว้ในระบบแทน:\n`
+        + `${lines.join('\n')}\n`
+        + 'สิ่งที่ยังไม่ทราบเพราะไม่มี ndbinfo: node group ของแต่ละ data node, data/index memory, arbitrator. '
+        + 'อย่าสรุปว่าคลัสเตอร์ปลอดภัยจากข้อมูลชุดนี้ — บอกได้แค่ว่าเครื่องไหนยังส่งข้อมูลอยู่.');
     },
   },
 

@@ -222,7 +222,151 @@ async function datasetCapacity(snap) {
   };
 }
 
-async function datasetNdb(snap) {
+/**
+ * Which part of a cluster a host is, guessed from its name.
+ *
+ * A guess, and labelled as one wherever it is shown. But a fleet where someone
+ * has grouped "mysql-mgm-01", "mysql-data-01" and "mysql-sql-01" under one
+ * group has already recorded the topology — in the naming and the grouping —
+ * and refusing to read it because ndbinfo is unavailable throws away the answer
+ * the user actually has.
+ *
+ * Order matters: "mysqld" contains "sql", and a management node is often called
+ * "master", so the most specific patterns are tested first.
+ */
+function inferNdbRole(name) {
+  const n = String(name).toLowerCase();
+  if (/\b(mgm|mgmd|manage(ment)?|master|arbit)/.test(n)) return 'MGM';
+  if (/\b(ndbd?|data|storage)/.test(n) || /-d\d/.test(n)) return 'DATA';
+  if (/\b(sql|mysqld|api|app)/.test(n)) return 'SQL';
+  return 'NODE';
+}
+
+const ROLE_LABEL = { MGM: 'Management / arbitrator', DATA: 'Data nodes', SQL: 'SQL / API nodes', NODE: 'บทบาทไม่ชัดจากชื่อ' };
+const ROLE_ORDER = ['MGM', 'DATA', 'SQL', 'NODE'];
+
+/** Find the group that looks like the cluster, or the one the caller named. */
+function findClusterGroup(snap, wanted) {
+  const groups = new Map();
+  for (const s of snap.list) for (const g of s.groups || []) {
+    if (!groups.has(g)) groups.set(g, []);
+    groups.get(g).push(s);
+  }
+  if (wanted && groups.has(wanted)) return { name: wanted, servers: groups.get(wanted) };
+  for (const [name, servers] of groups) {
+    if (/ndb|cluster|คลัสเตอร์|mysql/i.test(name)) return { name, servers };
+  }
+  return null;
+}
+
+/**
+ * Topology from the server grouping, when ndbinfo is not readable.
+ *
+ * This is the honest middle ground between a live cluster map and "no data".
+ * The database knows which hosts the operator put in the cluster group, whether
+ * each is reporting, and how many MySQL connections each holds. What it cannot
+ * know without ndbinfo is the part that decides survival — node groups, data
+ * memory, the arbitrator — so those are named as missing rather than left for
+ * the reader to assume are fine.
+ */
+function datasetNdbFromGroup(snap, group) {
+  const byRole = {};
+  for (const s of group.servers) (byRole[inferNdbRole(s.name)] ||= []).push(s);
+
+  const rows = group.servers.map((s) => {
+    const my = s.sample?.databases?.mysql;
+    return [
+      s.name, inferNdbRole(s.name), s.ip || '—', s.health,
+      my?.present ? `${my.active}/${my.max} active` : '—',
+      s.sample ? `${n1(s.sample?.cpu?.total)}% / ${n1(s.sample?.ram?.used_pct)}%` : '—',
+    ];
+  });
+
+  const offline = group.servers.filter((s) => s.health === 'offline');
+  const dataNodes = byRole.DATA || [];
+  const dataDown = dataNodes.filter((s) => s.health === 'offline');
+
+  return {
+    kind: 'ndb_topology',
+    title: `MySQL cluster — ${group.name}`,
+    subtitle: `${group.servers.length} เครื่องในกลุ่ม · ${group.servers.length - offline.length} ออนไลน์`
+      + (offline.length ? ` · ${offline.length} ไม่ส่งข้อมูล` : ''),
+    stats: [
+      { label: 'เครื่องในกลุ่ม', value: group.servers.length },
+      { label: 'Management', value: (byRole.MGM || []).length },
+      { label: 'Data nodes', value: dataNodes.length, tone: dataDown.length ? 'crit' : 'ok' },
+      { label: 'SQL / API', value: (byRole.SQL || []).length },
+      { label: 'ไม่ส่งข้อมูล', value: offline.length, tone: offline.length ? 'crit' : 'ok' },
+    ],
+    groupTopology: {
+      name: group.name,
+      lanes: ROLE_ORDER
+        .filter((r) => (byRole[r] || []).length)
+        .map((r) => ({
+          role: r,
+          label: ROLE_LABEL[r],
+          nodes: byRole[r].map((s) => ({
+            name: s.name, ip: s.ip, health: s.health,
+            mysql: s.sample?.databases?.mysql
+              ? `${s.sample.databases.mysql.active}/${s.sample.databases.mysql.max} conns` : null,
+          })),
+        })),
+    },
+    table: { title: `เครื่องในกลุ่ม ${group.name}`, cols: ['Server', 'บทบาท (เดาจากชื่อ)', 'IP', 'สถานะ', 'MySQL', 'CPU / RAM'], rows },
+    notes: [
+      'ผังนี้สร้างจาก **กลุ่มที่คุณตั้งไว้ในระบบ** และเดาบทบาทจากชื่อเครื่อง ไม่ได้อ่านจากตัวคลัสเตอร์โดยตรง',
+      'สิ่งที่ยังไม่รู้เพราะยังอ่าน ndbinfo ไม่ได้: node group ของแต่ละ data node, data/index memory, สถานะ arbitrator '
+        + '— ทั้งสามอย่างนี้คือตัวที่บอกว่าคลัสเตอร์ทนการล่มได้อีกกี่โหนด',
+      'เปิดข้อมูลจริงได้ด้วย: sudo /opt/monit/check-ndb.sh บนเครื่อง SQL node หรือ management node '
+        + 'แล้วถ้าอ่านไม่ได้ ตั้ง sudo /opt/monit/monit-config.sh -d 1 -D <management-node>:1186',
+    ],
+    facts: [
+      `กลุ่ม "${group.name}" มี ${group.servers.length} เครื่อง (บทบาทเดาจากชื่อ):`,
+      ...ROLE_ORDER.filter((r) => (byRole[r] || []).length).map((r) =>
+        `  ${ROLE_LABEL[r]}: ${byRole[r].map((s) => `${s.name}[${s.health}]`).join(', ')}`),
+      offline.length
+        ? `ไม่ส่งข้อมูล: ${offline.map((s) => s.name).join(', ')}`
+        : 'ทุกเครื่องในกลุ่มยังส่ง sample เข้ามาปกติ',
+      dataDown.length
+        ? `data node ที่เงียบอยู่: ${dataDown.map((s) => s.name).join(', ')} — ถ้าเป็น node group เดียวกันหมด คลัสเตอร์จะหยุดรับเขียน`
+        : '',
+      'ยังไม่มีข้อมูล ndbinfo จึงไม่ทราบ node group / data memory / arbitrator',
+    ].filter(Boolean).join('\n'),
+  };
+}
+
+/**
+ * When there is neither a cluster nor a group to draw.
+ *
+ * The instinct is to hand the empty dataset to the model and let it write
+ * something. It produces a fluent paragraph blaming "incorrect data collection
+ * settings or a connection problem", which is a guess dressed as a finding —
+ * and the reader cannot tell the difference. The agent's rule for collecting
+ * NDB is written down and knowable, so this says exactly that instead, and
+ * carries the agent's own reason when it has one.
+ */
+function ndbNotConfigured(snap) {
+  const tried = snap.list.filter((s) => s.ndb?.present && s.ndb?.accessible === false);
+  const withMysql = snap.list.filter((s) => s.sample?.databases?.mysql?.present);
+  const groups = [...new Set(snap.list.flatMap((s) => s.groups || []))];
+
+  return [
+    ...(tried.length
+      ? tried.map((s) => `${s.name}: agent เห็น NDB แต่อ่านไม่ได้ — ${s.ndb.reason || 'ไม่ได้ระบุสาเหตุ'}`)
+      : ['ไม่มีเครื่องใดรายงานข้อมูล NDB และไม่มีกลุ่มที่ชื่อสื่อถึงคลัสเตอร์']),
+    groups.length ? `กลุ่มที่มีในระบบตอนนี้: ${groups.join(', ')}` : 'ยังไม่ได้สร้างกลุ่มใดในระบบ',
+    withMysql.length ? `เครื่องที่รายงาน MySQL อยู่แล้ว: ${withMysql.map((s) => s.name).join(', ')}` : '',
+    '',
+    'ทำได้ 2 ทาง:',
+    '1. จัดกลุ่มเครื่องของคลัสเตอร์ไว้ด้วยกันในหน้า Groups แล้วตั้งชื่อให้มีคำว่า cluster หรือ ndb — '
+      + 'รายงานจะวาดผังจากกลุ่มนั้นให้ทันทีโดยไม่ต้องแตะ agent',
+    '2. เปิดให้ agent อ่านคลัสเตอร์จริง: sudo /opt/monit/check-ndb.sh บนเครื่อง SQL node หรือ management node '
+      + '(agent ตั้ง MONIT_NDB=auto เป็นค่าเริ่มต้น จึงข้ามไปเงียบ ๆ เมื่ออ่าน ndbinfo ไม่ได้และไม่มี ndb_mgm) '
+      + 'ถ้าอ่านไม่ได้ ตั้ง sudo /opt/monit/monit-config.sh -d 1 -D <management-node>:1186 เพื่อให้รายงานเหตุผลกลับมา',
+  ].filter(Boolean).join('\n');
+}
+
+async function datasetNdb(snap, params = {}) {
   const hosts = snap.list.filter((s) => s.ndb?.present && s.ndb?.accessible !== false);
   const clusters = hosts.map((s) => ({ from: s.name, ndb: s.ndb }));
   // Several SQL nodes in one cluster all report the same topology; the fullest
@@ -230,12 +374,19 @@ async function datasetNdb(snap) {
   const best = clusters.sort((a, b) =>
     (b.ndb.nodes?.length || 0) - (a.ndb.nodes?.length || 0))[0] || null;
 
+  // No ndbinfo — but the operator may have already told us the topology by
+  // grouping the hosts. That is a real answer; "no data" is not.
+  if (!best) {
+    const group = findClusterGroup(snap, params.group);
+    if (group?.servers?.length) return datasetNdbFromGroup(snap, group);
+  }
+
   return {
     kind: 'ndb_topology',
     title: 'MySQL NDB cluster topology',
     subtitle: best
       ? `${best.ndb.data_nodes_started}/${best.ndb.data_nodes_configured} data nodes started · seen from ${best.from}`
-      : 'No host is reporting an NDB cluster',
+      : 'ยังไม่มีข้อมูลคลัสเตอร์',
     stats: best ? [
       { label: 'Data nodes', value: `${best.ndb.data_nodes_started}/${best.ndb.data_nodes_configured}`, tone: best.ndb.unhealthy ? 'crit' : 'ok' },
       { label: 'Node groups down', value: best.ndb.node_groups_known === false ? '?' : best.ndb.node_groups_down, tone: best.ndb.node_groups_down ? 'crit' : 'ok' },
@@ -257,7 +408,17 @@ async function datasetNdb(snap) {
     } : null,
     facts: best
       ? `${ndbSummary(best.ndb)}\nReported by: ${clusters.map((c) => c.from).join(', ')}`
-      : 'No NDB cluster is visible. The agent collects NDB only when MONIT_NDB=1 and either ndbinfo (via mysql) or ndb_mgm is reachable on that host.',
+      : ndbNotConfigured(snap),
+    // Nothing to interpret means nothing to ask a model about — see narrate().
+    verdict: best ? null : {
+      executive_summary: 'ยังไม่มีข้อมูล NDB cluster และยังไม่พบกลุ่มเครื่องที่สื่อถึงคลัสเตอร์ '
+        + 'จึงยังวาดผังไม่ได้ — สาเหตุอยู่ที่การตั้งค่า ไม่ใช่ที่ตัวคลัสเตอร์',
+      findings: [],
+      next_actions: [
+        'จัดกลุ่มเครื่องของคลัสเตอร์ไว้ด้วยกันในหน้า Groups และตั้งชื่อกลุ่มให้มีคำว่า cluster หรือ ndb',
+        'หรือรัน sudo /opt/monit/check-ndb.sh บนเครื่อง SQL node / management node เพื่อเปิดข้อมูลจริง',
+      ],
+    },
   };
 }
 
@@ -266,7 +427,7 @@ export async function buildDataset(kind, params = {}, snapIn = null) {
   switch (kind) {
     case 'critical': return datasetCritical(snap);
     case 'capacity': return datasetCapacity(snap);
-    case 'ndb_topology': return datasetNdb(snap);
+    case 'ndb_topology': return datasetNdb(snap, params);
     case 'fleet_health':
     default: return datasetFleetHealth(snap);
   }
@@ -301,6 +462,12 @@ const NARRATIVE_SCHEMA = {
 };
 
 export async function narrate(dataset, { lang = 'th', log } = {}) {
+  // Some datasets are not an interpretation problem. "No NDB cluster is
+  // reporting" has one correct explanation and it is a configuration fact, not
+  // something to reason about — handing it to a model only invites a fluent
+  // guess that reads exactly like a finding.
+  if (dataset.verdict) return dataset.verdict;
+
   const messages = [
     {
       role: 'system',
@@ -437,6 +604,50 @@ function ndbSvg(ndb) {
     + `<p class="cap">Nodes are grouped by node group because that is what decides survival: a group with one live node is one failure from taking the whole cluster offline.</p></div>`;
 }
 
+/**
+ * Topology drawn from the server group.
+ *
+ * Laid out as three bands — management, data, SQL — because that is the shape
+ * of an NDB cluster and the shape is the point of a picture. Without ndbinfo
+ * there are no node groups to draw, so the diagram says so on its face rather
+ * than implying a redundancy it cannot see.
+ */
+function groupTopologySvg(gt) {
+  if (!gt?.lanes?.length) return '';
+  const W = 820, boxW = 176, boxH = 56, gapX = 16, gapY = 18, laneGap = 26, headH = 22;
+  let y = 8;
+  let out = '';
+  for (const lane of gt.lanes) {
+    const perRow = Math.max(1, Math.floor((W - 40) / (boxW + gapX)));
+    const rows = Math.ceil(lane.nodes.length / perRow);
+    const laneH = headH + rows * (boxH + gapY);
+    out += `<rect class="grp" x="16" y="${y}" width="${W - 32}" height="${laneH}" rx="4"/>`
+      + `<text class="gl" x="28" y="${y + 15}">${esc(lane.label.toUpperCase())} — ${lane.nodes.length}</text>`;
+    lane.nodes.forEach((nd, i) => {
+      const cx = 28 + (i % perRow) * (boxW + gapX);
+      const cy = y + headH + Math.floor(i / perRow) * (boxH + gapY);
+      const tone = nd.health === 'offline' ? 'crit' : nd.health === 'critical' ? 'crit'
+        : nd.health === 'warning' ? 'warn' : 'ok';
+      out += `<rect class="node ${tone}" x="${cx}" y="${cy}" width="${boxW}" height="${boxH}" rx="3"/>`
+        + `<text class="nid" x="${cx + 12}" y="${cy + 20}">${esc(nd.name)}</text>`
+        + `<text class="nh" x="${cx + 12}" y="${cy + 36}">${esc(nd.ip || 'ไม่ทราบ IP')}</text>`
+        + `<text class="nst ${tone}" x="${cx + boxW - 12}" y="${cy + 20}" text-anchor="end">${esc(nd.health)}</text>`
+        + (nd.mysql ? `<text class="nh" x="${cx + boxW - 12}" y="${cy + 36}" text-anchor="end">${esc(nd.mysql)}</text>` : '');
+    });
+    y += laneH + laneGap;
+  }
+  return `<div class="chart"><h3>ผังกลุ่ม ${esc(gt.name)}</h3>`
+    + `<svg viewBox="0 0 ${W} ${y}" role="img" aria-label="cluster topology by group">${out}</svg>`
+    + `<p class="cap">บทบาทเดาจากชื่อเครื่อง และไม่มีข้อมูล node group จาก ndbinfo — ผังนี้จึงบอกได้ว่าเครื่องไหนยังตอบอยู่ แต่ยังบอกไม่ได้ว่าคลัสเตอร์ทนการล่มได้อีกกี่โหนด</p></div>`;
+}
+
+function notesHtml(notes) {
+  if (!notes?.length) return '';
+  const md = (t) => esc(t).replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  return `<div class="tbl notes"><h3>ข้อควรรู้เกี่ยวกับผังนี้</h3><ul>`
+    + notes.map((n) => `<li>${md(n)}</li>`).join('') + '</ul></div>';
+}
+
 function tableHtml(t) {
   if (!t?.rows?.length) return '';
   return `<div class="tbl"><h3>${esc(t.title)}</h3><div class="scroll"><table><thead><tr>`
@@ -518,6 +729,8 @@ th{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.05
 tbody tr:last-child td{border-bottom:0}
 td{font-variant-numeric:tabular-nums}
 .acts{margin:0;padding-left:20px}.acts li{margin:4px 0}
+.notes ul{margin:0;padding-left:20px}.notes li{margin:5px 0;color:var(--ink2)}
+.notes{border-left:3px solid var(--warn)}
 text{font-family:system-ui,-apple-system,sans-serif}
 .bl{font-size:12px;fill:var(--ink2)}
 .bv{font-size:12px;fill:var(--ink2);font-variant-numeric:tabular-nums}
@@ -549,8 +762,10 @@ footer{margin-top:32px;padding-top:14px;border-top:1px solid var(--border);color
 <div class="summary"><p>${esc(narrative.executive_summary)}</p></div>
 ${findings ? `<h2>Findings</h2>${findings}` : ''}
 ${dataset.topology ? ndbSvg(dataset.topology) : ''}
+${dataset.groupTopology ? groupTopologySvg(dataset.groupTopology) : ''}
 ${dataset.bars ? barsSvg(dataset.bars) : ''}
 ${tableHtml(dataset.table)}
+${notesHtml(dataset.notes)}
 ${actions}
 <footer>Every figure in this report was computed directly from the monitoring database at generation time.
 The narrative was written by a language model from those figures and may be wrong about causes; the numbers are not its opinion.</footer>

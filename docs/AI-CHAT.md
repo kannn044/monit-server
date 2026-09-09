@@ -55,9 +55,17 @@ read (see the bottom of this file).
 
 `fleet_health` · `critical` · `capacity` · `ndb_topology`
 
-Generated from the same snapshot, narrated through a JSON schema (so the model
-fills fields rather than writing markup), then rendered server-side into
-self-contained HTML with inline SVG. Charts are drawn from the dataset, so a
+Generation is **asynchronous**: `POST /api/v1/reports` returns `202` with a row
+in `status: 'pending'`, the work continues server-side, and the page polls
+`GET /api/v1/reports/:id`. A model call on a local GPU runs for a minute or
+more; held open as a request it gave the page nothing to show but a disabled
+button, and anything slower than nginx's `proxy_read_timeout` came back as a
+504 even though the server went on to finish and store the report. A row that
+fails keeps its reason in `error` rather than disappearing.
+
+Reports are generated from the same snapshot, narrated through a JSON schema (so
+the model fills fields rather than writing markup), then rendered server-side
+into self-contained HTML with inline SVG. Charts are drawn from the dataset, so a
 chart cannot disagree with the database whatever the model says. Reports are
 stored in `ai_reports` with their dataset and narrative, and are never
 re-rendered — a report is a record of a moment.
@@ -281,6 +289,21 @@ Nothing needs to be configured for that fallback — it turns itself on.
 | `AI_ALLOW_SQL` | *(off)* | expose `run_sql` to admins |
 | `AI_SQL_TIMEOUT_MS` | `5000` | statement timeout for `run_sql` |
 | `AI_REQUEST_TIMEOUT_MS` | `180000` | give up on a model call |
+| `AI_LANG` | `th` | answer language: `th`, `en`, or `auto` to follow the question |
+| `AI_ANALYTICS_TIMEOUT_MS` | `4000` | ceiling on one optional analytics query |
+| `AI_ANALYTICS_TTL_MS` | `120000` | how long percentiles and trends are reused |
+| `AI_SNAPSHOT_TTL_MS` | `15000` | how long one fleet snapshot is reused |
+
+### Why the language is a setting
+
+`AI_LANG` defaults to `th`, and the reason is worth stating: everything around
+the question — the domain notes, the analysis protocol, the metric names, every
+tool result — is English. A model reading three thousand English tokens answers
+in English however the question was phrased, and "reply in the language the user
+wrote in" is not strong enough to overcome that. The language is therefore
+decided server-side and stated as an instruction twice: once near the top where
+it frames the task, and once as the very last line of the prompt, because the
+end is what a model weighs most. `AI_LANG=auto` restores the old behaviour.
 
 ## A read-only database role for `run_sql`
 

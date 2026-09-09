@@ -9,13 +9,13 @@
 
 import { q } from '../db/pool.js';
 import { requireRole } from '../lib/auth.js';
-import { createPendingReport, fillReport, REPORT_KINDS } from '../lib/ai-report.js';
+import { createPendingReport, fillReport, estimateSeconds, REPORT_KINDS } from '../lib/ai-report.js';
 
 export default async function reportRoutes(app) {
   app.get('/api/v1/reports', { preHandler: requireRole('viewer') }, async (req) => {
     const limit = Math.min(Number(req.query?.limit) || 50, 200);
     const { rows } = await q(
-      `SELECT id, kind, title, status, error, created_by, created_at,
+      `SELECT id, kind, title, status, error, created_by, created_at, finished_at,
               (dataset->>'subtitle')            AS subtitle,
               jsonb_array_length(COALESCE(narrative->'findings','[]'::jsonb)) AS findings
          FROM ai_reports ORDER BY created_at DESC LIMIT $1`, [limit]);
@@ -25,7 +25,12 @@ export default async function reportRoutes(app) {
   app.get('/api/v1/reports/:id', { preHandler: requireRole('viewer') }, async (req, reply) => {
     const { rows } = await q('SELECT * FROM ai_reports WHERE id = $1', [req.params.id]);
     if (!rows.length) return reply.code(404).send({ title: 'Not Found', status: 404 });
-    return rows[0];
+    const row = rows[0];
+    // Only while it is being written. The client counts down from created_at
+    // rather than from when it happened to open the page, so switching tabs or
+    // reloading does not reset the clock.
+    if (row.status === 'pending') row.eta_seconds = await estimateSeconds(row.kind);
+    return row;
   });
 
   app.post('/api/v1/reports', { preHandler: requireRole('viewer') }, async (req, reply) => {
@@ -49,6 +54,7 @@ export default async function reportRoutes(app) {
     const row = await createPendingReport({ kind, params, user: req.user?.email || req.user?.sub });
     fillReport(row.id, { kind, params, lang, log: req.log })
       .catch(() => { /* fillReport already recorded the reason on the row */ });
+    row.eta_seconds = await estimateSeconds(kind);
     return reply.code(202).send(row);
   });
 

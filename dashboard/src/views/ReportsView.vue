@@ -15,10 +15,27 @@ const loading = ref(false);
 const busy = ref('');
 const error = ref('');
 const lang = ref('th');
-const elapsed = ref(0);
+const now = ref(Date.now());
 
 let poll = null;
 let tick = null;
+
+/**
+ * Elapsed and remaining come from the report's own created_at, not from when
+ * this component happened to mount.
+ *
+ * Counting from mount looked right until you switched tabs and came back, at
+ * which point a report two minutes in claimed to have just started. The server
+ * knows when it began and roughly how long this kind takes on this hardware,
+ * so the page derives both from that — a reload, another tab or another
+ * machine all show the same clock.
+ */
+const startedAt = computed(() => (current.value?.created_at ? new Date(current.value.created_at).getTime() : null));
+const elapsed = computed(() => (startedAt.value ? Math.max(0, Math.round((now.value - startedAt.value) / 1000)) : 0));
+const eta = computed(() => Number(current.value?.eta_seconds) || 90);
+const remaining = computed(() => eta.value - elapsed.value);
+const overrun = computed(() => remaining.value < 0);
+const pctDone = computed(() => Math.min(100, Math.round((elapsed.value / Math.max(eta.value, 1)) * 100)));
 
 const openId = computed(() => route.params.id || null);
 const pending = computed(() => current.value?.status === 'pending');
@@ -52,9 +69,7 @@ async function loadOne(id, quiet = false) {
  * instead of a disabled button and no explanation.
  */
 function startPolling(id) {
-  stopPolling();
-  const t0 = Date.now() - (elapsed.value * 1000);
-  tick = setInterval(() => { elapsed.value = Math.round((Date.now() - t0) / 1000); }, 1000);
+  if (poll) clearInterval(poll);
   poll = setInterval(async () => {
     try {
       const r = await api(`/api/v1/reports/${id}`);
@@ -66,13 +81,11 @@ function startPolling(id) {
 
 function stopPolling() {
   if (poll) { clearInterval(poll); poll = null; }
-  if (tick) { clearInterval(tick); tick = null; }
 }
 
 async function generate(kind) {
   error.value = '';
   busy.value = kind;
-  elapsed.value = 0;
   try {
     // 202 with a pending row — the work carries on server-side.
     const row = await api('/api/v1/reports', { method: 'POST', body: { kind, lang: lang.value } });
@@ -113,11 +126,21 @@ function download() {
 }
 
 const when = (t) => new Date(t).toLocaleString('sv-SE').slice(0, 16);
-const mmss = (s) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+const mmss = (s) => {
+  const v = Math.max(0, Math.round(s));
+  return `${Math.floor(v / 60)}:${String(v % 60).padStart(2, '0')}`;
+};
 
-onMounted(async () => { await loadList(); await loadOne(openId.value); });
-onUnmounted(stopPolling);
-watch(openId, (id) => { elapsed.value = 0; loadOne(id); });
+onMounted(async () => {
+  // The clock ticks for the whole page, not just for the open report: a pending
+  // row in the list shows its own running time, and that has to keep moving
+  // whether or not the report is the one on screen.
+  tick = setInterval(() => { now.value = Date.now(); }, 1000);
+  await loadList();
+  await loadOne(openId.value);
+});
+onUnmounted(() => { stopPolling(); if (tick) { clearInterval(tick); tick = null; } });
+watch(openId, (id) => loadOne(id));
 </script>
 
 <template>
@@ -156,7 +179,7 @@ watch(openId, (id) => { elapsed.value = 0; loadOne(id); });
                      :to="`/reports/${r.id}`">
           <div class="it">
             {{ r.title }}
-            <span v-if="r.status === 'pending'" class="pill wait">กำลังสร้าง</span>
+            <span v-if="r.status === 'pending'" class="pill wait">กำลังสร้าง {{ mmss((now - new Date(r.created_at).getTime()) / 1000) }}</span>
             <span v-else-if="r.status === 'failed'" class="pill bad">ล้มเหลว</span>
           </div>
           <div class="is">{{ when(r.created_at) }} · {{ r.findings }} findings</div>
@@ -174,9 +197,23 @@ watch(openId, (id) => { elapsed.value = 0; loadOne(id); });
         <div v-else-if="pending" class="card progress">
           <div class="spin big"></div>
           <div class="pt">{{ current.title }}</div>
-          <div class="pm">กำลังให้โมเดลเขียนบทวิเคราะห์ — ใช้เวลาราว 1–3 นาทีบน GPU เครื่องนี้</div>
-          <div class="pe">{{ mmss(elapsed) }}</div>
-          <div class="pn">ตัวเลขและกราฟคำนวณเสร็จแล้ว ที่รออยู่คือคำอธิบาย · ปิดหน้านี้ไปทำอย่างอื่นได้ รายงานจะถูกบันทึกไว้ให้</div>
+          <div class="pm">กำลังให้โมเดลเขียนบทวิเคราะห์</div>
+
+          <div v-if="!overrun" class="pe">เหลืออีกประมาณ {{ mmss(remaining) }}</div>
+          <div v-else class="pe over">เกินเวลาที่ประมาณไว้ {{ mmss(-remaining) }}</div>
+
+          <div class="bar"><div class="fill" :class="{ indet: overrun }"
+               :style="overrun ? null : { width: pctDone + '%' }"></div></div>
+
+          <div class="psub">
+            ผ่านไปแล้ว {{ mmss(elapsed) }} · ปกติรายงานแบบนี้ใช้เวลาราว {{ mmss(eta) }}
+            <span class="muted">(วัดจากรายงานก่อนหน้าบนเครื่องนี้)</span>
+          </div>
+
+          <div class="pn">
+            ตัวเลขและกราฟคำนวณเสร็จแล้ว ที่รออยู่คือคำอธิบาย ·
+            <strong>ปิดหน้านี้ไปทำอย่างอื่นได้เลย</strong> — รายงานจะถูกบันทึกไว้ และเวลาที่นับจะยังตรงเมื่อกลับมาดู
+          </div>
         </div>
 
         <div v-else-if="failed" class="card progress fail">
@@ -242,8 +279,17 @@ watch(openId, (id) => { elapsed.value = 0; loadOne(id); });
 .progress.fail { border-left: 3px solid var(--critical); }
 .pt { font-weight: 600; font-size: 15px; }
 .pm { color: var(--ink-2); font-size: 13px; margin-top: 6px; max-width: 46ch; }
-.pe { font-size: 30px; font-weight: 700; font-variant-numeric: tabular-nums; margin: 16px 0 4px; color: var(--accent); }
-.pn { color: var(--muted); font-size: 12px; max-width: 52ch; line-height: 1.6; }
+.pe { font-size: 27px; font-weight: 700; font-variant-numeric: tabular-nums; margin: 16px 0 10px; color: var(--accent); }
+.pe.over { color: var(--warning); font-size: 20px; }
+.bar { width: min(340px, 80%); height: 6px; border-radius: 3px; background: var(--grid); overflow: hidden; }
+.fill { height: 100%; background: var(--accent); border-radius: 3px; transition: width 0.9s linear; }
+/* Past the estimate the bar stops claiming to know how far along it is. */
+.fill.indet { width: 34%; background: var(--warning); animation: slide 1.6s ease-in-out infinite alternate; }
+@keyframes slide { from { transform: translateX(-60%); } to { transform: translateX(220%); } }
+.psub { margin-top: 12px; font-size: 12.5px; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+.psub .muted { color: var(--muted); }
+.pn { color: var(--muted); font-size: 12px; max-width: 52ch; line-height: 1.6; margin-top: 10px; }
+@media (prefers-reduced-motion: reduce) { .fill.indet { animation: none; width: 100%; opacity: 0.45; } }
 
 .frame-card { padding: 12px; }
 .frame { width: 100%; height: calc(100vh - 260px); min-height: 460px; border: 1px solid var(--border); border-radius: 8px; background: var(--page); }

@@ -798,7 +798,8 @@ export async function fillReport(id, { kind, params = {}, lang = 'th', log, snap
     const narrative = await narrate(dataset, { lang, log });
     const html = renderHtml(dataset, narrative, { model: params.model });
     await q(
-      `UPDATE ai_reports SET title=$2, dataset=$3, narrative=$4, html=$5, status='ready', error=NULL
+      `UPDATE ai_reports SET title=$2, dataset=$3, narrative=$4, html=$5,
+              status='ready', error=NULL, finished_at=now()
         WHERE id=$1`,
       [id, dataset.title, dataset, narrative, html]);
     return { id, title: dataset.title, narrative };
@@ -806,10 +807,32 @@ export async function fillReport(id, { kind, params = {}, lang = 'th', log, snap
     log?.error(e, `report ${kind} failed`);
     // The row stays, carrying the reason. A report that failed silently and
     // vanished from the list is the worst of both worlds.
-    await q(`UPDATE ai_reports SET status='failed', error=$2 WHERE id=$1`,
+    await q(`UPDATE ai_reports SET status='failed', error=$2, finished_at=now() WHERE id=$1`,
       [id, String(e.message).slice(0, 500)]).catch(() => {});
     throw e;
   }
+}
+
+/**
+ * How long this kind of report usually takes here.
+ *
+ * The median of what this installation actually did, not a number picked in
+ * advance: generation time is dominated by the local GPU and the size of the
+ * fleet, both of which vary by an order of magnitude between deployments. The
+ * median rather than the mean because one report that hit a stalled model
+ * should not move the estimate for the next twenty.
+ *
+ * Falls back to 90 seconds only until a first report has completed.
+ */
+export async function estimateSeconds(kind) {
+  const { rows } = await q(
+    `SELECT percentile_cont(0.5) WITHIN GROUP (
+              ORDER BY extract(epoch FROM (finished_at - created_at))) AS secs
+       FROM (SELECT created_at, finished_at FROM ai_reports
+              WHERE kind = $1 AND status = 'ready' AND finished_at IS NOT NULL
+              ORDER BY created_at DESC LIMIT 10) r`, [kind]);
+  const s = Number(rows[0]?.secs);
+  return Number.isFinite(s) && s > 0 ? Math.round(s) : 90;
 }
 
 /** Build, narrate, render and store one report, start to finish. */

@@ -146,6 +146,11 @@ export const config = {
   // model reading three thousand English tokens answers in English however the
   // question was phrased.
   aiLanguage: (process.env.AI_LANG || 'th').toLowerCase(),
+  // The saved conversation is bounded on both axes. It carries the reasoning
+  // text and tool traces the page needs to redraw itself, which grows fast, and
+  // a jsonb column is not where you want to find out a chat ran to megabytes.
+  chatHistoryMax: Number(process.env.CHAT_HISTORY_MAX || 120),
+  chatHistoryMaxBytes: Number(process.env.CHAT_HISTORY_MAX_BYTES || 512 * 1024),
   // A local model generating a full report legitimately takes minutes; fetch's
   // default would abandon it long before it finished.
   aiRequestTimeoutMs: Number(process.env.AI_REQUEST_TIMEOUT_MS || 180_000),

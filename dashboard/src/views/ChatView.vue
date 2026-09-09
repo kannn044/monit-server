@@ -40,12 +40,44 @@ async function authFetch(path, init = {}, retry = true) {
   return res;
 }
 
+const restoring = ref(true);
+
 onMounted(async () => {
+  // Capabilities and the saved conversation are independent — no reason for
+  // the transcript to wait on a badge.
+  const [capsRes, histRes] = await Promise.all([
+    authFetch('/api/v1/chat/capabilities').catch(() => null),
+    authFetch('/api/v1/chat/history').catch(() => null),
+  ]);
+  try { if (capsRes?.ok) caps.value = await capsRes.json(); } catch { /* badge is optional */ }
   try {
-    const res = await authFetch('/api/v1/chat/capabilities');
-    if (res.ok) caps.value = await res.json();
-  } catch { /* the page still works without the badge */ }
+    if (histRes?.ok) {
+      const j = await histRes.json();
+      if (Array.isArray(j.messages)) messages.value = j.messages;
+    }
+  } catch { /* an unreadable transcript should not block a new conversation */ }
+  restoring.value = false;
 });
+
+/**
+ * Persist the conversation after every completed turn.
+ *
+ * The whole rendered transcript goes up, not just role and content: the tool
+ * trace, the reasoning block and the report card are what make a reopened
+ * conversation look like the one that was left, and rebuilding them from
+ * role/content alone is impossible. Failures are silent — losing a save is a
+ * far smaller problem than an error banner over a perfectly good answer.
+ */
+async function saveHistory() {
+  if (restoring.value) return;
+  try {
+    await authFetch('/api/v1/chat/history', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ messages: messages.value }),
+    });
+  } catch { /* ignore */ }
+}
 
 function scrollBottom() {
   nextTick(() => chatEnd.value?.scrollIntoView({ behavior: 'smooth', block: 'end' }));
@@ -172,12 +204,14 @@ async function send(preset) {
     msg.status = '';
     streaming.value = false;
     scrollBottom();
+    saveHistory();
   }
 }
 
 async function rate(msg, value) {
   if (!msg.logId || msg.feedback === value) return;
   msg.feedback = value;
+  saveHistory();
   try {
     await authFetch('/api/v1/chat/feedback', {
       method: 'POST',
@@ -187,10 +221,11 @@ async function rate(msg, value) {
   } catch { /* a lost rating is not worth an error banner */ }
 }
 
-function clearChat() {
+async function clearChat() {
   messages.value = [];
   error.value = '';
   showThink.value = {};
+  try { await authFetch('/api/v1/chat/history', { method: 'DELETE' }); } catch { /* ignore */ }
 }
 
 function handleKey(e) {
@@ -303,14 +338,16 @@ const SUGGESTIONS = [
           {{ toolsOn ? 'tools on' : 'tools off' }}
         </span>
         <router-link class="sm-link" to="/reports">Reports</router-link>
-        <button class="sm" @click="clearChat" :disabled="streaming">Clear</button>
+        <button class="sm" @click="clearChat" :disabled="streaming"
+                title="ลบบทสนทนานี้ทิ้ง — บทสนทนาจะถูกเก็บไว้จนกว่าจะกดปุ่มนี้">Clear</button>
       </div>
     </div>
 
     <div v-if="error" class="error-banner">{{ error }}</div>
 
     <div class="chat-messages">
-      <div v-if="!messages.length" class="chat-empty">
+      <div v-if="restoring" class="chat-empty"><div class="chat-empty-hint">กำลังเรียกบทสนทนาเดิม…</div></div>
+      <div v-else-if="!messages.length" class="chat-empty">
         <div class="chat-empty-title">ถามเรื่อง infrastructure ได้เลย</div>
         <div class="chat-empty-hint">ผู้ช่วยเห็นค่า cpu/ram/disk/load พร้อม p95 24 ชม., แนวโน้ม 7 วัน,
           incident, service ที่ควรรัน และผัง NDB cluster — และเรียกดูข้อมูลย้อนหลังเพิ่มเองได้</div>

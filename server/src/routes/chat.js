@@ -118,6 +118,47 @@ export default async function chatRoutes(app) {
     };
   });
 
+  /**
+   * The user's current conversation.
+   *
+   * Server-side rather than in the browser: the same person signs in from more
+   * than one machine, and a conversation living in one browser's localStorage
+   * is gone the moment they move. One row per user — the page replaces it
+   * after each turn, and Clear deletes it.
+   */
+  app.get('/api/v1/chat/history', { preHandler: requireRole('viewer') }, async (req) => {
+    const { rows } = await q('SELECT messages, updated_at FROM ai_chat_history WHERE user_id = $1',
+      [req.user.sub]);
+    return { messages: rows[0]?.messages || [], updated_at: rows[0]?.updated_at || null };
+  });
+
+  app.put('/api/v1/chat/history', { preHandler: requireRole('viewer') }, async (req, reply) => {
+    const messages = Array.isArray(req.body?.messages) ? req.body.messages : null;
+    if (!messages) return reply.code(400).send({ title: 'messages must be an array', status: 400 });
+
+    // Bounded on both axes. The transcript carries the reasoning text and tool
+    // traces the page needs to redraw itself, which grows quickly, and a jsonb
+    // column is not the place to discover that a conversation ran to megabytes.
+    const trimmed = messages.slice(-config.chatHistoryMax);
+    const json = JSON.stringify(trimmed);
+    if (json.length > config.chatHistoryMaxBytes) {
+      return reply.code(413).send({
+        title: 'Conversation too large to save', status: 413,
+        detail: 'Clear the conversation to start a new one.',
+      });
+    }
+    await q(
+      `INSERT INTO ai_chat_history (user_id, messages, updated_at) VALUES ($1, $2, now())
+       ON CONFLICT (user_id) DO UPDATE SET messages = EXCLUDED.messages, updated_at = now()`,
+      [req.user.sub, json]);
+    return { ok: true, saved: trimmed.length };
+  });
+
+  app.delete('/api/v1/chat/history', { preHandler: requireRole('viewer') }, async (req, reply) => {
+    await q('DELETE FROM ai_chat_history WHERE user_id = $1', [req.user.sub]);
+    return reply.code(204).send();
+  });
+
   app.post('/api/v1/chat/feedback', { preHandler: requireRole('viewer') }, async (req, reply) => {
     const { id, value } = req.body || {};
     if (!id) return reply.code(400).send({ title: 'id is required', status: 400 });

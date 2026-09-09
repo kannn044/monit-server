@@ -30,9 +30,16 @@ async function buildSystemPrompt() {
          COALESCE((SELECT array_agg(DISTINCT inc.severity) FROM incidents inc
            WHERE inc.server_id = s.id AND inc.status IN ('firing','acknowledged')), '{}') AS active_severities
        FROM servers s WHERE s.archived_at IS NULL ORDER BY s.name`),
-    q(`SELECT id, server_id, severity, status, metric, comparator, threshold, created_at
-       FROM incidents WHERE status IN ('firing','acknowledged')
-       ORDER BY created_at DESC LIMIT 50`),
+    // comparator lives on the rule, not the incident, and the incident's clock
+    // column is started_at — incidents has no created_at at all. Joining the
+    // rule also gets rule_name/message/value in, which is what actually lets
+    // the model say something useful instead of reciting an id.
+    q(`SELECT i.id, i.server_id, i.severity, i.status, i.rule_name, i.metric,
+              r.comparator, i.threshold, i.value, i.message, i.started_at
+         FROM incidents i
+         LEFT JOIN alert_rules r ON r.id = i.rule_id
+        WHERE i.status IN ('firing','acknowledged')
+        ORDER BY i.started_at DESC LIMIT 50`),
     q(`SELECT server_id, kind, name, enabled FROM expected_services ORDER BY server_id, kind, name`),
   ]);
 
@@ -65,8 +72,15 @@ async function buildSystemPrompt() {
     return line;
   });
 
-  const incidentLines = incidents.map((i) =>
-    `- ${i.id}: server=${i.server_id}, severity=${i.severity}, status=${i.status}, metric=${i.metric} ${i.comparator} ${i.threshold}, since=${i.created_at}`);
+  const incidentLines = incidents.map((i) => {
+    const cond = i.metric
+      ? `${i.metric} ${i.comparator || '?'} ${i.threshold ?? '?'}`
+        + (i.value != null ? ` (currently ${i.value})` : '')
+      : 'no metric';
+    return `- ${i.id}: server=${i.server_id}, severity=${i.severity}, status=${i.status}, `
+      + `rule=${i.rule_name || 'n/a'}, ${cond}, since=${i.started_at}`
+      + (i.message ? `\n  message: ${i.message}` : '');
+  });
 
   const expectedLines = expectedSvc.map((e) =>
     `- server=${e.server_id}, kind=${e.kind}, name=${e.name}, enabled=${e.enabled}`);

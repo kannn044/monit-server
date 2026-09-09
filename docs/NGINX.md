@@ -36,6 +36,14 @@ location /monit/ {
         # agent payloads are capped at 256 KB by the app
         client_max_body_size 1m;
         proxy_read_timeout 120s;
+
+        # The AI chat replies as a Server-Sent Events stream. nginx buffers
+        # proxied responses by default, which holds every token until the model
+        # is finished — the page then sits on a typing indicator for a minute
+        # and prints the whole answer at once. The app also sends
+        # X-Accel-Buffering: no on that one response; this makes it explicit.
+        proxy_buffering off;
+        proxy_cache off;
 }
 ```
 

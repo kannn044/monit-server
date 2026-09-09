@@ -12,12 +12,31 @@ const error = ref('');
 const modelName = ref('');
 const chatEnd = ref(null);      // scroll anchor
 
+/**
+ * Same JWT handling as api.js, minus the JSON parsing.
+ *
+ * The chat endpoint streams, so it cannot go through api.js at all — but the
+ * part of api.js that matters here is the 401 retry. Access tokens last 15
+ * minutes; without this, a chat tab left open over lunch answers the next
+ * question with a bare "HTTP 401" while every other page in the app quietly
+ * refreshes and carries on.
+ */
+async function authFetch(path, init = {}, retry = true) {
+  const res = await fetch(`${API_BASE}${path}`, {
+    ...init,
+    headers: { ...(init.headers || {}), Authorization: `Bearer ${auth.accessToken}` },
+  });
+  if (res.status === 401 && retry && auth.refreshToken) {
+    if (await auth.refresh()) return authFetch(path, init, false);
+    auth.logout();
+  }
+  return res;
+}
+
 // Fetch available model on mount
 onMounted(async () => {
   try {
-    const res = await fetch(`${API_BASE}/api/v1/chat/models`, {
-      headers: { Authorization: `Bearer ${auth.accessToken}` },
-    });
+    const res = await authFetch('/api/v1/chat/models');
     if (res.ok) {
       const j = await res.json();
       if (j.models?.[0]) modelName.value = j.models[0].id;
@@ -45,16 +64,17 @@ async function send() {
   scrollBottom();
 
   try {
-    const res = await fetch(`${API_BASE}/api/v1/chat`, {
+    const res = await authFetch('/api/v1/chat', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${auth.accessToken}`,
-      },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
+        // The filter already removes the empty assistant placeholder pushed a
+        // few lines above — it is the only message with no content. Slicing a
+        // further element off the end took the user's newest question with it,
+        // which made the very first message of every conversation an empty
+        // array and a 400, and every later one an answer to the previous turn.
         messages: messages.value
           .filter((m) => m.role !== 'assistant' || m.content)
-          .slice(0, -1) // exclude the empty placeholder
           .map(({ role, content }) => ({ role, content })),
       }),
     });

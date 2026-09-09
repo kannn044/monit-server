@@ -23,6 +23,14 @@ services:
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
       SAMPLE_INTERVAL_S: ${SAMPLE_INTERVAL_S:-10}
       ALERT_TICK_S: ${ALERT_TICK_S:-30}
+      # AI chat. host.docker.internal resolves to the host thanks to the
+      # extra_hosts entry below, so a vLLM listening on the host's 127.0.0.1
+      # is reachable without publishing it on the LAN.
+      VLLM_BASE_URL: ${VLLM_BASE_URL:-http://host.docker.internal:8000/v1}
+      VLLM_MODEL: ${VLLM_MODEL:-}
+      CHAT_MAX_HISTORY: ${CHAT_MAX_HISTORY:-20}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     networks:
       - pgnet
     ports:

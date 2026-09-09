@@ -36,10 +36,18 @@ async function buildSystemPrompt() {
     q(`SELECT server_id, kind, name, enabled FROM expected_services ORDER BY server_id, kind, name`),
   ]);
 
-  // Fetch latest PM2/Docker from the most recent sample per server
+  // Fetch latest PM2/Docker from the most recent sample per server.
+  //
+  // The time bound is not an optimisation, it is what makes this query usable:
+  // without it DISTINCT ON walks every chunk of the hypertable back to the
+  // beginning of retention on every single chat message. A server with nothing
+  // in the window is offline anyway, and computeHealth() already says so.
   const { rows: latestSamples } = await q(
     `SELECT DISTINCT ON (server_id) server_id, pm2, docker, time
-     FROM system_metrics ORDER BY server_id, time DESC`);
+     FROM system_metrics
+     WHERE time > now() - ($1::int * interval '1 second')
+     ORDER BY server_id, time DESC`,
+    [config.sampleIntervalS * config.offlineFactor * 2]);
   const sampleMap = Object.fromEntries(latestSamples.map((s) => [s.server_id, s]));
 
   const serverLines = servers.map((s) => {
@@ -110,12 +118,15 @@ export default async function chatRoutes(app) {
 
     const [systemPrompt, model] = await Promise.all([
       buildSystemPrompt(),
-      Promise.resolve(requestModel || resolveModel(req.log)),
+      requestModel || resolveModel(req.log),
     ]);
 
+    // Keep only the tail of the transcript. The system prompt grows with the
+    // fleet, so a long conversation silently pushes it out of the context
+    // window and the model starts answering without any of the live data.
     const fullMessages = [
       { role: 'system', content: systemPrompt },
-      ...messages,
+      ...messages.slice(-config.chatMaxHistory),
     ];
 
     let upstream;
@@ -142,11 +153,22 @@ export default async function chatRoutes(app) {
       return reply.code(502).send({ title: 'vLLM error', status: 502, detail: text || `HTTP ${upstream.status}` });
     }
 
-    // Stream SSE passthrough
+    // Stream SSE passthrough.
+    //
+    // hijack() first: it tells Fastify this route owns the socket from here on.
+    // Without it the async handler resolves with undefined once the stream is
+    // done and Fastify tries to serialise a second response onto a connection
+    // that has already been written to and closed.
+    reply.hijack();
     reply.raw.writeHead(200, {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
       Connection: 'keep-alive',
+      // nginx buffers proxied responses by default, which holds every token
+      // back until the model finishes — the answer then lands in one lump and
+      // the stream looks broken. This header turns that off per-response, so a
+      // proxy nobody remembered to configure cannot break streaming.
+      'X-Accel-Buffering': 'no',
     });
 
     const reader = upstream.body.getReader();

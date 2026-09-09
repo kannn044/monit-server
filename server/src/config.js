@@ -95,4 +95,24 @@ export const config = {
   refreshTokenTtl: '7d',
   // "offline" = no sample for offlineFactor × interval
   offlineFactor: 3,
+
+  // ---- AI chat (local vLLM, OpenAI-compatible) ---------------------------
+  //
+  // The base URL has to be reachable *from wherever this process runs*, which
+  // in Docker is not the host's loopback: a container's 127.0.0.1 is its own.
+  // Either point this at the host's LAN address, or keep the default and give
+  // the compose service
+  //     extra_hosts: ["host.docker.internal:host-gateway"]
+  // which is what docker-compose*.yml here already does.
+  //
+  // Trailing slashes are stripped because every call appends its own path
+  // ("/models", "/chat/completions") and "…/v1//models" is a 404 on vLLM.
+  vllmBaseUrl: (process.env.VLLM_BASE_URL || 'http://host.docker.internal:8000/v1').replace(/\/+$/, ''),
+  // Blank = ask /v1/models on each request and use the first one served. Pin it
+  // once you serve more than one model, otherwise the answer depends on order.
+  vllmModel: process.env.VLLM_MODEL || '',
+  // How many past messages to forward. The system prompt already carries the
+  // whole fleet, so an unbounded transcript is what overflows a local model's
+  // context window — and it fails as a confusing truncated reply, not an error.
+  chatMaxHistory: Number(process.env.CHAT_MAX_HISTORY || 20),
 };

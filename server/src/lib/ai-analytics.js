@@ -12,7 +12,7 @@
 // prompt costs tokens in punctuation and reads worse to a small model than one
 // dense line per server.
 
-import { q } from '../db/pool.js';
+import { q, pool } from '../db/pool.js';
 import { computeHealth } from './health.js';
 import { config } from '../config.js';
 
@@ -85,113 +85,195 @@ const LATEST_SQL = `
    WHERE time > now() - ($1::int * interval '1 second')
    ORDER BY server_id, time DESC`;
 
-/** Percentiles and averages over a window, from the hourly rollup. */
-function windowStatsSql(interval) {
+/**
+ * Sampled statistics, computed from raw samples rather than from metrics_1h.
+ *
+ * metrics_1h is the obvious source and it is a trap. WITH TimescaleDB it is a
+ * continuous aggregate and costs nothing; WITHOUT it — which is the fallback
+ * the migration runner silently chooses when the extension is unavailable — it
+ * is a plain VIEW that aggregates raw rows every time it is read. Measured on
+ * eight servers holding a week at the 10-second interval (484k rows), the 7-day
+ * percentile query took 7.8 seconds and the 7-day trend 4.2. Scale that to a
+ * real fleet and a chat request spends over a minute in SQL before the model is
+ * ever called: the browser shows a pending request, the GPU is idle, and nginx
+ * eventually returns 504.
+ *
+ * So these queries do not aggregate a week of rows. They take ONE sample per
+ * bucket with a LATERAL lookup — an index seek each on (server_id, time DESC) —
+ * and compute from those: 144 points per server over 24 hours, 168 over a week.
+ * Same queries, same shape, same cost on either deployment: single-digit
+ * milliseconds.
+ *
+ * The tradeoff is honest and small: a p95 over 144 samples is not identical to
+ * one over 8,640, and a sampled max can miss a spike that lasted seconds. For
+ * "is this number normal for this host" that difference does not change any
+ * answer, and the alert engine — which does watch every sample — is what
+ * catches the spike.
+ */
+function sampledStatsSql(span, step) {
   return `
+    WITH pts AS (
+      SELECT s.id AS server_id, g.b, m.cpu, m.ram, m.load, m.disk
+        FROM servers s
+        CROSS JOIN generate_series(date_trunc('hour', now()) - interval '${span}',
+                                   now(), interval '${step}') g(b)
+        CROSS JOIN LATERAL (
+          SELECT sm.cpu, sm.ram, sm.load, sm.disk
+            FROM system_metrics sm
+           WHERE sm.server_id = s.id
+             AND sm.time >= g.b AND sm.time < g.b + interval '${step}'
+           ORDER BY sm.time DESC LIMIT 1
+        ) m
+       WHERE s.archived_at IS NULL
+    ), v AS (
+      SELECT server_id, b,
+             (cpu->>'total')::double precision      AS cpu,
+             (ram->>'used_pct')::double precision   AS ram,
+             (ram->>'available_kb')::double precision AS ram_avail,
+             (load->>'1m')::double precision        AS load1,
+             (load->>'cores')::int                  AS cores,
+             disk_max_used_pct(disk)                AS disk_pct,
+             disk_min_avail_kb(disk)                AS disk_avail
+        FROM pts
+    )
     SELECT server_id,
-           avg(cpu_total_pct)                                                    AS cpu_avg,
-           percentile_cont(0.95) WITHIN GROUP (ORDER BY cpu_total_pct)           AS cpu_p95,
-           max(cpu_max_pct)                                                      AS cpu_max,
-           avg(ram_used_pct)                                                     AS ram_avg,
-           percentile_cont(0.95) WITHIN GROUP (ORDER BY ram_used_pct)            AS ram_p95,
-           avg(disk_used_pct)                                                    AS disk_avg,
-           min(disk_avail_kb)                                                    AS disk_avail_min,
-           avg(load_1m)                                                          AS load_avg,
-           percentile_cont(0.95) WITHIN GROUP (ORDER BY load_1m)                 AS load_p95,
-           max(cores)                                                            AS cores,
-           avg(gpu_util_pct)                                                     AS gpu_util_avg,
-           max(gpu_mem_used_pct)                                                 AS gpu_mem_max,
-           count(*)                                                              AS buckets
-      FROM metrics_1h
-     WHERE bucket > now() - interval '${interval}'
-     GROUP BY server_id`;
+           avg(cpu)                                            AS cpu_avg,
+           percentile_cont(0.95) WITHIN GROUP (ORDER BY cpu)    AS cpu_p95,
+           max(cpu)                                            AS cpu_max,
+           avg(ram)                                            AS ram_avg,
+           percentile_cont(0.95) WITHIN GROUP (ORDER BY ram)    AS ram_p95,
+           avg(disk_pct)                                       AS disk_avg,
+           min(disk_avail)                                     AS disk_avail_min,
+           avg(load1)                                          AS load_avg,
+           percentile_cont(0.95) WITHIN GROUP (ORDER BY load1)  AS load_p95,
+           max(cores)                                          AS cores,
+           NULL::double precision                              AS gpu_util_avg,
+           NULL::double precision                              AS gpu_mem_max,
+           count(*)                                            AS buckets
+      FROM v GROUP BY server_id`;
 }
 
 /**
- * Linear trend over 7 days, plus the disk-full projection derived from it.
+ * The week in one pass: trend, and the same-hour baseline the z-score needs.
  *
- * regr_slope() ships with Postgres, so "will this fill up, and when" needs no
- * extension and no library — and being a closed form it cannot drift the way a
- * model's arithmetic does. Only a *falling* avail slope yields an ETA; a disk
- * that is emptying gets no scary countdown.
+ * Both come off the same sampled points, so the week is walked once instead of
+ * three times. regr_slope() ships with Postgres, so "will this fill up, and
+ * when" needs no extension and no library — and being a closed form it cannot
+ * drift the way a model's arithmetic does.
+ *
+ * The baseline compares now against the SAME HOUR on other days rather than
+ * against a flat weekly average, which is the cheapest way to stop a nightly
+ * backup window from reading as an anomaly every night.
  */
-const TREND_SQL = `
-  WITH h AS (
-    SELECT server_id, extract(epoch FROM bucket) AS t,
-           ram_used_pct, disk_used_pct, disk_avail_kb, cpu_total_pct
-      FROM metrics_1h
-     WHERE bucket > now() - interval '7 days'
+const WEEK_SQL = `
+  WITH pts AS (
+    SELECT s.id AS server_id, g.b, m.cpu, m.ram, m.disk
+      FROM servers s
+      CROSS JOIN generate_series(date_trunc('hour', now()) - interval '7 days',
+                                 now(), interval '1 hour') g(b)
+      CROSS JOIN LATERAL (
+        SELECT sm.cpu, sm.ram, sm.disk FROM system_metrics sm
+         WHERE sm.server_id = s.id
+           AND sm.time >= g.b AND sm.time < g.b + interval '1 hour'
+         ORDER BY sm.time DESC LIMIT 1
+      ) m
+     WHERE s.archived_at IS NULL
+  ), v AS (
+    SELECT server_id, b, extract(epoch FROM b) AS t,
+           (cpu->>'total')::double precision    AS cpu,
+           (ram->>'used_pct')::double precision AS ram,
+           disk_max_used_pct(disk)              AS disk_pct
+      FROM pts
   )
   SELECT server_id,
-         regr_slope(ram_used_pct,  t) * 86400 AS ram_pct_per_day,
-         regr_slope(disk_used_pct, t) * 86400 AS disk_pct_per_day,
-         regr_slope(cpu_total_pct, t) * 86400 AS cpu_pct_per_day,
-         regr_slope(disk_avail_kb, t)         AS avail_kb_per_sec,
-         count(*)                             AS buckets
-    FROM h GROUP BY server_id`;
+         regr_slope(ram,      t) * 86400 AS ram_pct_per_day,
+         regr_slope(disk_pct, t) * 86400 AS disk_pct_per_day,
+         regr_slope(cpu,      t) * 86400 AS cpu_pct_per_day,
+         count(*)                        AS buckets,
+         avg(cpu)        FILTER (WHERE extract(hour FROM b) = extract(hour FROM now())
+                                   AND b < date_trunc('hour', now())) AS cpu_mean,
+         stddev_pop(cpu) FILTER (WHERE extract(hour FROM b) = extract(hour FROM now())
+                                   AND b < date_trunc('hour', now())) AS cpu_sd,
+         avg(ram)        FILTER (WHERE extract(hour FROM b) = extract(hour FROM now())
+                                   AND b < date_trunc('hour', now())) AS ram_mean,
+         stddev_pop(ram) FILTER (WHERE extract(hour FROM b) = extract(hour FROM now())
+                                   AND b < date_trunc('hour', now())) AS ram_sd
+    FROM v GROUP BY server_id`;
 
 /**
- * Baseline for the same hour of day over the past week.
+ * Network rate from the newest and oldest raw sample in a ten-minute window.
  *
- * Comparing "now" against a flat weekly average fires on every host that has a
- * nightly backup window. Comparing it against the same hour on other days is
- * the cheapest way to keep daily seasonality from reading as an anomaly.
+ * Not from metrics_1m: without the timescaledb extension that name is a plain
+ * VIEW that aggregates the whole table, and the predicate on `bucket` sits on
+ * top of a date_trunc the planner cannot turn into an index scan. On a fleet
+ * with a few million rows that is a table scan per chat message. Ten minutes of
+ * raw samples is about sixty rows per server and rides the
+ * (server_id, time DESC) index.
  */
-const BASELINE_SQL = `
-  SELECT server_id,
-         avg(cpu_total_pct)        AS cpu_mean,  stddev_pop(cpu_total_pct) AS cpu_sd,
-         avg(ram_used_pct)         AS ram_mean,  stddev_pop(ram_used_pct)  AS ram_sd
-    FROM metrics_1h
-   WHERE bucket > now() - interval '7 days'
-     AND bucket < date_trunc('hour', now())
-     AND extract(hour FROM bucket) = extract(hour FROM now())
-   GROUP BY server_id`;
-
-/** Network rate from consecutive 1-minute buckets; a counter reset yields null. */
 const NET_SQL = `
-  WITH w AS (
-    SELECT server_id, bucket, net_rx_bytes, net_tx_bytes
-      FROM metrics_1m
-     WHERE bucket > now() - interval '15 minutes'
-  ), b AS (
+  WITH r AS (
+    SELECT server_id, time,
+           net_counter_sum(network, 'rx_bytes') AS rx,
+           net_counter_sum(network, 'tx_bytes') AS tx
+      FROM system_metrics
+     WHERE time > now() - interval '10 minutes'
+  ), d AS (
     SELECT server_id,
-           max(net_rx_bytes) - min(net_rx_bytes) AS rx_d,
-           max(net_tx_bytes) - min(net_tx_bytes) AS tx_d,
-           extract(epoch FROM (max(bucket) - min(bucket))) AS secs
-      FROM w GROUP BY server_id
+           (array_agg(rx ORDER BY time DESC))[1] - (array_agg(rx ORDER BY time))[1] AS rxd,
+           (array_agg(tx ORDER BY time DESC))[1] - (array_agg(tx ORDER BY time))[1] AS txd,
+           extract(epoch FROM (max(time) - min(time)))                              AS secs
+      FROM r GROUP BY server_id
   )
   SELECT server_id,
-         CASE WHEN secs > 0 AND rx_d >= 0 THEN rx_d / secs END AS rx_bps,
-         CASE WHEN secs > 0 AND tx_d >= 0 THEN tx_d / secs END AS tx_bps
-    FROM b`;
+         CASE WHEN secs > 0 AND rxd >= 0 THEN rxd / secs END AS rx_bps,
+         CASE WHEN secs > 0 AND txd >= 0 THEN txd / secs END AS tx_bps
+    FROM d`;
 
 /**
  * Per-mount disk trend, and the projection that comes out of it.
  *
  * This cannot come from metrics_1h: that rollup stores min(avail) across every
- * mount, and on almost every host the smallest mount is /boot — 900MB, 90%
- * full by design, and never changing. Fitting a line to that reports "not
- * shrinking" for a machine whose root filesystem is filling steadily, which is
- * the exact question a capacity forecast exists to answer.
+ * mount, and on almost every host the smallest mount is /boot — 900MB, 90% full
+ * by design, and never changing. Fitting a line to that reports "not shrinking"
+ * for a machine whose root filesystem is filling steadily, which is the exact
+ * question a capacity forecast exists to answer.
  *
- * So it goes back to the raw samples, but takes one row per hour before
- * expanding the jsonb, and ignores anything under 4 GiB — small enough to be a
- * boot or EFI partition, large enough to keep every real filesystem.
+ * So it goes back to the raw samples — but it must not READ seven days of them.
+ * At a 10-second interval that is sixty thousand rows per server per week, and
+ * scanning them all (then expanding a jsonb array per row) is slow enough to
+ * look like a hung request. Instead one sample is picked per six-hour window
+ * with a LATERAL lookup, which is an index seek each: 29 points per server, and
+ * 29 points is more than enough to fit a straight line to a disk.
+ *
+ * Mounts under 4 GiB are ignored — small enough to be a boot or EFI partition,
+ * large enough to keep every real filesystem.
  */
 const DISK_TREND_SQL = `
-  WITH hourly AS (
-    SELECT DISTINCT ON (server_id, date_trunc('hour', time))
-           server_id, date_trunc('hour', time) AS b, disk
-      FROM system_metrics
-     WHERE time > now() - interval '7 days'
-     ORDER BY server_id, date_trunc('hour', time), time DESC
+  WITH hrs AS (
+    SELECT generate_series(date_trunc('hour', now()) - interval '7 days',
+                           date_trunc('hour', now()),
+                           interval '6 hours') AS h
+  ), sampled AS (
+    SELECT s.id AS server_id, hrs.h AS b, m.disk
+      FROM servers s
+      CROSS JOIN hrs
+      CROSS JOIN LATERAL (
+        SELECT sm.disk FROM system_metrics sm
+         WHERE sm.server_id = s.id
+           AND sm.time >= hrs.h AND sm.time < hrs.h + interval '6 hours'
+         ORDER BY sm.time DESC LIMIT 1
+      ) m
+     WHERE s.archived_at IS NULL
   ), mounts AS (
     SELECT server_id, b,
-           d->>'mount'              AS mount,
-           (d->>'size_kb')::bigint  AS size_kb,
-           (d->>'avail_kb')::bigint AS avail_kb,
-           (d->>'used_pct')::double precision AS used_pct
-      FROM hourly, LATERAL jsonb_array_elements(COALESCE(disk, '[]'::jsonb)) d
+           d->>'mount'                        AS mount,
+           -- double precision, not bigint: these come from a shell script via
+           -- jsonb, and one host reporting "200000000.0" would otherwise abort
+           -- the whole fleet's capacity forecast with a cast error.
+           (d->>'size_kb')::double precision   AS size_kb,
+           (d->>'avail_kb')::double precision  AS avail_kb,
+           (d->>'used_pct')::double precision  AS used_pct
+      FROM sampled, LATERAL jsonb_array_elements(COALESCE(disk, '[]'::jsonb)) d
   ), fitted AS (
     SELECT server_id, mount,
            max(size_kb)                                AS size_kb,
@@ -205,28 +287,13 @@ const DISK_TREND_SQL = `
   )
   SELECT DISTINCT ON (server_id)
          server_id, mount, size_kb, buckets, kb_per_sec, avail_now, used_pct,
-         CASE WHEN kb_per_sec < 0 AND buckets >= 12
+         CASE WHEN kb_per_sec < 0 AND buckets >= 8
               THEN avail_now / (-kb_per_sec) / 86400 END AS days_to_full
     FROM fitted
    ORDER BY server_id,
-            COALESCE(CASE WHEN kb_per_sec < 0 AND buckets >= 12
+            COALESCE(CASE WHEN kb_per_sec < 0 AND buckets >= 8
                           THEN avail_now / (-kb_per_sec) END, 1e18) ASC,
             used_pct DESC`;
-
-/**
- * Cached for five minutes.
- *
- * It is the one query here that reads raw samples over a week, and a seven-day
- * trend does not move between two messages typed a minute apart. Paying for it
- * on every chat turn would be paying for nothing.
- */
-let diskTrendCache = { at: 0, map: {} };
-async function diskTrend() {
-  if (Date.now() - diskTrendCache.at < 5 * 60_000) return diskTrendCache.map;
-  const { rows } = await q(DISK_TREND_SQL);
-  diskTrendCache = { at: Date.now(), map: byServer(rows) };
-  return diskTrendCache.map;
-}
 
 const INCIDENTS_SQL = `
   SELECT i.id, i.server_id, i.severity, i.status, i.rule_name, i.metric,
@@ -246,31 +313,145 @@ const EXPECTED_SQL = `SELECT server_id, kind, name, enabled FROM expected_servic
 const byServer = (rows) => Object.fromEntries(rows.map((r) => [r.server_id, r]));
 
 /**
- * One round trip's worth of everything the chat could need about the fleet.
- * Every caller in the AI feature builds on this, so it runs exactly once per
- * request no matter how many tools the model ends up calling.
+ * Run the optional analytics on one connection, under a statement timeout.
+ *
+ * These are the queries whose cost depends on how the database is deployed.
+ * With TimescaleDB, metrics_1h is a continuous aggregate and they are trivial.
+ * Without it, the migration creates metrics_1m/metrics_1h as plain VIEWs that
+ * aggregate the whole table, and the same query can take minutes — which the
+ * user experiences as a chat request that hangs forever with an idle GPU,
+ * because nothing has reached the model yet.
+ *
+ * So they are bounded and optional. If they time out, the chat still answers
+ * from current values; it just cannot talk about percentiles or trends. A
+ * degraded answer beats a spinner.
+ *
+ * One client, sequentially: SET LOCAL needs a transaction, and taking six
+ * clients from a pool of ten to run six queries in parallel is how the ingest
+ * path starts waiting behind the chat page.
  */
-export async function fleetSnapshot() {
-  const staleS = config.sampleIntervalS * config.offlineFactor * 2;
-  const [
-    { rows: servers }, { rows: latest }, { rows: s24 }, { rows: s7d },
-    { rows: trend }, { rows: base }, { rows: net }, { rows: incidents }, { rows: expected },
-    diskCap,
-  ] = await Promise.all([
-    q(SERVERS_SQL),
-    q(LATEST_SQL, [staleS]),
-    q(windowStatsSql('24 hours')),
-    q(windowStatsSql('7 days')),
-    q(TREND_SQL),
-    q(BASELINE_SQL),
-    q(NET_SQL),
-    q(INCIDENTS_SQL),
-    q(EXPECTED_SQL),
-    diskTrend(),
-  ]);
+let analyticsCache = { at: 0, data: null };
 
-  const L = byServer(latest), A = byServer(s24), B = byServer(s7d);
-  const T = byServer(trend), Z = byServer(base), N = byServer(net);
+async function analytics(log) {
+  // Percentiles over 24 hours and trends over a week do not move between two
+  // messages typed a minute apart. Recomputing them per message is the single
+  // easiest way to make a chat feel slow for no gain.
+  if (analyticsCache.data && Date.now() - analyticsCache.at < config.aiAnalyticsTtlMs) {
+    return analyticsCache.data;
+  }
+  const empty = { s24: [], s7d: [], week: [], net: [] };
+  const client = await pool.connect();
+  const out = { ...empty };
+  try {
+    await client.query('BEGIN READ ONLY');
+    await client.query(`SET LOCAL statement_timeout = '${config.aiAnalyticsTimeoutMs}ms'`);
+    const steps = [
+      ['s24', sampledStatsSql('24 hours', '10 minutes')],
+      ['s7d', sampledStatsSql('7 days', '1 hour')],
+      ['week', WEEK_SQL],
+      ['net', NET_SQL],
+    ];
+    for (const [key, sql] of steps) {
+      try {
+        const { rows } = await client.query(sql);
+        out[key] = rows;
+      } catch (e) {
+        // A timeout aborts the transaction, so the rest of the batch cannot run
+        // on this connection — start a clean one and carry on with what is left.
+        log?.warn({ step: key, err: e.message }, 'ai analytics step skipped');
+        await client.query('ROLLBACK').catch(() => {});
+        await client.query('BEGIN READ ONLY').catch(() => {});
+        await client.query(`SET LOCAL statement_timeout = '${config.aiAnalyticsTimeoutMs}ms'`).catch(() => {});
+      }
+    }
+    await client.query('ROLLBACK').catch(() => {});
+  } catch (e) {
+    log?.warn(e, 'ai analytics unavailable — answering from current values only');
+  } finally {
+    client.release();
+  }
+  analyticsCache = { at: Date.now(), data: out };
+  return out;
+}
+
+/**
+ * Cached for five minutes.
+ *
+ * It is the one query here that looks back a week, and a seven-day trend does
+ * not move between two messages typed a minute apart.
+ */
+let diskTrendCache = { at: 0, map: {} };
+async function diskTrend(log) {
+  if (Date.now() - diskTrendCache.at < 5 * 60_000) return diskTrendCache.map;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN READ ONLY');
+    await client.query(`SET LOCAL statement_timeout = '${config.aiAnalyticsTimeoutMs}ms'`);
+    const { rows } = await client.query(DISK_TREND_SQL);
+    await client.query('ROLLBACK');
+    diskTrendCache = { at: Date.now(), map: byServer(rows) };
+  } catch (e) {
+    log?.warn(e, 'disk trend unavailable — no capacity projection this time');
+    // Cache the failure too, so a database that cannot answer this is not asked
+    // again on every single message.
+    diskTrendCache = { at: Date.now(), map: {} };
+    await client.query('ROLLBACK').catch(() => {});
+  } finally {
+    client.release();
+  }
+  return diskTrendCache.map;
+}
+
+/**
+ * The snapshot, cached briefly.
+ *
+ * A single chat turn asks for it once, then several tools read from the same
+ * object; a follow-up question a few seconds later wants the same picture. The
+ * TTL is short enough that "now" still means now, and long enough that a
+ * conversation does not re-query the fleet on every message.
+ */
+let snapCache = { at: 0, snap: null, pending: null };
+
+export async function fleetSnapshot({ force = false, log } = {}) {
+  if (!force && snapCache.snap && Date.now() - snapCache.at < config.aiSnapshotTtlMs) {
+    return snapCache.snap;
+  }
+  // Two people asking at the same moment should produce one round of queries,
+  // not two.
+  if (snapCache.pending) return snapCache.pending;
+  snapCache.pending = buildSnapshot(log).then((snap) => {
+    snapCache = { at: Date.now(), snap, pending: null };
+    return snap;
+  }).catch((e) => {
+    snapCache.pending = null;
+    throw e;
+  });
+  return snapCache.pending;
+}
+
+/**
+ * One round trip's worth of everything the chat could need about the fleet.
+ *
+ * The essential queries run first and are not optional: without servers, their
+ * latest sample and the open incidents there is nothing to say. All four are
+ * bounded by primary keys or by the (server_id, time DESC) index, so they stay
+ * fast whatever the deployment. Everything after them is enrichment.
+ */
+async function buildSnapshot(log) {
+  const staleS = config.sampleIntervalS * config.offlineFactor * 2;
+  const [{ rows: servers }, { rows: latest }, { rows: incidents }, { rows: expected }] =
+    await Promise.all([
+      q(SERVERS_SQL),
+      q(LATEST_SQL, [staleS]),
+      q(INCIDENTS_SQL),
+      q(EXPECTED_SQL),
+    ]);
+
+  const [extra, diskCap] = await Promise.all([analytics(log), diskTrend(log)]);
+
+  const L = byServer(latest), A = byServer(extra.s24), B = byServer(extra.s7d);
+  // Trend and baseline now come off the same weekly pass, so one map serves both.
+  const T = byServer(extra.week), Z = T, N = byServer(extra.net);
   const D = diskCap;
 
   const expectedBy = {};
@@ -302,11 +483,11 @@ export async function fleetSnapshot() {
 
     const tr = T[s.id] || {};
     // The projection comes from the per-mount fit, which has already refused to
-    // answer when the slope is flat or there were too few buckets to fit one.
+    // answer when the slope is flat or there were too few points to fit one.
     const cap = D[s.id] || null;
     const daysToFull = cap?.days_to_full != null ? Number(cap.days_to_full) : null;
-    // Prefer the live reading for the mount the fit chose — the fit's own
-    // "now" is up to an hour old.
+    // Prefer the live reading for the mount the fit chose — the fit's own "now"
+    // is up to six hours old.
     const capMount = cap ? disks.find((d) => d.mount === cap.mount) : null;
 
     const z = (val, mean, sd) => {
@@ -364,9 +545,43 @@ export async function fleetSnapshot() {
     incidents: incidents.length,
     pm2: list.reduce((a, s) => a + (Number(s.sample?.pm2?.online) || 0), 0),
     docker: list.reduce((a, s) => a + (Number(s.sample?.docker?.running) || 0), 0),
+    // Told to the model so it never presents a partial picture as complete.
+    degraded: !extra.s24.length,
   };
 
   return { list, byId: Object.fromEntries(list.map((s) => [s.id, s])), totals, incidents };
+}
+
+/**
+ * Time every part of the snapshot separately.
+ *
+ * When the chat page hangs, the only question worth answering first is "which
+ * step". This turns that from a guess into a number.
+ */
+export async function snapshotTimings() {
+  const staleS = config.sampleIntervalS * config.offlineFactor * 2;
+  const steps = [
+    ['servers', SERVERS_SQL, []],
+    ['latest_sample', LATEST_SQL, [staleS]],
+    ['incidents', INCIDENTS_SQL, []],
+    ['expected_services', EXPECTED_SQL, []],
+    ['stats_24h', sampledStatsSql('24 hours', '10 minutes'), []],
+    ['stats_7d', sampledStatsSql('7 days', '1 hour'), []],
+    ['week_trend_baseline', WEEK_SQL, []],
+    ['network_rate', NET_SQL, []],
+    ['disk_trend', DISK_TREND_SQL, []],
+  ];
+  const out = [];
+  for (const [name, sql, params] of steps) {
+    const t0 = Date.now();
+    try {
+      const { rows } = await q(sql, params);
+      out.push({ step: name, ms: Date.now() - t0, rows: rows.length });
+    } catch (e) {
+      out.push({ step: name, ms: Date.now() - t0, error: e.message });
+    }
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------

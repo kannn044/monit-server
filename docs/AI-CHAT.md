@@ -85,122 +85,137 @@ called, latency, and the thumbs from the UI).
 
 ## What to change on the vLLM side
 
-Nothing is required — the app probes the endpoint and quietly degrades. But
-three server flags decide how good the answers get.
+**Very little.** A vLLM started like the reference deployment below already has
+everything this feature wants:
 
-### 1. Point the app at the right endpoint
+```
+vllm serve /model
+  --served-model-name qwen3.8-27b
+  --quantization compressed-tensors --tensor-parallel-size 2 --dtype bfloat16
+  --max-model-len 196608 --kv-cache-dtype fp8
+  --enable-prefix-caching --enable-chunked-prefill
+  --max-num-batched-tokens 2048 --max-num-seqs 16
+  --gpu-memory-utilization 0.85
+  --reasoning-parser deepseek_r1
+  --enable-auto-tool-choice --tool-call-parser qwen3_xml
+  --speculative-config '{"method":"mtp","num_speculative_tokens":3}'
+```
 
-In `.env` on the monit host:
+| Flag | Why it matters here |
+|---|---|
+| `--enable-auto-tool-choice` + `--tool-call-parser qwen3_xml` | the model can go and look things up instead of answering only from the prompt |
+| `--enable-prefix-caching` | the system prompt is long and nearly identical between messages; this is what keeps time-to-first-token down |
+| `--reasoning-parser deepseek_r1` | **the one flag to change** — see below; `qwen3` is the right parser for this model |
+| `--max-model-len 196608` | far more than the ~2k-token context pack or a report needs |
+
+### The one thing to configure
+
+`.env` on the monit host:
 
 ```ini
 VLLM_BASE_URL=http://<vllm-host>:8084/v1
 ```
 
-Leave `VLLM_MODEL` blank. When vLLM is started with `vllm serve /model`, the
-served model id is literally `/model`, and the app reads it from `/v1/models`
-rather than guessing.
-
-Check it from inside the container, which is where it has to work:
+Leave `VLLM_MODEL` blank. The app reads the id from `/v1/models` — with
+`--served-model-name qwen3.8-27b` that is `qwen3.8-27b`, not the `/model` path,
+and pinning the wrong one 404s every message while the model list still loads
+fine. Check it from inside the container, which is where it has to work:
 
 ```bash
 docker compose -f docker-compose.app-only.yml exec app \
   sh -c 'wget -qO- "$VLLM_BASE_URL/models"'
 ```
 
-### 2. Enable tool calling — the one that matters most
+### The one flag worth changing: `--reasoning-parser`
 
-Without it the model can only answer from what was packed into the prompt.
-With it, it can go and look: pull 7 days of a metric, search past incidents for
-the same signature, read the cluster topology.
+`--reasoning-parser deepseek_r1` is the wrong parser for Qwen3, and it fails in
+a way that looks like tool calling being broken.
 
-Add to the vLLM command line:
+The DeepSeek-R1 parser assumes a reply *opens* in reasoning mode and splits it
+at the first `</think>`. Qwen3 with `enable_thinking: false` never emits that
+tag, so there is no split point and the parser files the entire reply under
+`reasoning` — including a perfectly formed tool call:
+
+```json
+{"message":{"content":null,"tool_calls":[],
+  "reasoning":"<tool_call>\n<function=list_servers>\n<parameter=health>\ndown\n</parameter>\n</function>\n</tool_call>"},
+ "finish_reason":"stop"}
+```
+
+The model did exactly the right thing. `content: null`, `tool_calls: []` and
+`finish_reason: "stop"` say it did nothing at all.
+
+**Fix:**
 
 ```
---enable-auto-tool-choice --tool-call-parser hermes
+--reasoning-parser qwen3        # instead of deepseek_r1
 ```
 
-`hermes` is the parser for Qwen3. Restart is required — the flag is read at
-startup. Verify:
+That parser knows a Qwen3 reply may carry no think block, so `content` stays
+`content` and the `qwen3_xml` tool parser gets text to work on. It is the only
+server-side change worth making, and it needs a container restart.
+
+**Until then, the app copes on its own.** `ai-llm.js` recognises the signature —
+stopped normally, said nothing, "thought" something substantial — and:
+
+- reads the reply out of `reasoning`;
+- recovers `<tool_call>` blocks from it with its own XML parser
+  (`parseXmlToolCalls`, which also accepts the JSON shape);
+- records `caps.noThinkSafe = false` and keeps thinking **on** for every
+  subsequent turn, since the cheap no-think mode is what triggers the problem.
+
+The cost of leaving it unfixed is latency and tokens: every lookup reasons
+before answering, where it could have replied immediately. Nothing breaks.
+
+The same salvage runs on the streaming path — a reply that arrives entirely as
+`reasoning` deltas is shown as the answer rather than as an empty bubble.
+
+Field naming, separately: reasoning arrives as `reasoning_content` in streaming
+deltas and `reasoning` on a non-streaming reply, depending on the release. Both
+are read.
+
+### Watch `max_tokens` too
+
+Reasoning tokens count against `max_tokens`. A turn with a small budget can
+spend all of it thinking and return `content: null` with
+`finish_reason: "length"` — a different failure with the same empty look. The
+tool-selection turn is therefore given 1400 tokens rather than the ~100 it
+emits, and a planning turn that stops on `length` without deciding anything
+falls through to answering from the context pack instead of retrying into the
+same wall.
+
+### Verifying
 
 ```bash
 curl -s http://localhost:8084/v1/chat/completions \
   -H 'Content-Type: application/json' -d '{
-  "model":"/model",
+  "model":"qwen3.8-27b","max_tokens":600,"tool_choice":"auto",
+  "chat_template_kwargs":{"enable_thinking":false},
   "messages":[{"role":"user","content":"which servers are down?"}],
   "tools":[{"type":"function","function":{
-    "name":"list_servers",
-    "description":"list servers",
-    "parameters":{"type":"object","properties":{"health":{"type":"string"}}}}}],
-  "tool_choice":"auto","max_tokens":80}' | head -c 600
+    "name":"list_servers","description":"list servers",
+    "parameters":{"type":"object","properties":{"health":{"type":"string"}}}}}]}'
 ```
 
-A `tool_calls` array in the reply means it works. An HTTP 400 mentioning tools
-means the flag is missing — the app will detect that on its first request and
-fall back to constrained-JSON tool selection, which is slower and does one
-round instead of two.
+Three outcomes:
 
-The dashboard shows `tools on` / `tools off` next to the model name, so you can
-see which mode you are in without reading logs. `GET /api/v1/chat/capabilities`
-returns the same thing in full.
+| Reply | Meaning |
+|---|---|
+| `tool_calls` has an entry | the whole path works |
+| `tool_calls: []`, `reasoning` contains `<tool_call>`, `finish_reason: "stop"` | the reasoning parser swallowed it — switch to `--reasoning-parser qwen3` |
+| `tool_calls: []`, `reasoning` is prose, `finish_reason: "length"` | the budget ran out mid-thought — raise `max_tokens` |
 
-### 3. Prefix caching
+An HTTP 400 naming a field means this build does not take it; the app detects
+that on its first request and drops the field for the rest of the process.
 
-```
---enable-prefix-caching
-```
+The dashboard shows `tools on` / `tools off` beside the model name, and
+`GET /api/v1/chat/capabilities` reports what was actually accepted.
 
-The system prompt is now long and mostly identical between messages (fleet
-state changes slowly). Prefix caching keeps its KV cache between requests, so
-time-to-first-token drops sharply. This is what pays for the richer context.
+### If you are running an older vLLM
 
-### 4. Context length
-
-The context is bigger than before: the fleet block, tool results, and for a
-report a few thousand tokens of figures. Give it room:
-
-```
---max-model-len 32768
-```
-
-If the GPU cannot hold that with the current `--gpu-memory-utilization`, lower
-the utilisation target first, then the context — a truncated prompt fails as a
-confusingly incomplete answer rather than an error.
-
-### 5. Thinking mode
-
-The old prompt ended with `Use /no_think to disable thinking mode.`, which
-pinned Qwen3's reasoning **off** for every question. That is now controlled per
-request instead: off for lookups, on for analysis, through
-`chat_template_kwargs: {enable_thinking: true}`.
-
-This needs the Qwen3 chat template that understands the flag — it ships with
-the model. If your `/model` directory has a custom template that does not, vLLM
-returns 400 and the app disables the field for the rest of the process, which
-is fine: you lose the per-question switch, not the feature. Set
-`AI_THINKING=0` to stop sending it at all.
-
-### Putting it together
-
-```bash
-docker inspect vllm_qwen38_mtp_a30 --format '{{json .Args}}' | python3 -m json.tool
-```
-
-Take the arguments that are already there — model path, MTP / speculative
-decoding, tensor parallel, gpu memory utilisation — and add:
-
-```
---enable-auto-tool-choice \
---tool-call-parser hermes \
---enable-prefix-caching \
---max-model-len 32768
-```
-
-then recreate the container. Nothing else about the deployment changes.
-
-> If your build is older than the `--enable-auto-tool-choice` flag, or the
-> parser name differs, leave it out. The app works either way; it just spends
-> one constrained-JSON call deciding what to look up instead of using the
-> native path.
+Without `--enable-auto-tool-choice` the app falls back to picking tools through
+constrained JSON: slower, one round instead of two, and everything else works.
+Nothing needs to be configured for that fallback — it turns itself on.
 
 ---
 

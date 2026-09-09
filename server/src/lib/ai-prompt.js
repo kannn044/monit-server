@@ -46,16 +46,6 @@ const PROTOCOL = `## How to answer an analysis question
  * turns.
  *
  * Shape is easier to teach by demonstration than by instruction, especially at
- * this model size — the protocol above says "end with a recommendation", and
- * the example is what makes it actually happen. Kept as text rather than as
- * user/assistant turns so it cannot be mistaken for real conversation history,
- * and so it survives any chat template.
- */
-/**
- * Two worked examples, carried in the system message rather than as extra
- * turns.
- *
- * Shape is easier to teach by demonstration than by instruction, especially at
  * this model size: the protocol above says "end with a concrete action", and
  * the example is what makes that actually happen. Kept as text rather than as
  * user/assistant turns so it cannot be mistaken for real history, and so it

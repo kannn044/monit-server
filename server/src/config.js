@@ -130,6 +130,16 @@ export const config = {
   // with — the in-process guard should not be the only thing standing there.
   aiAllowSql: /^(1|true|yes)$/i.test(process.env.AI_ALLOW_SQL || ''),
   aiSqlTimeoutMs: Number(process.env.AI_SQL_TIMEOUT_MS || 5000),
+  // Ceiling on each optional analytics query (percentiles, trends, baselines).
+  // Past this the query is abandoned and the answer goes out without trends —
+  // a degraded answer beats a request that hangs until nginx returns 504.
+  aiAnalyticsTimeoutMs: Number(process.env.AI_ANALYTICS_TIMEOUT_MS || 4000),
+  // Percentiles over 24h and trends over a week do not move between two
+  // messages typed a minute apart, so they are computed once and reused.
+  aiAnalyticsTtlMs: Number(process.env.AI_ANALYTICS_TTL_MS || 120_000),
+  // How long one fleet snapshot is reused. Long enough that a conversation does
+  // not re-query the fleet on every message, short enough that "now" is now.
+  aiSnapshotTtlMs: Number(process.env.AI_SNAPSHOT_TTL_MS || 15_000),
   // A local model generating a full report legitimately takes minutes; fetch's
   // default would abandon it long before it finished.
   aiRequestTimeoutMs: Number(process.env.AI_REQUEST_TIMEOUT_MS || 180_000),

@@ -24,7 +24,7 @@ import { q } from '../db/pool.js';
 import { requireRole } from '../lib/auth.js';
 import { config } from '../config.js';
 import { llmChat, llmStream, llmJson, resolveModel, caps, PROFILES } from '../lib/ai-llm.js';
-import { fleetSnapshot } from '../lib/ai-analytics.js';
+import { fleetSnapshot, snapshotTimings } from '../lib/ai-analytics.js';
 import { buildSystemPrompt, routeIntent, PLAN_INSTRUCTION } from '../lib/ai-prompt.js';
 import { toolSchemas, toolNames, runTool } from '../lib/ai-tools.js';
 import { generateReport, REPORT_KINDS } from '../lib/ai-report.js';
@@ -88,6 +88,36 @@ export default async function chatRoutes(app) {
     report_kinds: REPORT_KINDS,
   }));
 
+  /**
+   * Where the time goes.
+   *
+   * "The chat page hangs" has two very different causes — a slow database
+   * before the model is ever called, or an unreachable model — and from the
+   * outside they look identical. This times each step so the answer is a number
+   * rather than a guess.
+   */
+  app.get('/api/v1/chat/diag', { preHandler: requireRole('admin') }, async () => {
+    const steps = await snapshotTimings();
+    const t0 = Date.now();
+    let vllm;
+    try {
+      const res = await fetch(`${config.vllmBaseUrl}/models`, { signal: AbortSignal.timeout(10_000) });
+      const j = await res.json().catch(() => ({}));
+      vllm = { ok: res.ok, status: res.status, ms: Date.now() - t0, models: (j.data || []).map((m) => m.id) };
+    } catch (e) {
+      vllm = { ok: false, ms: Date.now() - t0, error: e.message };
+    }
+    return {
+      base_url: config.vllmBaseUrl,
+      analytics_timeout_ms: config.aiAnalyticsTimeoutMs,
+      snapshot_ttl_ms: config.aiSnapshotTtlMs,
+      total_db_ms: steps.reduce((a, s) => a + s.ms, 0),
+      steps,
+      vllm,
+      caps,
+    };
+  });
+
   app.post('/api/v1/chat/feedback', { preHandler: requireRole('viewer') }, async (req, reply) => {
     const { id, value } = req.body || {};
     if (!id) return reply.code(400).send({ title: 'id is required', status: 400 });
@@ -105,20 +135,19 @@ export default async function chatRoutes(app) {
     const email = req.user?.email || req.user?.sub || null;
     const question = String(messages[messages.length - 1]?.content || '');
 
-    // The snapshot and the model id are independent — no reason to wait for one
-    // before starting the other, and the snapshot is the slower of the two.
-    let snap;
-    try {
-      [snap] = await Promise.all([fleetSnapshot(), requestModel || resolveModel(req.log)]);
-    } catch (e) {
-      req.log.error(e, 'chat pre-flight failed');
-      return reply.code(502).send({ title: 'Cannot start chat', status: 502, detail: e.message });
-    }
-
-    const route = routeIntent(question, snap);
     const lang = isThai(question) ? 'th' : 'en';
 
-    // hijack() first: it tells Fastify this route owns the socket from here on.
+    // Take the socket BEFORE any slow work.
+    //
+    // Assembling the fleet snapshot used to happen first, so a slow database
+    // meant the browser sat on a request with no response headers at all — it
+    // shows as "pending" for as long as the query takes, the GPU is idle
+    // because nothing has reached the model yet, and there is nothing on screen
+    // to say which of the two is happening. Headers now go out immediately and
+    // every stage announces itself, so a slow step looks like a slow step
+    // rather than a hang.
+    //
+    // hijack() also tells Fastify this route owns the socket from here on.
     // Without it the async handler resolves with undefined once the stream is
     // done and Fastify tries to serialise a second response onto a connection
     // that has already been written to and closed.
@@ -141,9 +170,21 @@ export default async function chatRoutes(app) {
     const usedTools = [];
     let answerChars = 0;
     let failure = null;
+    let route = { intent: 'analyze', servers: [], useTools: false, profile: 'analysis' };
 
     try {
-      send({ t: 'meta', intent: route.intent, lang, tools: caps.tools !== false && route.useTools });
+      send({ t: 'status', s: 'reading' });
+      const [snap] = await Promise.all([
+        fleetSnapshot({ log: req.log }),
+        requestModel || resolveModel(req.log),
+      ]);
+      route = routeIntent(question, snap);
+      send({
+        t: 'meta', intent: route.intent, lang,
+        tools: caps.tools !== false && route.useTools,
+        // Say so out loud rather than quietly answering from less data.
+        degraded: !!snap.totals.degraded,
+      });
 
       // ---- report ---------------------------------------------------------
       // A report is not a chat answer that happens to be long: it is a stored
@@ -193,7 +234,14 @@ export default async function chatRoutes(app) {
         for (let round = 0; round < config.aiMaxToolRounds; round++) {
           let calls = [];
           if (caps.tools !== false) {
-            const { message } = await llmChat({ messages: planMsgs, profile: 'plan', tools: schemas, log: req.log });
+            const { message, finish } = await llmChat({ messages: planMsgs, profile: 'plan', tools: schemas, log: req.log });
+            // Truncated mid-reasoning: no tool calls, no answer, nothing to
+            // append. Retrying would truncate at the same place, so go and
+            // answer from the context pack — which is never empty.
+            if (finish === 'length' && !message.tool_calls?.length) {
+              req.log.warn('planning turn hit the token limit before deciding — answering from context');
+              break;
+            }
             calls = (message.tool_calls || []).map((c) => ({
               id: c.id, name: c.function?.name,
               args: safeParse(c.function?.arguments),

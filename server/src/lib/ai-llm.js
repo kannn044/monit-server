@@ -24,14 +24,42 @@ let modelCache = { id: null, at: 0 };
  * transient error, and retrying it on every message doubles the latency of
  * every message.
  */
-export const caps = { tools: null, guidedJson: null, thinking: null };
+export const caps = {
+  tools: null,
+  guidedJson: null,
+  thinking: null,
+  /**
+   * Whether turning thinking OFF still produces a usable reply.
+   *
+   * It does not on every deployment, and the way it fails is invisible. A vLLM
+   * served with `--reasoning-parser deepseek_r1` assumes the model opens in
+   * reasoning mode and splits the output at the first `</think>`. Qwen3 with
+   * `enable_thinking: false` never emits that tag, so the parser finds no split
+   * point and files the ENTIRE reply — answer, tool calls and all — under
+   * `reasoning`, handing back `content: null` and `tool_calls: []` with
+   * `finish_reason: "stop"`. A complete, correct answer, reported as nothing.
+   *
+   * Detected the first time it happens and never repeated: after that, thinking
+   * stays on for every turn. The right fix is on the server
+   * (`--reasoning-parser qwen3`), but this feature cannot depend on someone
+   * changing a flag before it works.
+   */
+  noThinkSafe: null,
+};
 
 /** Sampling presets. Qwen3's own recommendation, split by what the turn is for. */
 export const PROFILES = {
   // Deciding which tool to call, or classifying a question: as close to
   // deterministic as sampling gets, and short.
-  route: { temperature: 0, top_p: 1, max_tokens: 220, thinking: false },
-  plan: { temperature: 0.2, top_p: 0.8, top_k: 20, max_tokens: 768, thinking: false },
+  //
+  // The token budgets on the two "decide" turns look generous for turns that
+  // emit a few dozen tokens. They are sized for the failure case: a vLLM served
+  // with --reasoning-parser will emit a reasoning preamble that counts against
+  // max_tokens, and if the budget runs out inside that preamble the reply comes
+  // back with content: null and tool_calls: [] — a turn that silently did
+  // nothing. Cheap insurance; unused budget costs nothing.
+  route: { temperature: 0, top_p: 1, max_tokens: 512, thinking: false },
+  plan: { temperature: 0.2, top_p: 0.8, top_k: 20, max_tokens: 1400, thinking: false },
   // Reciting a number that is already in the context. Creativity is a defect.
   lookup: { temperature: 0.15, top_p: 0.8, top_k: 20, max_tokens: 900, thinking: false, presence_penalty: 0.5 },
   // Reasoning across servers and time. Qwen3's thinking-mode numbers.
@@ -79,7 +107,10 @@ function buildBody({ model, messages, profile, tools, guidedJson, stream, maxTok
   // was pinning it to "off" for every question by putting /no_think in the
   // system message. Analysis needs it on; a lookup is faster with it off.
   if (config.aiThinking && caps.thinking !== false) {
-    body.chat_template_kwargs = { enable_thinking: !!p.thinking };
+    // caps.noThinkSafe === false means this server's reasoning parser eats the
+    // whole reply when thinking is off, so the cheap mode is not available and
+    // every turn thinks.
+    body.chat_template_kwargs = { enable_thinking: !!p.thinking || caps.noThinkSafe === false };
   }
   if (tools?.length && caps.tools !== false) {
     body.tools = tools;
@@ -87,6 +118,18 @@ function buildBody({ model, messages, profile, tools, guidedJson, stream, maxTok
   }
   if (guidedJson && caps.guidedJson !== false) {
     body.guided_json = guidedJson;
+  }
+
+  // Fallback for a chat template that rejected chat_template_kwargs: Qwen3 also
+  // honours a bare /no_think in the last user message. Without this, a server
+  // whose template does not take the flag would reason its way through every
+  // tool-selection turn — the slowest possible way to pick a tool.
+  if (!p.thinking && caps.thinking === false && caps.noThinkSafe !== false) {
+    const last = body.messages[body.messages.length - 1];
+    if (last?.role === 'user' && !String(last.content).includes('/no_think')) {
+      body.messages = [...body.messages.slice(0, -1),
+        { ...last, content: `${last.content}\n/no_think` }];
+    }
   }
   return body;
 }
@@ -143,15 +186,98 @@ async function post(body, log, attempt = 0) {
   throw new Error(`vLLM ${res.status}: ${text.slice(0, 400) || 'no body'}`);
 }
 
+/**
+ * Tool calls written as Qwen3's XML, for when they arrive as text rather than
+ * as a parsed `tool_calls` array.
+ *
+ *   <tool_call><function=list_servers>
+ *     <parameter=health>down</parameter>
+ *   </function></tool_call>
+ *
+ * vLLM normally parses these itself, but not when a reasoning parser has
+ * already swallowed the text they were written in. Recovering them here is the
+ * difference between a working first request and a silent no-op.
+ */
+export function parseXmlToolCalls(text) {
+  const out = [];
+  const blocks = String(text).match(/<tool_call>[\s\S]*?<\/tool_call>/g) || [];
+  for (const block of blocks) {
+    // Some builds emit JSON inside the wrapper instead of XML.
+    const json = block.match(/<tool_call>\s*(\{[\s\S]*\})\s*<\/tool_call>/);
+    if (json) {
+      try {
+        const o = JSON.parse(json[1]);
+        if (o.name) {
+          out.push({
+            id: `call_${out.length}`,
+            type: 'function',
+            function: { name: o.name, arguments: JSON.stringify(o.arguments ?? o.parameters ?? {}) },
+          });
+          continue;
+        }
+      } catch { /* fall through to the XML shape */ }
+    }
+    const name = block.match(/<function=([^>\s]+)>/)?.[1];
+    if (!name) continue;
+    const args = {};
+    for (const m of block.matchAll(/<parameter=([^>\s]+)>([\s\S]*?)<\/parameter>/g)) {
+      const raw = m[2].trim();
+      // Numbers and booleans come through as text; the tool schemas declare
+      // them typed, so coerce the unambiguous ones.
+      args[m[1]] = /^-?\d+(\.\d+)?$/.test(raw) ? Number(raw)
+        : raw === 'true' ? true : raw === 'false' ? false : raw;
+    }
+    out.push({
+      id: `call_${out.length}`,
+      type: 'function',
+      function: { name, arguments: JSON.stringify(args) },
+    });
+  }
+  return out;
+}
+
+const reasoningOf = (m) => m?.reasoning_content || m?.reasoning || '';
+
+/**
+ * Undo a reasoning parser that classified the whole reply as reasoning.
+ *
+ * The signature is unmistakable: the model stopped normally, said nothing, and
+ * "thought" something substantial. Treat that thought as the reply.
+ */
+function salvage(message, finish, log) {
+  const reasoning = reasoningOf(message);
+  if (message?.content || !reasoning || finish !== 'stop') return message;
+
+  const calls = parseXmlToolCalls(reasoning);
+  const text = reasoning.replace(/<tool_call>[\s\S]*?<\/tool_call>/g, '').trim();
+  if (caps.noThinkSafe === null) {
+    caps.noThinkSafe = false;
+    log?.warn('this vLLM\'s reasoning parser returns the whole reply as "reasoning" when thinking '
+      + 'is disabled — keeping thinking on from now on. Serve with --reasoning-parser qwen3 to fix it properly.');
+  }
+  return {
+    ...message,
+    content: text,
+    tool_calls: message.tool_calls?.length ? message.tool_calls : calls,
+  };
+}
+
 /** One non-streaming completion. Returns the first choice's message object. */
 export async function llmChat({ messages, profile = 'analysis', tools, guidedJson, maxTokens, log }) {
   const model = await resolveModel(log);
   const res = await post(buildBody({ model, messages, profile, tools, guidedJson, maxTokens }), log);
   const j = await res.json();
   const choice = j.choices?.[0];
+  const message = salvage(choice?.message, choice?.finish_reason, log)
+    || { role: 'assistant', content: '' };
   return {
-    message: choice?.message || { role: 'assistant', content: '' },
+    message,
     finish: choice?.finish_reason,
+    // With --reasoning-parser configured, vLLM strips the thinking out of
+    // content into a field of its own — and has spelled that field both ways
+    // across releases. Read both, so the reasoning is never mistaken for an
+    // empty reply.
+    reasoning: reasoningOf(choice?.message),
     usage: j.usage,
   };
 }
@@ -169,6 +295,7 @@ export async function llmStream({ messages, profile = 'analysis', maxTokens, log
   const decoder = new TextDecoder();
   let buffer = '';
   let full = '';
+  let thought = '';        // kept in case it turns out to have been the answer
   let inThink = false;
   let carry = '';   // holds a partial "<think" that straddles two chunks
 
@@ -209,13 +336,25 @@ export async function llmStream({ messages, profile = 'analysis', maxTokens, log
       try {
         const parsed = JSON.parse(data);
         const delta = parsed.choices?.[0]?.delta;
-        // Some builds put the reasoning in its own field instead of <think>.
-        if (delta?.reasoning_content) onThink?.(delta.reasoning_content);
+        // Some builds put the reasoning in its own field instead of <think>,
+        // and have named that field both ways across releases.
+        const reason = delta?.reasoning_content ?? delta?.reasoning;
+        if (reason) { thought += reason; onThink?.(reason); }
         if (delta?.content) { full += delta.content; emit(delta.content); }
       } catch { /* a malformed chunk is not worth killing the answer over */ }
     }
   }
   if (carry) (inThink ? onThink : onDelta)?.(carry);
+
+  // Nothing was ever emitted as content, but something was emitted as
+  // reasoning: the same parser problem as in salvage(), arriving one delta at a
+  // time. The reasoning was the answer — show it rather than an empty bubble.
+  if (!full.trim() && thought.trim()) {
+    if (caps.noThinkSafe === null) caps.noThinkSafe = false;
+    log?.warn('streamed reply arrived entirely as reasoning — using it as the answer');
+    full = thought.replace(/<tool_call>[\s\S]*?<\/tool_call>/g, '').trim();
+    if (full) onDelta?.(full);
+  }
   return full;
 }
 
@@ -229,7 +368,15 @@ export async function llmStream({ messages, profile = 'analysis', maxTokens, log
  * handle a null anyway.
  */
 export async function llmJson({ messages, schema, profile = 'report', maxTokens, log }) {
-  const { message } = await llmChat({ messages, profile, guidedJson: schema, maxTokens, log });
+  let { message, finish } = await llmChat({ messages, profile, guidedJson: schema, maxTokens, log });
+  // Ran out of budget before writing any JSON — almost always a long reasoning
+  // preamble. One retry with double the room, rather than reporting failure for
+  // a model that was about to answer.
+  if (!message.content && finish === 'length') {
+    const budget = (maxTokens || PROFILES[profile]?.max_tokens || 2000) * 2;
+    log?.warn({ budget }, 'model spent its whole budget reasoning — retrying with more room');
+    ({ message } = await llmChat({ messages, profile, guidedJson: schema, maxTokens: budget, log }));
+  }
   const raw = String(message.content || '').replace(/<think>[\s\S]*?<\/think>/g, '').trim();
   try {
     return JSON.parse(raw);

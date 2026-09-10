@@ -154,12 +154,22 @@ function sampledStatsSql(span, step) {
 }
 
 /**
- * The week in one pass: trend, and the same-hour baseline the z-score needs.
+ * The week in ONE pass: 7-day statistics, trend, and the same-hour baseline.
  *
- * Both come off the same sampled points, so the week is walked once instead of
- * three times. regr_slope() ships with Postgres, so "will this fill up, and
- * when" needs no extension and no library — and being a closed form it cannot
- * drift the way a model's arithmetic does.
+ * Previously three separate walks over the week. Each LATERAL lookup is an
+ * index seek, and the cost is servers x buckets: at one-hour steps that is 168
+ * seeks per server per query, so a forty-server fleet paid twenty thousand
+ * seeks per snapshot. Warm and small that measures in milliseconds; on a real
+ * database it measured twenty-three seconds, which is the whole latency budget
+ * spent before the model is even called.
+ *
+ * So: one pass, three-hour steps (56 points), everything computed from it.
+ *
+ * Three hours still gives the baseline what it needs. The series starts at
+ * date_trunc('hour', now()) minus seven days and steps by three, so every point
+ * shares now's hour modulo three — and the points where the hour matches
+ * exactly are one per day, seven over the week. Enough for a mean and a
+ * deviation, which is all the z-score is.
  *
  * The baseline compares now against the SAME HOUR on other days rather than
  * against a flat weekly average, which is the cheapest way to stop a nightly
@@ -167,14 +177,14 @@ function sampledStatsSql(span, step) {
  */
 const WEEK_SQL = `
   WITH pts AS (
-    SELECT s.id AS server_id, g.b, m.cpu, m.ram, m.disk
+    SELECT s.id AS server_id, g.b, m.cpu, m.ram, m.load, m.disk
       FROM servers s
       CROSS JOIN generate_series(date_trunc('hour', now()) - interval '7 days',
-                                 now(), interval '1 hour') g(b)
+                                 now(), interval '3 hours') g(b)
       CROSS JOIN LATERAL (
-        SELECT sm.cpu, sm.ram, sm.disk FROM system_metrics sm
+        SELECT sm.cpu, sm.ram, sm.load, sm.disk FROM system_metrics sm
          WHERE sm.server_id = s.id
-           AND sm.time >= g.b AND sm.time < g.b + interval '1 hour'
+           AND sm.time >= g.b AND sm.time < g.b + interval '3 hours'
          ORDER BY sm.time DESC LIMIT 1
       ) m
      WHERE s.archived_at IS NULL
@@ -182,23 +192,36 @@ const WEEK_SQL = `
     SELECT server_id, b, extract(epoch FROM b) AS t,
            (cpu->>'total')::double precision    AS cpu,
            (ram->>'used_pct')::double precision AS ram,
-           disk_max_used_pct(disk)              AS disk_pct
+           (load->>'1m')::double precision      AS load1,
+           (load->>'cores')::int                AS cores,
+           disk_max_used_pct(disk)              AS disk_pct,
+           disk_min_avail_kb(disk)              AS disk_avail
       FROM pts
+  ), same_hour AS (
+    SELECT server_id, cpu, ram FROM v
+     WHERE extract(hour FROM b) = extract(hour FROM now())
+       AND b < date_trunc('hour', now())
   )
-  SELECT server_id,
-         regr_slope(ram,      t) * 86400 AS ram_pct_per_day,
-         regr_slope(disk_pct, t) * 86400 AS disk_pct_per_day,
-         regr_slope(cpu,      t) * 86400 AS cpu_pct_per_day,
-         count(*)                        AS buckets,
-         avg(cpu)        FILTER (WHERE extract(hour FROM b) = extract(hour FROM now())
-                                   AND b < date_trunc('hour', now())) AS cpu_mean,
-         stddev_pop(cpu) FILTER (WHERE extract(hour FROM b) = extract(hour FROM now())
-                                   AND b < date_trunc('hour', now())) AS cpu_sd,
-         avg(ram)        FILTER (WHERE extract(hour FROM b) = extract(hour FROM now())
-                                   AND b < date_trunc('hour', now())) AS ram_mean,
-         stddev_pop(ram) FILTER (WHERE extract(hour FROM b) = extract(hour FROM now())
-                                   AND b < date_trunc('hour', now())) AS ram_sd
-    FROM v GROUP BY server_id`;
+  SELECT v.server_id,
+         regr_slope(v.ram,      v.t) * 86400 AS ram_pct_per_day,
+         regr_slope(v.disk_pct, v.t) * 86400 AS disk_pct_per_day,
+         regr_slope(v.cpu,      v.t) * 86400 AS cpu_pct_per_day,
+         count(*)                            AS buckets,
+         avg(v.cpu)                                             AS cpu_avg,
+         percentile_cont(0.95) WITHIN GROUP (ORDER BY v.cpu)     AS cpu_p95,
+         max(v.cpu)                                             AS cpu_max,
+         avg(v.ram)                                             AS ram_avg,
+         percentile_cont(0.95) WITHIN GROUP (ORDER BY v.ram)     AS ram_p95,
+         avg(v.disk_pct)                                        AS disk_avg,
+         min(v.disk_avail)                                      AS disk_avail_min,
+         avg(v.load1)                                           AS load_avg,
+         percentile_cont(0.95) WITHIN GROUP (ORDER BY v.load1)   AS load_p95,
+         max(v.cores)                                           AS cores,
+         (SELECT avg(cpu)        FROM same_hour h WHERE h.server_id = v.server_id) AS cpu_mean,
+         (SELECT stddev_pop(cpu) FROM same_hour h WHERE h.server_id = v.server_id) AS cpu_sd,
+         (SELECT avg(ram)        FROM same_hour h WHERE h.server_id = v.server_id) AS ram_mean,
+         (SELECT stddev_pop(ram) FROM same_hour h WHERE h.server_id = v.server_id) AS ram_sd
+    FROM v GROUP BY v.server_id`;
 
 /**
  * Network rate from the newest and oldest raw sample in a ten-minute window.
@@ -339,15 +362,17 @@ async function analytics(log) {
   if (analyticsCache.data && Date.now() - analyticsCache.at < config.aiAnalyticsTtlMs) {
     return analyticsCache.data;
   }
-  const empty = { s24: [], s7d: [], week: [], net: [] };
+  const empty = { s24: [], week: [], net: [] };
   const client = await pool.connect();
   const out = { ...empty };
   try {
     await client.query('BEGIN READ ONLY');
     await client.query(`SET LOCAL statement_timeout = '${config.aiAnalyticsTimeoutMs}ms'`);
+    // 24h at half-hour steps (48 points) and the week at three-hour steps
+    // (56), instead of 144 + 168 + 168. Same shape of answer, a third of the
+    // index seeks.
     const steps = [
-      ['s24', sampledStatsSql('24 hours', '10 minutes')],
-      ['s7d', sampledStatsSql('7 days', '1 hour')],
+      ['s24', sampledStatsSql('24 hours', '30 minutes')],
       ['week', WEEK_SQL],
       ['net', NET_SQL],
     ];
@@ -449,9 +474,10 @@ async function buildSnapshot(log) {
 
   const [extra, diskCap] = await Promise.all([analytics(log), diskTrend(log)]);
 
-  const L = byServer(latest), A = byServer(extra.s24), B = byServer(extra.s7d);
-  // Trend and baseline now come off the same weekly pass, so one map serves both.
-  const T = byServer(extra.week), Z = T, N = byServer(extra.net);
+  const L = byServer(latest), A = byServer(extra.s24);
+  // The weekly pass now carries the 7-day statistics, the trend AND the
+  // baseline, so one map serves all three.
+  const T = byServer(extra.week), B = T, Z = T, N = byServer(extra.net);
   const D = diskCap;
 
   const expectedBy = {};
@@ -565,9 +591,8 @@ export async function snapshotTimings() {
     ['latest_sample', LATEST_SQL, [staleS]],
     ['incidents', INCIDENTS_SQL, []],
     ['expected_services', EXPECTED_SQL, []],
-    ['stats_24h', sampledStatsSql('24 hours', '10 minutes'), []],
-    ['stats_7d', sampledStatsSql('7 days', '1 hour'), []],
-    ['week_trend_baseline', WEEK_SQL, []],
+    ['stats_24h', sampledStatsSql('24 hours', '30 minutes'), []],
+    ['week_stats_trend_baseline', WEEK_SQL, []],
     ['network_rate', NET_SQL, []],
     ['disk_trend', DISK_TREND_SQL, []],
   ];

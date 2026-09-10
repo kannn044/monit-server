@@ -23,7 +23,7 @@
 import { q } from '../db/pool.js';
 import { requireRole } from '../lib/auth.js';
 import { config } from '../config.js';
-import { llmChat, llmStream, llmJson, resolveModel, caps, PROFILES, contextLimit, promptBudget } from '../lib/ai-llm.js';
+import { llmChat, llmStream, llmJson, resolveModel, noteModelInfo, caps, PROFILES, contextLimit, promptBudget } from '../lib/ai-llm.js';
 import { fleetSnapshot, snapshotTimings } from '../lib/ai-analytics.js';
 import { buildSystemPrompt, routeIntent, estimateTokens, PLAN_INSTRUCTION } from '../lib/ai-prompt.js';
 import { toolSchemas, toolNames, runTool } from '../lib/ai-tools.js';
@@ -65,6 +65,7 @@ export default async function chatRoutes(app) {
       const res = await fetch(`${config.vllmBaseUrl}/models`, { signal: AbortSignal.timeout(8000) });
       if (!res.ok) throw new Error(`vLLM returned ${res.status}`);
       const j = await res.json();
+      noteModelInfo(j);
       return { models: j.data || [] };
     } catch (e) {
       req.log.error(e, 'failed to fetch vLLM models');
@@ -96,22 +97,34 @@ export default async function chatRoutes(app) {
    * outside they look identical. This times each step so the answer is a number
    * rather than a guess.
    */
-  app.get('/api/v1/chat/diag', { preHandler: requireRole('admin') }, async () => {
-    const steps = await snapshotTimings();
+  app.get('/api/v1/chat/diag', { preHandler: requireRole('admin') }, async (req) => {
+    // Ask the model endpoint FIRST, so the reported context window is the
+    // detected one rather than the fallback: on a fresh process nothing has
+    // called resolveModel() yet, and diagnostics that report a default as if it
+    // were a measurement are worse than no diagnostics.
     const t0 = Date.now();
     let vllm;
     try {
       const res = await fetch(`${config.vllmBaseUrl}/models`, { signal: AbortSignal.timeout(10_000) });
       const j = await res.json().catch(() => ({}));
-      vllm = { ok: res.ok, status: res.status, ms: Date.now() - t0, models: (j.data || []).map((m) => m.id) };
+      noteModelInfo(j);
+      vllm = {
+        ok: res.ok, status: res.status, ms: Date.now() - t0,
+        models: (j.data || []).map((m) => ({ id: m.id, max_model_len: m.max_model_len })),
+      };
     } catch (e) {
       vllm = { ok: false, ms: Date.now() - t0, error: e.message };
     }
+    const steps = await snapshotTimings();
     return {
       base_url: config.vllmBaseUrl,
       analytics_timeout_ms: config.aiAnalyticsTimeoutMs,
       snapshot_ttl_ms: config.aiSnapshotTtlMs,
       total_db_ms: steps.reduce((a, s) => a + s.ms, 0),
+      // Uncached, one after another — deliberately the worst case. The live
+      // path runs the essentials in parallel and reuses the analytics for two
+      // minutes, so this number is the ceiling, not the typical cost.
+      note: 'steps are measured cold and sequentially; the chat path caches and parallelises',
       steps,
       vllm,
       caps,

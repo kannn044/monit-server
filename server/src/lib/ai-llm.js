@@ -32,6 +32,25 @@ export function contextLimit() {
   return config.aiModelContextTokens || modelCache.maxLen || 16384;
 }
 
+/**
+ * Record what a /v1/models response said, wherever it was fetched.
+ *
+ * The window was reported as the 16384 fallback on a server actually serving
+ * 196608, because nothing had called resolveModel() in that process yet — and
+ * the diagnostics endpoint, the one place that HAD just fetched /v1/models,
+ * read the ids out of the response and dropped the rest. Any caller that has
+ * the payload should hand it over.
+ */
+export function noteModelInfo(payload) {
+  const m = payload?.data?.[0];
+  if (!m) return;
+  modelCache = {
+    id: modelCache.id || m.id,
+    maxLen: Number(m.max_model_len) || modelCache.maxLen || 0,
+    at: modelCache.at || Date.now(),
+  };
+}
+
 /** Tokens the prompt may use, leaving the rest for tool results and the reply. */
 export function promptBudget() {
   const half = Math.floor(contextLimit() * 0.45);
@@ -130,7 +149,14 @@ function buildBody({ model, messages, profile, tools, guidedJson, stream, maxTok
   // comes back empty. Measure the prompt and ask for what is actually left.
   const promptTokens = messages.reduce((a, m) => a + estimateTokens(m.content || ''), 0) + 32 * messages.length;
   const room = contextLimit() - promptTokens - 64;
-  const want = maxTokens || p.max_tokens;
+  let want = maxTokens || p.max_tokens;
+
+  // When this server's reasoning parser forces thinking on (see noThinkSafe),
+  // the reply and the reasoning share one budget — and the reasoning goes
+  // first. A budget sized for the reply alone is then spent before the reply
+  // starts, which is exactly the empty answer this whole path exists to avoid.
+  // Give it room for both, when the window has room to give.
+  if (caps.noThinkSafe === false && !p.thinking) want = Math.round(want * 3);
   const body = {
     model,
     messages,

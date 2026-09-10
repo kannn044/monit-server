@@ -268,28 +268,50 @@ function renderMd(text) {
     table = null;
   };
 
-  function inline(s) {
-    return s
+  function inline(s2) {
+    return s2
       .replace(/`([^`]+)`/g, '<code>$1</code>')
       .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
       .replace(/(^|[\s(])\*([^*\n]+)\*/g, '$1<em>$2</em>')
       .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
   }
 
+  // Table detection, deliberately forgiving.
+  //
+  // The strict form — every row fenced by outer pipes, a separator row directly
+  // under the header — is what the prompt asks for and what the model usually
+  // produces. Usually. When it drops the outer pipes, or forgets the separator,
+  // the strict parser fell through to paragraph text and the user got a screen
+  // of numbers glued together with "|", which is exactly the failure that looks
+  // like the feature is broken. So: a line with at least two pipes starts a
+  // table, a separator row is used when present and skipped when absent.
+  const looksLikeRow = (l) => (l.match(/\|/g) || []).length >= 2 && !/^\|?\s*$/.test(l);
+  const isSeparator = (l) => /^\|?[\s:|-]+\|[\s:|-]*$/.test(l) && /-/.test(l);
   const cells = (l) => l.replace(/^\||\|$/g, '').split('|').map((c) => c.trim());
 
   for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const raw = line.trim();
+    const raw = lines[i].trim();
 
-    if (/^\|.*\|$/.test(raw) && /^\|[\s:|-]+\|$/.test((lines[i + 1] || '').trim())) {
-      closeList();
-      table = { head: cells(raw), rows: [] };
-      i++;                                  // skip the separator row
-      continue;
+    if (!table && looksLikeRow(raw) && !isSeparator(raw)) {
+      const next = (lines[i + 1] || '').trim();
+      // A header needs either a separator under it or a second row to be a
+      // table at all — one lone piped line is prose containing a pipe.
+      if (isSeparator(next) || looksLikeRow(next)) {
+        closeList();
+        table = { head: cells(raw), rows: [] };
+        if (isSeparator(next)) i++;
+        continue;
+      }
     }
     if (table) {
-      if (/^\|.*\|$/.test(raw)) { table.rows.push(cells(raw)); continue; }
+      if (isSeparator(raw)) continue;
+      if (looksLikeRow(raw)) {
+        const r = cells(raw);
+        // Pad or trim to the header width so a ragged row cannot skew the grid.
+        while (r.length < table.head.length) r.push('');
+        table.rows.push(r.slice(0, table.head.length));
+        continue;
+      }
       closeTable();
     }
 

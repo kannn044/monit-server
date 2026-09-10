@@ -296,6 +296,7 @@ export async function llmStream({ messages, profile = 'analysis', maxTokens, log
   let buffer = '';
   let full = '';
   let thought = '';        // kept in case it turns out to have been the answer
+  let finish = null;
   let inThink = false;
   let carry = '';   // holds a partial "<think" that straddles two chunks
 
@@ -335,6 +336,7 @@ export async function llmStream({ messages, profile = 'analysis', maxTokens, log
       if (!data || data === '[DONE]') continue;
       try {
         const parsed = JSON.parse(data);
+        if (parsed.choices?.[0]?.finish_reason) finish = parsed.choices[0].finish_reason;
         const delta = parsed.choices?.[0]?.delta;
         // Some builds put the reasoning in its own field instead of <think>,
         // and have named that field both ways across releases.
@@ -346,16 +348,30 @@ export async function llmStream({ messages, profile = 'analysis', maxTokens, log
   }
   if (carry) (inThink ? onThink : onDelta)?.(carry);
 
-  // Nothing was ever emitted as content, but something was emitted as
-  // reasoning: the same parser problem as in salvage(), arriving one delta at a
-  // time. The reasoning was the answer — show it rather than an empty bubble.
+  // Nothing was emitted as content, but something was emitted as reasoning.
+  // Two very different situations, and they must not be treated alike:
+  //
+  //   finish_reason "stop"   — the model finished, and the reasoning parser
+  //                            mislabelled a complete answer. Show it.
+  //   finish_reason "length" — the model was still thinking when it ran out of
+  //                            budget. That text is a half-finished train of
+  //                            thought, in whatever language it thinks in, cut
+  //                            off mid-sentence. Showing it as the answer is
+  //                            worse than showing nothing: it looks like the
+  //                            assistant replied, badly. Return empty and let
+  //                            the caller ask again without thinking on.
   if (!full.trim() && thought.trim()) {
-    if (caps.noThinkSafe === null) caps.noThinkSafe = false;
-    log?.warn('streamed reply arrived entirely as reasoning — using it as the answer');
-    full = thought.replace(/<tool_call>[\s\S]*?<\/tool_call>/g, '').trim();
-    if (full) onDelta?.(full);
+    if (finish === 'length') {
+      log?.warn({ thoughtChars: thought.length },
+        'model spent its whole budget reasoning and never answered — caller should retry without thinking');
+    } else {
+      if (caps.noThinkSafe === null) caps.noThinkSafe = false;
+      log?.warn('streamed reply arrived entirely as reasoning — using it as the answer');
+      full = thought.replace(/<tool_call>[\s\S]*?<\/tool_call>/g, '').trim();
+      if (full) onDelta?.(full);
+    }
   }
-  return full;
+  return { text: full, finish, thought };
 }
 
 /**

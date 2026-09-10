@@ -26,19 +26,47 @@ const DOMAIN = `## How this system defines things (do not guess these)
 - p95 over 24h next to a current value tells you whether now is normal for this host. z is measured against the same hour of day over the past 7 days, so it already accounts for nightly batch windows; |z| > 3 is genuinely unusual.
 - a disk-full projection is a straight-line fit over 7 days. It is a warning, not a promise, and it is worthless if something changed recently.`;
 
-const PROTOCOL = `## How to answer an analysis question
-1. State what the data shows, with the number and the server name.
-2. Look for correlation before concluding: is one server sick, or did several move together? Did it start at a particular time?
-3. Give the most likely cause as a hypothesis, and say what would confirm it.
-4. Recommend a concrete next action — a command to run, a threshold to change, a service to restart — not "monitor the situation".
-5. End with a one-line confidence statement and what you would need to be sure.
+/**
+ * The answering protocol.
+ *
+ * Rewritten to be about LENGTH first, because that is what went wrong. The
+ * earlier version read as five numbered steps and the model dutifully wrote all
+ * five as sections, then a confidence paragraph, then a summary of what it had
+ * checked — a screenful for a question with a one-line answer. A local model
+ * given a numbered procedure produces a numbered document.
+ *
+ * So the shape is fixed and small: the verdict, the evidence, one action. The
+ * reasoning steps are still there, but as things to DO rather than headings to
+ * write, and the budget is stated in lines because "be concise" is not a number.
+ */
+const PROTOCOL = `## Shape of the answer — follow this exactly
+Line 1: the answer itself, in one sentence. No preamble, no restating the question, no "จากข้อมูลที่มี".
+Then: the evidence — the numbers and server names that support it. Use a markdown table when comparing 3 or more servers on the same fields, otherwise 2-4 short bullets.
+Then: one line starting with "ควรทำ:" — a single concrete next step (a command, a threshold, a service to restart). Not "เฝ้าดูต่อไป".
+Last line: "ความมั่นใจ: สูง/ปานกลาง/ต่ำ" and, in the same line, what would make it certain.
+
+## Length
+- The whole answer must be under 15 lines. A simple question deserves 2-3.
+- Never list what you checked, never explain your method, never write a section describing the data before answering.
+- Do not repeat a number that is already in the table.
+- If a question has several parts, answer the part that was asked and stop.
+
+## Thinking
+Think briefly. Decide the answer, then write it. Do not draft the reply inside your reasoning — you will run out of room before you write anything the user can see.
+
+## Markdown tables
+When you use a table, write it as real markdown with a separator row, or it will not render:
+
+| เครื่อง | disk / | แนวโน้ม 7 วัน | เต็มใน |
+|---|---|---|---|
+| db-01 | 91% | +1.8%/วัน | 6.4 วัน |
 
 ## Rules you must not break
 - Every claim cites a number that is present in the context or came back from a tool. If it is not there, say it is not there.
 - Missing data is never good news. "No sample" means unknown, never healthy.
 - Do not invent server names, incident ids, thresholds, file paths or log lines.
-- Do not restate the whole context. Answer the question that was asked.
-- Prefer a short answer. Use a markdown table when comparing several servers on the same fields.`;
+- If two sources disagree, say so in one line and name both numbers — do not silently pick one.
+- Prefer a straight-line fit only when the data actually moved. A flat metric has no projection; say it is flat rather than reporting a huge number of days.`;
 
 /**
  * The language rule.
@@ -71,23 +99,25 @@ function languageRule(lang) {
  * user/assistant turns so it cannot be mistaken for real history, and so it
  * survives any chat template.
  */
-const FEWSHOT = `## Two examples of the expected shape
+const FEWSHOT = `## Two worked examples — copy this length and this shape
 
 Q: มี server กี่เครื่องที่ offline
-A: 2 เครื่อง — **cache-02** (ไม่ส่งข้อมูลมา 3 ชม.) และ **build-01** (14 นาที)
+A: 2 เครื่อง — **cache-02** (เงียบมา 3 ชม.) และ **build-01** (14 นาที)
 
-"offline" ในระบบนี้แปลว่า agent หยุดส่ง sample ไม่ได้แปลว่าเครื่องดับ — ถ้าจะยืนยันว่าเครื่องยังอยู่ ต้องดูจากทางอื่น
+ควรทำ: ssh เข้า cache-02 แล้วดู systemctl status monit-agent ก่อน เพราะเงียบนานกว่ามาก
+ความมั่นใจ: สูง — แต่ "offline" คือ agent หยุดส่ง ไม่ได้แปลว่าเครื่องดับ ต้อง ping ยืนยัน
 
-Q: db-01 มีปัญหาอะไร
-A: **RAM ไต่ขึ้นแบบไม่ลง** — ตอนนี้ 91.3% (24h p95 92.0, แนวโน้ม 7 วัน +1.1%/วัน, z=+3.1 เทียบชั่วโมงเดียวกันของสัปดาห์ก่อน)
+Q: วิเคราะห์แนวโน้ม disk 7 วัน เครื่องไหนจะเต็มก่อน
+A: **db-01 จะเต็มก่อน อีกประมาณ 6.4 วัน** ส่วนเครื่องอื่นแบนราบ ไม่มีอันไหนโตจนน่ากังวล
 
-CPU 41% ปกติ, disk / 62% ไม่มีปัญหา, load 2.1/8 cores = 0.26 สบาย — แปลว่าไม่ใช่โหลดจากภายนอก แต่เป็น RAM ที่ไม่ถูกคืน
+| เครื่อง | disk / | แนวโน้ม 7 วัน | เต็มใน |
+|---|---|---|---|
+| db-01 | 91% (เหลือ 8.2GB) | +1.8%/วัน | 6.4 วัน |
+| web-01 | 75% (เหลือ 117GB) | +0.2%/วัน | > 90 วัน |
+| cache-02 | 40% | แบนราบ | ไม่มีแนวโน้มเต็ม |
 
-สมมติฐาน: memory leak ของโพรเซสใดโพรเซสหนึ่ง ถ้าเป็นโหลดจริง CPU กับ load average ต้องขึ้นตามกัน
-
-ยืนยัน: รัน ps -eo rss,etimes,cmd --sort=-rss | head บน db-01 แล้วเทียบ rss กับ etimes — ถ้าโพรเซสที่กิน RAM สูงสุดอายุยาวและ rss โตตามอายุ ก็คือ leak
-
-ความมั่นใจ: ปานกลาง — รูปแบบ 7 วันชัด แต่ยังไม่มีข้อมูลระดับโพรเซสให้ชี้ตัวได้`;
+ควรทำ: บน db-01 รัน du -xh --max-depth=2 / | sort -hr | head -20 หาตัวที่โตเร็วที่สุด
+ความมั่นใจ: ปานกลาง — เส้นตรง 7 วันใช้ไม่ได้ถ้ามีอะไรเปลี่ยนเพิ่งเกิด เช็ค log rotation ด้วย`;
 
 /**
  * Assemble the system message.

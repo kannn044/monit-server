@@ -368,13 +368,49 @@ export default async function chatRoutes(app) {
         ...history,
         { role: 'user', content: question },
       ];
-      await llmStream({
+      const first = await llmStream({
         messages: answerMsgs,
         profile: route.profile,
         log: req.log,
         onDelta: (c) => { answerChars += c.length; send({ t: 'delta', c }); },
         onThink: (c) => send({ t: 'think', c }),
       });
+
+      // The model thought until it ran out of budget and never wrote an answer.
+      //
+      // On this hardware that is not rare: a long context plus thinking mode
+      // plus a fifteen-step question and the reasoning alone fills the window.
+      // Retrying with the same settings would stop in the same place, so the
+      // retry turns thinking off and asks for the answer directly — which is
+      // what the user wanted in the first place.
+      if (!answerChars && first?.finish === 'length') {
+        req.log.warn('answer turn produced only reasoning — retrying with thinking off');
+        send({ t: 'status', s: 'answering' });
+        await llmStream({
+          messages: [
+            ...answerMsgs,
+            {
+              role: 'user',
+              content: 'ตอบคำถามข้างต้นเลย สั้น กระชับ ตรงประเด็น ไม่ต้องอธิบายวิธีคิด '
+                + 'ขึ้นต้นด้วยคำตอบทันที ไม่เกิน 12 บรรทัด และตอบเป็นภาษาไทย',
+            },
+          ],
+          profile: 'lookup',
+          maxTokens: 1200,
+          log: req.log,
+          onDelta: (c) => { answerChars += c.length; send({ t: 'delta', c }); },
+          onThink: (c) => send({ t: 'think', c }),
+        });
+      }
+
+      if (!answerChars) {
+        const msg = lang === 'th'
+          ? 'ขออภัย โมเดลใช้โควตาไปกับการคิดจนหมดและยังไม่ได้ตอบ — ลองถามใหม่ให้แคบลง '
+            + 'เช่น ระบุชื่อเครื่องหรือช่วงเวลาที่สนใจ (กดดู "วิธีคิดของโมเดล" ด้านบนได้ว่ามันคิดถึงไหน)'
+          : 'The model spent its whole budget reasoning and never answered. Try a narrower question.';
+        answerChars = msg.length;
+        send({ t: 'delta', c: msg });
+      }
     } catch (e) {
       failure = e.message;
       req.log.error(e, 'chat failed');

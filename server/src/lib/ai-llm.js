@@ -14,9 +14,29 @@
 // degrades to a plainer mode instead of the chat page simply not working.
 
 import { config } from '../config.js';
+import { estimateTokens } from './ai-prompt.js';
 
-/** Cached model id from /v1/models. */
-let modelCache = { id: null, at: 0 };
+/** Cached model id and, more usefully, the context window it was served with. */
+let modelCache = { id: null, maxLen: 0, at: 0 };
+
+/**
+ * How many tokens this deployment can actually hold.
+ *
+ * Taken from /v1/models, which reports the `--max-model-len` vLLM was started
+ * with. Asking an operator to keep a number in .env in sync with a flag on
+ * another machine is a bug waiting to happen — and getting it wrong is
+ * invisible until an answer comes back truncated. AI_MODEL_CONTEXT_TOKENS
+ * overrides it when the served value is not the effective one.
+ */
+export function contextLimit() {
+  return config.aiModelContextTokens || modelCache.maxLen || 16384;
+}
+
+/** Tokens the prompt may use, leaving the rest for tool results and the reply. */
+export function promptBudget() {
+  const half = Math.floor(contextLimit() * 0.45);
+  return Math.max(1200, Math.min(config.aiPromptBudgetTokens || half, half));
+}
 
 /**
  * What this vLLM turned out to accept. `null` = not probed yet.
@@ -62,10 +82,18 @@ export const PROFILES = {
   plan: { temperature: 0.2, top_p: 0.8, top_k: 20, max_tokens: 1400, thinking: false },
   // Reciting a number that is already in the context. Creativity is a defect.
   lookup: { temperature: 0.15, top_p: 0.8, top_k: 20, max_tokens: 900, thinking: false, presence_penalty: 0.5 },
-  // Reasoning across servers and time. Qwen3's thinking-mode numbers.
+  // Reasoning across servers and time.
+  //
+  // max_tokens is deliberately modest and thinking is off by default. The
+  // ranking, the percentiles and the projections are computed in SQL and handed
+  // over as a conclusion, so there is nothing left to reason about — and on a
+  // context sized to fit the GPU rather than to be generous, a model that
+  // reasons drafts the whole reply inside its thinking and runs out of room
+  // before writing a word of it. AI_THINK_ANALYSIS=1 turns it back on for a
+  // deployment with room to spare.
   analysis: {
-    temperature: 0.6, top_p: 0.95, top_k: 20, max_tokens: 2600,
-    thinking: true, presence_penalty: 1.0,
+    temperature: 0.4, top_p: 0.9, top_k: 20, max_tokens: 1100,
+    thinking: false, presence_penalty: 1.0,
   },
   // Filling a JSON schema: needs to stay on the rails, not explore.
   report: { temperature: 0.35, top_p: 0.9, top_k: 20, max_tokens: 3000, thinking: false, presence_penalty: 1.0 },
@@ -80,7 +108,7 @@ export async function resolveModel(log) {
     const j = await res.json();
     const id = j.data?.[0]?.id;
     if (!id) throw new Error('empty model list');
-    modelCache = { id, at: Date.now() };
+    modelCache = { id, maxLen: Number(j.data[0].max_model_len) || 0, at: Date.now() };
     return id;
   } catch (e) {
     log?.warn(e, 'failed to auto-detect vLLM model');
@@ -92,13 +120,24 @@ export async function resolveModel(log) {
 
 function buildBody({ model, messages, profile, tools, guidedJson, stream, maxTokens }) {
   const p = PROFILES[profile] || PROFILES.analysis;
+
+  // Leave room to answer.
+  //
+  // max_tokens is a budget for the REPLY, but the prompt has already spent part
+  // of the window. Asking for 1100 output tokens on top of a 5,000-token prompt
+  // when the server was started with a small --max-model-len is how a request
+  // comes back truncated mid-sentence — or, with a reasoning parser in the way,
+  // comes back empty. Measure the prompt and ask for what is actually left.
+  const promptTokens = messages.reduce((a, m) => a + estimateTokens(m.content || ''), 0) + 32 * messages.length;
+  const room = contextLimit() - promptTokens - 64;
+  const want = maxTokens || p.max_tokens;
   const body = {
     model,
     messages,
     stream: !!stream,
     temperature: p.temperature,
     top_p: p.top_p,
-    max_tokens: maxTokens || p.max_tokens,
+    max_tokens: Math.max(256, Math.min(want, room > 0 ? room : want)),
   };
   if (p.top_k !== undefined) body.top_k = p.top_k;
   if (p.presence_penalty !== undefined) body.presence_penalty = p.presence_penalty;
@@ -110,7 +149,8 @@ function buildBody({ model, messages, profile, tools, guidedJson, stream, maxTok
     // caps.noThinkSafe === false means this server's reasoning parser eats the
     // whole reply when thinking is off, so the cheap mode is not available and
     // every turn thinks.
-    body.chat_template_kwargs = { enable_thinking: !!p.thinking || caps.noThinkSafe === false };
+    const wantThinking = (!!p.thinking || config.aiThinkAnalysis) && profile !== 'plan' && profile !== 'route';
+    body.chat_template_kwargs = { enable_thinking: wantThinking || caps.noThinkSafe === false };
   }
   if (tools?.length && caps.tools !== false) {
     body.tools = tools;

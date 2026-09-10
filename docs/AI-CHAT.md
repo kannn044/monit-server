@@ -74,6 +74,29 @@ The NDB diagram lays nodes out **by node group**, because that is the thing that
 decides survival: a group down to one live node is one failure from taking the
 whole cluster offline, and an id-ordered list hides exactly that.
 
+## Conversations and progress
+
+The chat transcript is saved server-side, one row per user in
+`ai_chat_history`, and kept until that user presses **Clear**. Not
+`localStorage`: the same person signs in from more than one machine, and a
+conversation that lives in one browser is gone the moment they move. The whole
+rendered transcript is stored — the tool trace, the reasoning block, the report
+card — because those are what make a reopened conversation look like the one
+that was left, and they cannot be rebuilt from role and content alone. Bounded
+by `CHAT_HISTORY_MAX` messages and `CHAT_HISTORY_MAX_BYTES`.
+
+While a report is being written the page shows a **countdown**, not a stopwatch,
+and both ends of it come from the server. Elapsed is measured from the report's
+`created_at`, so switching tabs, reloading, or opening the page on another
+machine all show the same clock — counting from when the component mounted made
+a report two minutes in claim it had just started. The estimate is the median of
+the last ten completed reports **of that kind on this installation**
+(`estimateSeconds`), because generation time is set by the local GPU and the
+size of the fleet, both of which vary by an order of magnitude between
+deployments; the median rather than the mean so one stalled run does not move
+the estimate for the next twenty. Past the estimate the bar stops pretending to
+know how far along it is and says so.
+
 ## When the chat request hangs
 
 A `POST /api/v1/chat` that sits pending and then returns **504** with an idle
@@ -293,6 +316,8 @@ Nothing needs to be configured for that fallback — it turns itself on.
 | `AI_ANALYTICS_TIMEOUT_MS` | `4000` | ceiling on one optional analytics query |
 | `AI_ANALYTICS_TTL_MS` | `120000` | how long percentiles and trends are reused |
 | `AI_SNAPSHOT_TTL_MS` | `15000` | how long one fleet snapshot is reused |
+| `CHAT_HISTORY_MAX` | `120` | messages kept in a saved conversation |
+| `CHAT_HISTORY_MAX_BYTES` | `524288` | size cap on one saved conversation |
 
 ### Why the language is a setting
 

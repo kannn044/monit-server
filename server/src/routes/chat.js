@@ -23,9 +23,9 @@
 import { q } from '../db/pool.js';
 import { requireRole } from '../lib/auth.js';
 import { config } from '../config.js';
-import { llmChat, llmStream, llmJson, resolveModel, caps, PROFILES } from '../lib/ai-llm.js';
+import { llmChat, llmStream, llmJson, resolveModel, caps, PROFILES, contextLimit, promptBudget } from '../lib/ai-llm.js';
 import { fleetSnapshot, snapshotTimings } from '../lib/ai-analytics.js';
-import { buildSystemPrompt, routeIntent, PLAN_INSTRUCTION } from '../lib/ai-prompt.js';
+import { buildSystemPrompt, routeIntent, estimateTokens, PLAN_INSTRUCTION } from '../lib/ai-prompt.js';
 import { toolSchemas, toolNames, runTool } from '../lib/ai-tools.js';
 import { generateReport, REPORT_KINDS } from '../lib/ai-report.js';
 
@@ -115,6 +115,9 @@ export default async function chatRoutes(app) {
       steps,
       vllm,
       caps,
+      context_tokens: contextLimit(),
+      prompt_budget_tokens: promptBudget(),
+      think_on_analysis: config.aiThinkAnalysis,
     };
   });
 
@@ -278,13 +281,28 @@ export default async function chatRoutes(app) {
       }
 
       // ---- gather ---------------------------------------------------------
-      const baseSystem = buildSystemPrompt({
+      const budget = promptBudget();
+      const built = buildSystemPrompt({
         snap, scope: { servers: route.servers }, role,
         toolNames: toolNames(role), mode: route.profile, lang,
+        question, budgetTokens: budget,
       });
-      const history = messages.slice(-config.chatMaxHistory, -1)
-        .filter((m) => m.content && (m.role === 'user' || m.role === 'assistant'))
-        .map(({ role: r, content }) => ({ role: r, content: String(content).slice(0, 4000) }));
+      const baseSystem = built.text;
+      send({ t: 'budget', prompt: built.tokens, budget, context: contextLimit(), lead: built.lead });
+      req.log.info({ promptTokens: built.tokens, budget, context: contextLimit(), aspects: built.aspects },
+        'ai prompt built');
+
+      // History is the first thing to go when the window is tight: the current
+      // question plus freshly-queried data beats three turns of stale chat.
+      const historyBudget = Math.max(0, budget - built.tokens);
+      const history = [];
+      for (const m of messages.slice(-config.chatMaxHistory, -1).reverse()) {
+        if (!m.content || (m.role !== 'user' && m.role !== 'assistant')) continue;
+        const content = String(m.content).slice(0, 1200);
+        const cost = estimateTokens(content);
+        if (cost > historyBudget - history.reduce((a, x) => a + estimateTokens(x.content), 0)) break;
+        history.unshift({ role: m.role, content });
+      }
 
       const gathered = [];
       if (route.useTools && config.aiMaxToolRounds > 0) {
@@ -358,8 +376,27 @@ export default async function chatRoutes(app) {
         // the answering call carries no `tools`, and a chat template that sees
         // tool messages without a tool list is free to render them oddly or
         // reject them outright.
+        //
+        // And capped. A tool result is the least predictable thing in the
+        // prompt — query_metrics over a fleet can be thousands of characters —
+        // so it gets whatever the window has left after the prompt and the
+        // reply reservation, newest result first.
+        const toolRoom = Math.max(400, contextLimit() - built.tokens
+          - history.reduce((a, x) => a + estimateTokens(x.content), 0) - 1400);
+        const parts = [];
+        let used = 0;
+        for (const g of [...gathered].reverse()) {
+          const block = `### ${g.name}(${JSON.stringify(g.args || {})})\n${g.result}`;
+          const cost = estimateTokens(block);
+          if (used + cost > toolRoom) {
+            parts.unshift(`### ${g.name} — ผลลัพธ์ยาวเกินกว่าที่ context จะรับได้ ไม่ได้ส่งมา`);
+            continue;
+          }
+          used += cost;
+          parts.unshift(block);
+        }
         system += `\n\n## Data you just looked up (freshest truth — prefer this over anything above)\n`
-          + gathered.map((g) => `### ${g.name}(${JSON.stringify(g.args || {})})\n${g.result}`).join('\n\n');
+          + parts.join('\n\n');
       }
       send({ t: 'status', s: 'answering' });
 

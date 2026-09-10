@@ -119,62 +119,207 @@ A: **db-01 จะเต็มก่อน อีกประมาณ 6.4 วั
 ควรทำ: บน db-01 รัน du -xh --max-depth=2 / | sort -hr | head -20 หาตัวที่โตเร็วที่สุด
 ความมั่นใจ: ปานกลาง — เส้นตรง 7 วันใช้ไม่ได้ถ้ามีอะไรเปลี่ยนเพิ่งเกิด เช็ค log rotation ด้วย`;
 
-/**
- * Assemble the system message.
- *
- * `scope` decides how much of the fleet comes along: a question about one
- * server gets that server in full and the rest as one line each, which is both
- * cheaper and more accurate than the old "everything, always".
- */
-export function buildSystemPrompt({ snap, scope, role, toolNames = [], mode = 'analysis', lang = 'th' }) {
-  const parts = [
-    `You are the SRE assistant built into monit, a self-hosted server monitoring system. `
-    + `You are talking to a ${role} of this installation. Everything below was queried from the live database moments ago.`,
-    languageRule(lang),
-    DOMAIN,
-  ];
+// ---------------------------------------------------------------------------
+// token budgeting
+// ---------------------------------------------------------------------------
 
-  parts.push(`## Fleet right now\n${fleetHeader(snap)}`);
+/**
+ * Rough token count, deliberately pessimistic.
+ *
+ * Thai runs about one token per one-and-a-bit characters on a Qwen tokenizer;
+ * English about four characters per token. Counting them separately is crude
+ * but it is the difference between a 40% error and a 200% one, and every
+ * decision below is "does this still fit" — where guessing high is safe and
+ * guessing low is a truncated prompt.
+ */
+export function estimateTokens(text) {
+  const t = String(text || '');
+  let ascii = 0;
+  for (let i = 0; i < t.length; i++) if (t.charCodeAt(i) < 128) ascii++;
+  return Math.ceil(ascii / 3.5 + (t.length - ascii) / 1.2);
+}
+
+/** Which metric families a question is about. Empty means "all of them". */
+export function detectAspects(text) {
+  const t = String(text).toLowerCase();
+  const a = new Set();
+  if (/disk|ดิสก์|พื้นที่|เต็ม|storage|mount|partition|ฮาร์ดดิสก์/.test(t)) a.add('disk');
+  if (/ram|memory|หน่วยความจำ|เมมโมรี|swap/.test(t)) a.add('ram');
+  if (/cpu|ซีพียู|โหลด|processor/.test(t)) { a.add('cpu'); a.add('load'); }
+  if (/load|โหลด|saturat/.test(t)) a.add('load');
+  if (/network|เน็ต|แบนด์วิดท์|traffic|rx|tx/.test(t)) a.add('net');
+  if (/service|pm2|docker|container|โพรเซส|process|บริการ/.test(t)) a.add('svc');
+  if (/ndb|cluster|คลัสเตอร์|mysql|node group/.test(t)) a.add('ndb');
+  return a;
+}
+
+/**
+ * The answer, computed in SQL, handed over as a conclusion.
+ *
+ * This is the single change that made a small model usable here. Given a fleet
+ * and the question "which disk fills first", the model was ranking the servers
+ * itself — inside its reasoning, in prose, one at a time, second-guessing the
+ * ordering — and on a short context it ran out of room before writing anything
+ * the user could see.
+ *
+ * But the ranking is not a judgement call. `daysToFull` is already computed for
+ * every server, and sorting is what a database does. So the ordering is settled
+ * here and stated as fact, and the model's remaining job is to say it in Thai
+ * with a table and one recommendation: a job worth a couple of hundred tokens
+ * instead of two thousand.
+ */
+export function computeLead(snap, { intent, aspects }) {
+  const n1 = (v) => (v == null || Number.isNaN(Number(v)) ? null : Math.round(Number(v) * 10) / 10);
+  const online = snap.list.filter((s) => s.health !== 'offline');
+  const lines = [];
+
+  if (aspects.has('disk') || intent === 'capacity') {
+    const shrinking = online.filter((s) => s.daysToFull !== null)
+      .sort((a, b) => a.daysToFull - b.daysToFull);
+    const flat = online.filter((s) => s.daysToFull === null && s.worstDisk);
+    if (shrinking.length) {
+      lines.push('อันดับเครื่องที่จะเต็มก่อน (เรียงแล้ว อย่าจัดอันดับใหม่):');
+      for (const s of shrinking.slice(0, 5)) {
+        lines.push(`  ${s.name}: อีก ${s.daysToFull.toFixed(1)} วัน — ${s.capacity.mount} `
+          + `${n1(s.worstDisk?.used_pct)}% เหลือ ${((Number(s.capacity.avail_now) || 0) / 1024 / 1024).toFixed(1)}GB`);
+      }
+    } else {
+      lines.push('ไม่มีเครื่องใดมีแนวโน้มดิสก์เต็ม: การ fit เส้นตรง 7 วันไม่พบเครื่องที่พื้นที่ว่างลดลงจริง');
+    }
+    if (flat.length) {
+      // Named, not counted: "the rest are flat" invites the model to go and
+      // check what "the rest" means, which is another pass over the fleet.
+      const worst = flat.sort((a, b) => Number(b.worstDisk.used_pct) - Number(a.worstDisk.used_pct))[0];
+      lines.push(`เครื่องที่แนวโน้มแบนราบ: ${flat.length} เครื่อง `
+        + `(ใช้พื้นที่สูงสุดคือ ${worst.name} ที่ ${n1(worst.worstDisk.used_pct)}% แต่ไม่โต)`);
+      const tight = flat.filter((s) => Number(s.worstDisk.avail_kb) < 20 * 1024 * 1024);
+      if (tight.length) {
+        lines.push(`  แบนราบแต่พื้นที่เหลือน้อยกว่า 20GB: ${tight.map((s) => `${s.name} (${((Number(s.worstDisk.avail_kb)) / 1024 / 1024).toFixed(1)}GB)`).join(', ')}`);
+      }
+    }
+  }
+
+  if (aspects.has('ram')) {
+    const rising = online.filter((s) => Number(s.trend?.ram_pct_per_day) > 0.3)
+      .sort((a, b) => Number(b.trend.ram_pct_per_day) - Number(a.trend.ram_pct_per_day));
+    lines.push(rising.length
+      ? `RAM ที่ไต่ขึ้นจริง (เรียงตามอัตราการโต): ${rising.slice(0, 5).map((s) => `${s.name} ${n1(s.sample?.ram?.used_pct)}% +${n1(s.trend.ram_pct_per_day)}%/วัน`).join(', ')}`
+      : 'RAM: ไม่มีเครื่องใดมีแนวโน้มไต่ขึ้นเกิน 0.3%/วัน');
+  }
+
+  if (aspects.has('cpu')) {
+    const busy = online.filter((s) => Number(s.stats24?.cpu_p95) > 60)
+      .sort((a, b) => Number(b.stats24.cpu_p95) - Number(a.stats24.cpu_p95));
+    lines.push(busy.length
+      ? `CPU สูงสุดตาม 24h p95: ${busy.slice(0, 5).map((s) => `${s.name} p95 ${n1(s.stats24.cpu_p95)}%`).join(', ')}`
+      : 'CPU: ไม่มีเครื่องใดที่ 24h p95 เกิน 60%');
+  }
+
+  // Always: the things that are true regardless of what was asked.
+  const off = snap.list.filter((s) => s.health === 'offline');
+  if (off.length) lines.push(`ไม่ส่ง sample: ${off.map((s) => `${s.name} (${Math.round((Date.now() - new Date(s.last_seen).getTime()) / 60000)} นาที)`).join(', ')}`);
+  const missing = online.filter((s) => s.missingServices.length);
+  if (missing.length) lines.push(`service ที่ประกาศไว้แต่ไม่รัน: ${missing.map((s) => `${s.name}: ${s.missingServices.join(',')}`).join(' | ')}`);
+
+  return lines.length ? lines.join('\n') : null;
+}
+
+/**
+ * Assemble the system message, inside a token budget.
+ *
+ * The deployment this was written against serves a quantized 27B on two cards
+ * with a context sized to fit, not to be generous. Everything here therefore
+ * has a priority, and sections are dropped from the bottom up until the prompt
+ * fits — an answer built on nine servers instead of thirty is worth having; an
+ * answer that never gets written because the prompt filled the window is not.
+ *
+ * The order is not arbitrary. The computed lead outranks the raw fleet data
+ * because it IS the answer; the focus servers outrank the rest of the fleet
+ * because the question named them; the worked examples go first when space is
+ * short because they shape the output rather than inform it.
+ */
+export function buildSystemPrompt({
+  snap, scope, role, toolNames = [], mode = 'analysis', lang = 'th',
+  question = '', budgetTokens = 0,
+}) {
+  const aspects = detectAspects(question);
+  const lead = computeLead(snap, { intent: mode, aspects });
 
   const focus = scope?.servers?.length
     ? snap.list.filter((s) => scope.servers.includes(s.id))
     : [];
+  const focusIds = new Set(focus.map((s) => s.id));
 
-  if (focus.length && focus.length <= 4) {
-    parts.push(`## Focus servers (full detail)\n${focus.map(serverDetail).join('\n\n')}`);
-    const rest = snap.list.filter((s) => !scope.servers.includes(s.id));
-    if (rest.length) parts.push(`## Other servers (one line each)\n${rest.map(fleetLine).join('\n')}`);
-  } else {
-    parts.push(`## Servers\n${snap.list.map(fleetLine).join('\n') || '(none)'}`);
+  // Interesting first, so that trimming the tail removes the least.
+  const rank = (s) => (s.health === 'critical' ? 0 : s.health === 'warning' ? 1
+    : s.health === 'offline' ? 2 : s.incidents.length || s.missingServices.length ? 3 : 4);
+  const rest = snap.list.filter((s) => !focusIds.has(s.id)).sort((a, b) => rank(a) - rank(b));
+
+  const head = `You are the SRE assistant built into monit, a self-hosted server monitoring system. `
+    + `You are talking to a ${role} of this installation. Everything below was queried from the live database moments ago.`;
+
+  // [required] sections are never dropped; the rest go in reverse order.
+  const sections = [
+    { required: true, text: head },
+    { required: true, text: languageRule(lang) },
+    ...(lead ? [{ required: true, text: `## คำตอบที่คำนวณมาแล้ว — ใช้ตามนี้ ห้ามคำนวณหรือจัดอันดับใหม่\n${lead}` }] : []),
+    { required: true, text: PROTOCOL },
+    ...(focus.length && focus.length <= 3
+      ? [{ text: `## Focus servers (full detail)\n${focus.map(serverDetail).join('\n\n')}` }] : []),
+    { text: `## Servers\n${(focus.length && focus.length <= 3 ? rest : snap.list).map((s) => fleetLine(s, aspects)).join('\n') || '(none)'}`,
+      trimmable: true },
+    { text: snap.incidents.length
+      ? `## Open incidents (${snap.incidents.length})\n${snap.incidents.slice(0, 12).map((i) => `- ${incidentLine(i)}`).join('\n')}`
+      : '## Open incidents\nNone.' },
+    { text: readingKey(aspects) },
+    // FEWSHOT before DOMAIN so DOMAIN is dropped first: the worked examples
+    // decide the shape and length of the reply, which is the thing that keeps
+    // going wrong, while the domain notes only add background.
+    { text: FEWSHOT },
+    { text: DOMAIN },
+  ];
+
+  const budget = budgetTokens || Infinity;
+  let out = sections.map((x) => x.text);
+  let total = estimateTokens(out.join('\n\n'));
+
+  // Drop optional sections from the end until it fits.
+  for (let i = sections.length - 1; i >= 0 && total > budget; i--) {
+    if (sections[i].required) continue;
+    if (sections[i].trimmable) continue;      // handled below, it is the data
+    out[i] = null;
+    total = estimateTokens(out.filter(Boolean).join('\n\n'));
   }
 
-  if (snap.incidents.length) {
-    parts.push(`## Open incidents (${snap.incidents.length})\n`
-      + snap.incidents.slice(0, 25).map((i) => `- ${incidentLine(i)}`).join('\n'));
-  } else {
-    parts.push('## Open incidents\nNone.');
+  // Still too big: the fleet list itself is the remaining cost. Keep the most
+  // interesting servers and say plainly how many were left out, so the model
+  // never presents a partial fleet as the whole one.
+  const dataIdx = sections.findIndex((x) => x.trimmable);
+  if (total > budget && dataIdx >= 0) {
+    const all = (focus.length && focus.length <= 3 ? rest : snap.list);
+    let keep = all.length;
+    while (keep > 3 && total > budget) {
+      keep = Math.max(3, Math.floor(keep * 0.7));
+      out[dataIdx] = `## Servers (${keep} จาก ${all.length} เครื่อง — เรียงตามความน่าสนใจ ตัดส่วนที่เหลือออกเพราะ context จำกัด)\n`
+        + all.slice(0, keep).map((s) => fleetLine(s, aspects)).join('\n')
+        + (keep < all.length ? `\n(อีก ${all.length - keep} เครื่องไม่ได้แสดง — ถ้าคำถามต้องใช้ ให้บอกผู้ใช้ว่ายังไม่ได้ดูครบ)` : '');
+      total = estimateTokens(out.filter(Boolean).join('\n\n'));
+    }
   }
 
-  // Reading key: the fleet lines are dense on purpose, and a small model reads
-  // them far better when told what the shorthand means than when left to infer.
-  parts.push(`## Reading the server lines
-"cpu 82.1%(24h p95 88) +2.1/d" = now, the 95th percentile over 24h, and the 7-day trend per day.
-"disk / 91% avail 8.2GB (machine 74%) FULL~6.4d" = the fullest real filesystem, space left, the whole machine, then the straight-line projection. Partitions under 4GB are left out — /boot is near full by design and says nothing about capacity.
-"load 0.99/core" = load average divided by core count.
-"ANOM ram z=3.4" = far outside this host's own normal for this hour of day.
-"MISSING docker[redis]" = declared as expected but not running.`);
+  const text = out.filter(Boolean).join('\n\n');
+  return { text, tokens: estimateTokens(text), aspects: [...aspects], lead: !!lead };
+}
 
-  if (toolNames.length && mode !== 'lookup') {
-    parts.push(`## Tools\nResults from ${toolNames.join(', ')} may already appear in this conversation. `
-      + `Treat a tool result as the freshest truth, above anything above it.`);
-  }
-
-  parts.push(PROTOCOL);
-  if (mode !== 'lookup') parts.push(FEWSHOT);
-  // Last word, deliberately: this is the instruction most often ignored, and
-  // the end of the prompt is the part a model weighs most heavily.
-  parts.push(languageRule(lang));
-  return parts.join('\n\n');
+/** Only explains the shorthand that is actually on screen. */
+function readingKey(aspects) {
+  const want = (k) => !aspects.size || aspects.has(k);
+  const rows = ['## Reading the server lines'];
+  if (want('cpu') || want('ram')) rows.push('"cpu 82.1%(24h p95 88) +2.1/d" = now, the 95th percentile over 24h, the 7-day trend per day.');
+  if (want('disk')) rows.push('"disk / 91% avail 8.2GB (machine 74%) FULL~6.4d" = fullest real filesystem, space left, whole machine, straight-line projection. "(แบนราบ)" = not shrinking, so no projection exists. Partitions under 4GB are excluded.');
+  if (want('load')) rows.push('"load 0.99/core" = load average divided by core count.');
+  rows.push('"ANOM ram z=3.4" = far outside this host\'s own normal for this hour. "MISSING docker[redis]" = declared as expected but not running.');
+  return rows.join('\n');
 }
 
 // ---------------------------------------------------------------------------

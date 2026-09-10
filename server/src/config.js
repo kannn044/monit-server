@@ -146,6 +146,21 @@ export const config = {
   // model reading three thousand English tokens answers in English however the
   // question was phrased.
   aiLanguage: (process.env.AI_LANG || 'th').toLowerCase(),
+  // The model's context window. 0 = read it from /v1/models, which reports the
+  // --max-model-len vLLM was started with. Keeping a number here in sync with a
+  // flag on another machine is a bug waiting to happen, and getting it wrong is
+  // invisible until an answer comes back truncated — so only set this when the
+  // served value is not the effective one.
+  aiModelContextTokens: Number(process.env.AI_MODEL_CONTEXT_TOKENS || 0),
+  // Tokens the system prompt may use. 0 = 45% of the window, leaving the rest
+  // for tool results and the reply. Sections are dropped in priority order
+  // until the prompt fits.
+  aiPromptBudgetTokens: Number(process.env.AI_PROMPT_BUDGET_TOKENS || 0),
+  // Thinking on the answering turn. Off by default: the ranking, percentiles
+  // and projections are computed in SQL and handed over as a conclusion, so
+  // there is nothing left to reason about — and on a small context a model that
+  // reasons drafts the whole reply inside its thinking and never writes it.
+  aiThinkAnalysis: /^(1|true|yes)$/i.test(process.env.AI_THINK_ANALYSIS || ''),
   // The saved conversation is bounded on both axes. It carries the reasoning
   // text and tool traces the page needs to redraw itself, which grows fast, and
   // a jsonb column is not where you want to find out a chat ran to megabytes.

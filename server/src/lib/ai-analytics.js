@@ -588,11 +588,22 @@ export async function snapshotTimings() {
 // rendering for the prompt
 // ---------------------------------------------------------------------------
 
-/** One dense line per server — what the model sees for a fleet-wide question. */
-export function fleetLine(s) {
+/**
+ * One dense line per server, carrying only the metrics the question is about.
+ *
+ * The full line is roughly 180 characters. On a thirty-server fleet that is
+ * 5,400 characters of context — most of it irrelevant to any one question, and
+ * on a GPU with a small `--max-model-len` it is the difference between the
+ * model having room to answer and spending its whole budget reading. A question
+ * about disks does not need pm2 counts, and paying for them costs an answer.
+ *
+ * `aspects` is a Set of metric families ('disk', 'ram', 'cpu', 'load', 'net',
+ * 'svc', 'ndb'); null or empty means everything, which is what a general
+ * "what's wrong" question wants.
+ */
+export function fleetLine(s, aspects = null) {
+  const want = (k) => !aspects || !aspects.size || aspects.has(k);
   const p = [];
-  const cpu = n1(s.sample?.cpu?.total);
-  const ram = n1(s.sample?.ram?.used_pct);
   const a24 = s.stats24 || {};
 
   p.push(`- ${s.name} [${s.health}]`);
@@ -600,12 +611,23 @@ export function fleetLine(s) {
     p.push(`last sample ${ago(s.last_seen)} ago`);
     return p.join(' ');
   }
-  if (cpu !== null) p.push(`cpu ${cpu}%${a24.cpu_p95 ? `(24h p95 ${n1(a24.cpu_p95)})` : ''}${slopeTag(s.trend?.cpu_pct_per_day)}`);
-  if (ram !== null) p.push(`ram ${ram}%${a24.ram_p95 ? `(24h p95 ${n1(a24.ram_p95)})` : ''}${slopeTag(s.trend?.ram_pct_per_day)}`);
-  if (s.worstDisk) {
+
+  if (want('cpu')) {
+    const cpu = n1(s.sample?.cpu?.total);
+    if (cpu !== null) p.push(`cpu ${cpu}%${a24.cpu_p95 ? `(24h p95 ${n1(a24.cpu_p95)})` : ''}${slopeTag(s.trend?.cpu_pct_per_day)}`);
+  }
+  if (want('ram')) {
+    const ram = n1(s.sample?.ram?.used_pct);
+    if (ram !== null) p.push(`ram ${ram}%${a24.ram_p95 ? `(24h p95 ${n1(a24.ram_p95)})` : ''}${slopeTag(s.trend?.ram_pct_per_day)}`);
+  }
+  if (want('disk') && s.worstDisk) {
     let d = `disk ${s.worstDisk.mount} ${n1(s.worstDisk.used_pct)}% avail ${kb(s.worstDisk.avail_kb)}`;
     if (s.diskTotalPct !== null) d += ` (machine ${n1(s.diskTotalPct)}%)`;
-    if (s.daysToFull !== null && s.daysToFull < 90) d += ` FULL~${s.daysToFull.toFixed(1)}d`;
+    // Three distinct states, and conflating the last two put a "แบนราบ" on a
+    // line whose own computed lead said "full in 187 days".
+    if (s.daysToFull === null) { if (s.capacity) d += ' (แบนราบ)'; }
+    else if (s.daysToFull < 90) d += ` FULL~${s.daysToFull.toFixed(1)}d`;
+    else d += ` FULL~${Math.round(s.daysToFull)}d (ยังอีกนาน)`;
     p.push(d);
     // A small partition at 99% is not a capacity story, but a full /boot does
     // break the next kernel upgrade, so it is worth one short clause.
@@ -614,21 +636,32 @@ export function fleetLine(s) {
       p.push(`small mount ${s.tightestDisk.mount} ${n1(s.tightestDisk.used_pct)}%`);
     }
   }
-  const cores = Number(a24.cores) || Number(s.sample?.load?.cores);
-  const l1 = Number(s.sample?.load?.['1m']);
-  if (Number.isFinite(l1) && cores > 0) p.push(`load ${n1(l1 / cores)}/core`);
-  if (s.sample?.pm2?.accessible !== false && s.sample?.pm2?.present) {
-    p.push(`pm2 ${s.sample.pm2.online}on/${(s.sample.pm2.online || 0) + (s.sample.pm2.stopped || 0)}`);
+  if (want('load')) {
+    const cores = Number(a24.cores) || Number(s.sample?.load?.cores);
+    const l1 = Number(s.sample?.load?.['1m']);
+    if (Number.isFinite(l1) && cores > 0) p.push(`load ${n1(l1 / cores)}/core`);
   }
-  if (s.sample?.docker?.accessible !== false && s.sample?.docker?.present) {
-    p.push(`docker ${s.sample.docker.running}/${s.sample.docker.total}`);
+  if (want('net') && s.net) {
+    const rx = bps(s.net.rx_bps), tx = bps(s.net.tx_bps);
+    if (rx || tx) p.push(`net rx ${rx || '?'} tx ${tx || '?'}`);
   }
-  if (s.ndb?.accessible) {
+  if (want('svc')) {
+    if (s.sample?.pm2?.accessible !== false && s.sample?.pm2?.present) {
+      p.push(`pm2 ${s.sample.pm2.online}on/${(s.sample.pm2.online || 0) + (s.sample.pm2.stopped || 0)}`);
+    }
+    if (s.sample?.docker?.accessible !== false && s.sample?.docker?.present) {
+      p.push(`docker ${s.sample.docker.running}/${s.sample.docker.total}`);
+    }
+  }
+  if (want('ndb') && s.ndb?.accessible) {
     p.push(`ndb ${s.ndb.data_nodes_started}/${s.ndb.data_nodes_configured}nodes`
       + (s.ndb.data_memory_pct != null ? ` mem ${n1(s.ndb.data_memory_pct)}%` : ''));
   }
-  if (Math.abs(s.cpuZ ?? 0) >= 2.5) p.push(`ANOM cpu z=${n1(s.cpuZ)}`);
-  if (Math.abs(s.ramZ ?? 0) >= 2.5) p.push(`ANOM ram z=${n1(s.ramZ)}`);
+
+  // Always kept, whatever the question: an anomaly or a missing service is
+  // never irrelevant, and each costs a handful of characters.
+  if (want('cpu') && Math.abs(s.cpuZ ?? 0) >= 2.5) p.push(`ANOM cpu z=${n1(s.cpuZ)}`);
+  if (want('ram') && Math.abs(s.ramZ ?? 0) >= 2.5) p.push(`ANOM ram z=${n1(s.ramZ)}`);
   if (s.missingServices.length) p.push(`MISSING ${s.missingServices.join(',')}`);
   if (s.incidents.length) p.push(`inc ${s.incidents.length}`);
   return p.join(' · ');

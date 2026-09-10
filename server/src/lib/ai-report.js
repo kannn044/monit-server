@@ -13,6 +13,8 @@
 import { q } from '../db/pool.js';
 import { llmJson } from './ai-llm.js';
 import { fleetSnapshot, ndbSummary } from './ai-analytics.js';
+import { estimateTokens } from './ai-prompt.js';
+import { promptBudget } from './ai-llm.js';
 
 const esc = (s) => String(s ?? '')
   .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
@@ -468,6 +470,22 @@ export async function narrate(dataset, { lang = 'th', log } = {}) {
   // guess that reads exactly like a finding.
   if (dataset.verdict) return dataset.verdict;
 
+  // The figures block scales with the fleet, and a report on forty servers can
+  // outgrow the window on its own. Trimmed to the same budget the chat uses,
+  // and told plainly when it was cut — a narrative written over half the fleet
+  // must not read as if it covered all of it.
+  const budget = promptBudget();
+  let facts = dataset.facts || '';
+  if (estimateTokens(facts) > budget) {
+    const lines = facts.split('\n');
+    let keep = lines.length;
+    while (keep > 5 && estimateTokens(lines.slice(0, keep).join('\n')) > budget) {
+      keep = Math.max(5, Math.floor(keep * 0.75));
+    }
+    facts = `${lines.slice(0, keep).join('\n')}\n(แสดง ${keep} จาก ${lines.length} บรรทัด — ตัดเพราะ context จำกัด)`;
+    log?.warn({ keep, total: lines.length }, 'report facts trimmed to fit the context window');
+  }
+
   const messages = [
     {
       role: 'system',
@@ -482,7 +500,7 @@ Return JSON only.`,
     },
     {
       role: 'user',
-      content: `Report: ${dataset.title}\n${dataset.subtitle}\n\nFigures:\n${dataset.facts}`,
+      content: `Report: ${dataset.title}\n${dataset.subtitle}\n\nFigures:\n${facts}`,
     },
   ];
   try {

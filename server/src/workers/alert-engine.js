@@ -5,7 +5,7 @@
 import crypto from 'node:crypto';
 import { q } from '../db/pool.js';
 import { config } from '../config.js';
-import { extractMetric, compare } from '../lib/metrics.js';
+import { extractMetric, compare, formatMetricValue } from '../lib/metrics.js';
 import { enqueueNotifications } from './notifier.js';
 
 const REMINDER_MIN = 60; // "still firing" reminder cadence
@@ -34,6 +34,8 @@ async function buildNotifyPayload(rule, server, incident, event) {
     comparator: rule.comparator,
     value: incident.value,
     threshold: rule.threshold,
+    value_display: formatMetricValue(rule.metric, incident.value),
+    threshold_display: formatMetricValue(rule.metric, rule.threshold),
     duration_min: Number(rule.duration_min),
     started_at: incident.started_at,
     message: incident.message,
@@ -61,11 +63,18 @@ export async function tick(boss, log = console) {
   const expectedByServer = new Map();
   for (const e of expected) (expectedByServer.get(e.server_id) || expectedByServer.set(e.server_id, []).get(e.server_id)).push(e);
 
-  // Latest sample per server (within the last 5 minutes)
+  // The two newest samples per server (within the last 5 minutes). The second
+  // one is only used by rate metrics (network / disk I/O), which need two
+  // cumulative-counter readings to produce a per-second value.
   const { rows: latest } = await q(
-    `SELECT DISTINCT ON (server_id) * FROM system_metrics
-     WHERE time > now() - INTERVAL '5 minutes' ORDER BY server_id, time DESC`);
-  const sampleByServer = new Map(latest.map((r) => [r.server_id, r]));
+    `SELECT * FROM (
+       SELECT m.*, row_number() OVER (PARTITION BY server_id ORDER BY time DESC) AS rn
+       FROM system_metrics m
+       WHERE time > now() - INTERVAL '5 minutes'
+     ) x WHERE rn <= 2`);
+  const sampleByServer = new Map();
+  const prevByServer = new Map();
+  for (const r of latest) (Number(r.rn) === 1 ? sampleByServer : prevByServer).set(r.server_id, r);
 
   const { rows: states } = await q('SELECT * FROM rule_state');
   const stateKey = (r, s) => `${r}|${s}`;
@@ -77,7 +86,7 @@ export async function tick(boss, log = console) {
     for (const server of scopeServers(rule, servers, projectsByServer)) {
       const sample = sampleByServer.get(server.id);
       const noSampleSeconds = server.last_seen ? (now - new Date(server.last_seen).getTime()) / 1000 : null;
-      const ctx = { noSampleSeconds, expected: expectedByServer.get(server.id) || [] };
+      const ctx = { noSampleSeconds, expected: expectedByServer.get(server.id) || [], prev: prevByServer.get(server.id) };
 
       let value;
       if (rule.metric === 'no_sample') {
@@ -120,7 +129,7 @@ export async function tick(boss, log = console) {
           const isFlapping = flap[0].n >= rule.flap_limit;
 
           const id = newIncidentId();
-          const message = `${rule.name}: ${rule.metric} = ${Number(value).toFixed(2)} (${rule.comparator} ${rule.threshold}) on ${server.name} for ${rule.duration_min} min`;
+          const message = `${rule.name}: ${rule.metric} = ${formatMetricValue(rule.metric, value)} (${rule.comparator} ${formatMetricValue(rule.metric, rule.threshold)}) on ${server.name} for ${rule.duration_min} min`;
           const { rows: incRows } = await q(
             `INSERT INTO incidents (id, rule_id, rule_name, server_id, severity, status, metric, value, threshold, message)
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,

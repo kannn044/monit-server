@@ -4,8 +4,82 @@
 const num = (v) => (v === null || v === undefined || v === '' ? null : Number(v));
 const arr = (v) => (Array.isArray(v) ? v : []);
 
+// ---------------------------------------------------------------------------
+// Rate metrics (network / disk I/O)
+// ---------------------------------------------------------------------------
+// The agent ships cumulative counters, so a rate needs two samples. Callers
+// pass the previous sample as ctx.prev; without it these metrics return null
+// and the rule is skipped (never a fake zero).
+export const RATE_METRICS = new Set([
+  'net.rx_bps', 'net.tx_bps', 'net.errors_ps', 'net.drops_ps',
+  'disk.read_bps', 'disk.write_bps', 'disk.read_iops', 'disk.write_iops', 'disk.busy_pct',
+]);
+// Two samples further apart than this are not "consecutive": a rate averaged
+// over an outage is not a rate anyone can act on.
+export const RATE_MAX_GAP_S = 300;
+
+function rateDt(sample, prev) {
+  if (!prev?.time || !sample?.time) return null;
+  const dt = (new Date(sample.time) - new Date(prev.time)) / 1000;
+  return dt > 0 && dt <= RATE_MAX_GAP_S ? dt : null;
+}
+
+/**
+ * Per-entity counter deltas, matched by key (iface / dev) so an interface that
+ * appears or disappears between samples does not distort the sum.
+ * Returns null when nothing could be paired, or when any counter went
+ * backwards (reboot / counter reset) — that interval has no meaningful rate.
+ */
+function counterDeltas(cur, prev, key, field) {
+  const before = new Map(arr(prev).map((x) => [x?.[key], x]));
+  const out = [];
+  for (const c of arr(cur)) {
+    const p = before.get(c?.[key]);
+    if (!p) continue;
+    const a = num(c[field]), b = num(p[field]);
+    if (a === null || b === null || Number.isNaN(a) || Number.isNaN(b)) continue;
+    if (a < b) return null;
+    out.push(a - b);
+  }
+  return out.length ? out : null;
+}
+
+function sumRate(cur, prev, key, fields, dt) {
+  let total = 0, any = false;
+  for (const f of fields) {
+    const d = counterDeltas(cur, prev, key, f);
+    if (d === null) continue;
+    any = true;
+    total += d.reduce((a, b) => a + b, 0);
+  }
+  return any ? total / dt : null;
+}
+
+function rateMetric(path, sample, prev) {
+  const dt = rateDt(sample, prev);
+  if (dt === null) return null;
+  const n1 = sample.network, n0 = prev.network, d1 = sample.diskio, d0 = prev.diskio;
+  switch (path) {
+    case 'net.rx_bps':      return sumRate(n1, n0, 'iface', ['rx_bytes'], dt);
+    case 'net.tx_bps':      return sumRate(n1, n0, 'iface', ['tx_bytes'], dt);
+    case 'net.errors_ps':   return sumRate(n1, n0, 'iface', ['rx_errs', 'tx_errs'], dt);
+    case 'net.drops_ps':    return sumRate(n1, n0, 'iface', ['rx_drop', 'tx_drop'], dt);
+    case 'disk.read_bps':   return sumRate(d1, d0, 'dev', ['read_bytes'], dt);
+    case 'disk.write_bps':  return sumRate(d1, d0, 'dev', ['write_bytes'], dt);
+    case 'disk.read_iops':  return sumRate(d1, d0, 'dev', ['reads'], dt);
+    case 'disk.write_iops': return sumRate(d1, d0, 'dev', ['writes'], dt);
+    case 'disk.busy_pct': { // busiest single disk, like iostat %util
+      const d = counterDeltas(d1, d0, 'dev', 'io_ms');
+      if (!d) return null;
+      return Math.min(100, (100 * Math.max(...d)) / (dt * 1000));
+    }
+    default: return null;
+  }
+}
+
 export function extractMetric(path, sample, ctx = {}) {
   if (!sample) return null;
+  if (RATE_METRICS.has(path)) return rateMetric(path, sample, ctx.prev);
   const { cpu, ram, load, disk, gpu, docker, pm2, http, databases } = sample;
   switch (path) {
     case 'cpu.total':        return num(cpu?.total);
@@ -159,6 +233,9 @@ export const METRIC_UNITS = {
   'load.1m': '', 'load.5m': '', 'load.15m': '', 'uptime_s': 'seconds',
   'gpu.util_pct': 'percent', 'gpu.mem_used_pct': 'percent',
   'net.rx_bps': 'bytes/s', 'net.tx_bps': 'bytes/s',
+  'net.errors_ps': 'per second', 'net.drops_ps': 'per second',
+  'disk.read_bps': 'bytes/s', 'disk.write_bps': 'bytes/s',
+  'disk.read_iops': 'per second', 'disk.write_iops': 'per second', 'disk.busy_pct': 'percent',
   'docker.running': 'count', 'pm2.online': 'count',
   'ndb.nodes_unhealthy': 'count', 'ndb.data_nodes_started': 'count',
   'ndb.data_nodes_configured': 'count', 'ndb.node_groups_down': 'count',
@@ -168,3 +245,15 @@ export const METRIC_UNITS = {
   'db.active_pct': 'percent', 'db.active': 'count',
   'service_down': 'count', 'no_sample': 'seconds',
 };
+
+// Human-readable value for incident messages and notifications. Thresholds for
+// bytes/s metrics are stored in bytes/s but entered and read as MB/s (1024²,
+// the same base the dashboard charts use).
+export function formatMetricValue(metric, v) {
+  if (v === null || v === undefined || Number.isNaN(Number(v))) return '-';
+  const unit = METRIC_UNITS[metric];
+  if (unit === 'bytes/s') return `${(Number(v) / 1048576).toFixed(2)} MB/s`;
+  if (unit === 'percent') return `${Number(v).toFixed(1)}%`;
+  if (unit === 'per second') return `${Number(v).toFixed(2)}/s`;
+  return Number(v).toFixed(2);
+}

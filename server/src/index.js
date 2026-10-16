@@ -18,6 +18,8 @@ import alertRoutes from './routes/alerts.js';
 import installRoutes from './routes/install.js';
 import chatRoutes from './routes/chat.js';
 import reportRoutes from './routes/reports.js';
+import rulePackRoutes from './routes/rule-packs.js';
+import { syncAllBindings } from './lib/rule-packs.js';
 import { startNotifier } from './workers/notifier.js';
 import { startAlertEngine } from './workers/alert-engine.js';
 import { resolveJwtSecret } from './lib/secrets.js';
@@ -76,6 +78,7 @@ async function main() {
   await app.register(projectRoutes);
   await app.register(metricsRoutes);
   await app.register(alertRoutes);
+  await app.register(rulePackRoutes);
   await app.register(chatRoutes);
   await app.register(reportRoutes);
   // Registered before the static handler so /install/:token is not mistaken for
@@ -107,6 +110,8 @@ async function main() {
     boss.on('error', (e) => app.log.error(e, 'pg-boss error'));
     await boss.start();
     await startNotifier(boss, app.log);
+    // Pack-owned rule names embed group names; refresh them in case a group was renamed.
+    await syncAllBindings(app.log);
     startAlertEngine(boss, app.log);
   }
 

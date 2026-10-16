@@ -18,6 +18,7 @@ const sampleSchema = {
     load: { type: 'object' },
     disk: { type: 'array' },
     network: { type: 'array' },
+    diskio: { type: 'array' },
     gpu: { type: 'array' },
     docker: { type: 'object' },
     pm2: { type: 'object' },
@@ -67,12 +68,15 @@ export default async function ingestRoutes(app) {
     }
 
     await q(
-      `INSERT INTO system_metrics (time, server_id, cpu, ram, load, uptime_s, disk, network, gpu, docker, pm2, http, databases)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+      `INSERT INTO system_metrics (time, server_id, cpu, ram, load, uptime_s, disk, network, gpu, docker, pm2, http, databases, diskio)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
       [ts.toISOString(), s.server_id, s.cpu ?? null, s.ram ?? null, s.load ?? null,
        s.uptime_s ?? null, JSON.stringify(s.disk ?? []), JSON.stringify(s.network ?? []),
        JSON.stringify(s.gpu ?? []), s.docker ?? null, s.pm2 ?? null,
-       JSON.stringify(s.http ?? []), s.databases ?? null]
+       JSON.stringify(s.http ?? []), s.databases ?? null,
+       // NULL (not []) from agents that predate disk I/O, so "not reported" and
+       // "no disks" stay distinguishable.
+       s.diskio === undefined ? null : JSON.stringify(s.diskio)]
     );
 
     // last_seen is "when did we last hear from this agent", so it must be OUR

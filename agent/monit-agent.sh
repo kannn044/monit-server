@@ -25,6 +25,8 @@ set -o pipefail
 : "${MONIT_BUFFER_DIR:=/var/lib/monit-agent/buffer}"
 : "${MONIT_BUFFER_MAX:=50}"
 : "${MONIT_NET_IFACES:=eth0}"
+: "${MONIT_DISKIO:=1}"             # 0 = do not report disk read/write
+: "${MONIT_DISKIO_DEVICES:=auto}"  # auto = every physical disk in /sys/block; or "sda nvme0n1"
 : "${MONIT_GPU:=auto}"
 : "${MONIT_HTTP_CHECKS:=}"
 : "${MONIT_DOCKER_MAX:=100}"
@@ -105,15 +107,41 @@ collect_disk() {
 }
 
 collect_net() {
-  local out="" iface line rx tx
+  # /proc/net/dev: "iface: rx_bytes rx_packets rx_errs rx_drop ... tx_bytes tx_packets tx_errs tx_drop ..."
+  # The colon is replaced by a space first: on busy links the kernel prints
+  # "eth0:123456789" with no gap, which used to shift every field by one.
+  local out="" iface line rx tx rxe rxd txe txd
   for iface in $MONIT_NET_IFACES; do
     [ -z "$iface" ] && continue
-    line=$(awk -v IF="$iface" 'NR>2 { name=$1; sub(/:$/,"",name); if (name==IF) print $2, $10 }' /proc/net/dev 2>/dev/null)
+    line=$(awk -v IF="$iface" 'NR>2 { sub(/:/," "); if ($1==IF) print $2, $10, $4, $5, $12, $13 }' /proc/net/dev 2>/dev/null)
     [ -z "$line" ] && continue
-    read -r rx tx <<< "$line"
-    out="${out}${out:+,}{\"iface\":\"$(json_escape "$iface")\",\"rx_bytes\":${rx:-0},\"tx_bytes\":${tx:-0}}"
+    read -r rx tx rxe rxd txe txd <<< "$line"
+    out="${out}${out:+,}{\"iface\":\"$(json_escape "$iface")\",\"rx_bytes\":${rx:-0},\"tx_bytes\":${tx:-0},\"rx_errs\":${rxe:-0},\"rx_drop\":${rxd:-0},\"tx_errs\":${txe:-0},\"tx_drop\":${txd:-0}}"
   done
   printf '[%s]' "$out"
+}
+
+collect_diskio() {
+  # Cumulative counters from /proc/diskstats for WHOLE physical disks only.
+  # Partitions (sda1, nvme0n1p1) are not in /sys/block, and stacked devices
+  # (dm-*, md*) sit on top of the physical ones — counting them too would
+  # report every byte twice. Rates are derived on the server.
+  #   $3 name  $4 reads  $6 sectors read  $8 writes  $10 sectors written  $13 ms doing I/O
+  # Sectors in diskstats are always 512 bytes regardless of the device's block size.
+  [ "$MONIT_DISKIO" = "0" ] && { printf '[]'; return 0; }
+  [ -r /proc/diskstats ] || { printf '[]'; return 0; }
+  local devs="$MONIT_DISKIO_DEVICES"
+  if [ "$devs" = "auto" ]; then
+    devs=$(ls /sys/block 2>/dev/null | grep -vE '^(loop|ram|zram|sr|fd|dm-|md|nbd|drbd)' | tr '\n' ' ')
+  fi
+  [ -z "${devs// /}" ] && { printf '[]'; return 0; }
+  local items
+  items=$(awk -v DEVS=" $devs " '
+    index(DEVS, " " $3 " ") > 0 && NF >= 13 {
+      printf "%s{\"dev\":\"%s\",\"reads\":%.0f,\"writes\":%.0f,\"read_bytes\":%.0f,\"write_bytes\":%.0f,\"io_ms\":%.0f}", \
+        (n++?",":""), $3, $4, $8, $6*512, $10*512, $13
+    }' /proc/diskstats 2>/dev/null)
+  printf '[%s]' "$items"
 }
 
 collect_load() {
@@ -542,6 +570,7 @@ build_payload() {
   "ram":        $(collect_ram),
   "disk":       $(collect_disk),
   "network":    $(collect_net),
+  "diskio":     $(collect_diskio),
   "load":       $(collect_load),
   "gpu":        $(collect_gpu),
   "docker":     $(collect_docker),

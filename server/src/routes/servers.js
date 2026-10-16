@@ -186,6 +186,20 @@ export default async function serverRoutes(app) {
         net = { rx_bps: rx >= 0 ? rx / dt : null, tx_bps: tx >= 0 ? tx / dt : null };
       }
     }
+    // disk I/O from the same two samples, via the alert engine's own code path
+    let diskio = null;
+    if (rows.length === 2 && s.diskio) {
+      const ctx = { prev: rows[1] };
+      diskio = {
+        read_bps: extractMetric('disk.read_bps', s, ctx),
+        write_bps: extractMetric('disk.write_bps', s, ctx),
+        busy_pct: extractMetric('disk.busy_pct', s, ctx),
+      };
+      if (net) {
+        net.errors_ps = extractMetric('net.errors_ps', s, ctx);
+        net.drops_ps = extractMetric('net.drops_ps', s, ctx);
+      }
+    }
     return {
       summary: {
         time: s.time,
@@ -198,6 +212,7 @@ export default async function serverRoutes(app) {
         gpu_mem_used_pct: extractMetric('gpu.mem_used_pct', s),
         uptime_s: s.uptime_s,
         net,
+        diskio,
         docker: s.docker, pm2: s.pm2, http: s.http, gpu: s.gpu, disk: s.disk,
         ram: s.ram, load: s.load, databases: s.databases,
       },

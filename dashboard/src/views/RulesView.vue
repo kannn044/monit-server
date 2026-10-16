@@ -2,6 +2,8 @@
 import { ref, onMounted, computed } from 'vue';
 import { api } from '../api.js';
 import { useAuth } from '../stores/auth.js';
+import { METRICS, toDisplay, fromDisplay, conditionText, unitSuffix } from '../metrics-catalog.js';
+import RulePacks from '../components/RulePacks.vue';
 
 const auth = useAuth();
 const rules = ref([]);
@@ -10,30 +12,14 @@ const projects = ref([]);
 const servers = ref([]);
 const error = ref('');
 const editing = ref(null);
+const tab = ref('rules'); // rules | packs
+const manualRules = computed(() => rules.value.filter((r) => !r.pack_binding_id));
+const packRules = computed(() => rules.value.filter((r) => r.pack_binding_id));
 
 // Rules that fire but notify nobody — the most common "alerts do not arrive"
 // cause, and nothing else on screen makes it visible.
 const silentRules = computed(() => rules.value.filter((r) => r.enabled && !(r.channels || []).length));
 
-const METRICS = [
-  ['cpu.total', 'CPU total %'], ['ram.used_pct', 'RAM used %'], ['ram.available_kb', 'RAM available (KB)'],
-  ['disk.total_used_pct', 'Disk used % (whole machine)'],
-  ['disk.used_pct', 'Disk used % (worst single mount)'],
-  ['disk.avail_kb', 'Disk available KB (tightest mount)'],
-  ['disk.total_avail_kb', 'Disk available KB (whole machine)'],
-  ['load.1m', 'Load 1m'], ['load.5m', 'Load 5m'], ['load.15m', 'Load 15m'],
-  ['gpu.util_pct', 'GPU utilization %'], ['gpu.mem_used_pct', 'GPU VRAM used %'],
-  ['docker.running', 'Docker containers running'], ['pm2.online', 'PM2 processes online'],
-  ['http.status_code', 'HTTP status code'], ['http.latency_ms', 'HTTP latency (ms)'],
-  ['db.active_pct', 'DB connections used %'], ['db.active', 'DB active connections'],
-  ['service_down', 'Expected services down (count)'], ['no_sample', 'Seconds since last sample'],
-  ['ndb.nodes_unhealthy', 'NDB data nodes not STARTED (count)'],
-  ['ndb.data_nodes_started', 'NDB data nodes started (count)'],
-  ['ndb.node_groups_down', 'NDB node groups with no live node'],
-  ['ndb.data_memory_pct', 'NDB DataMemory used %'],
-  ['ndb.index_memory_pct', 'NDB IndexMemory used %'],
-  ['ndb.arbitrator_connected', 'NDB arbitrator connected (1/0)'],
-];
 
 const blank = () => ({
   name: '', metric: 'cpu.total', comparator: '>', threshold: 90, duration_min: 5,
@@ -53,16 +39,21 @@ async function load() {
 onMounted(load);
 
 function edit(r) {
-  editing.value = r ? { ...r, channels: [...(r.channels || [])], scope_ids: [...(r.scope_ids || [])] } : blank();
+  editing.value = r
+    ? {
+      ...r, channels: [...(r.channels || [])], scope_ids: [...(r.scope_ids || [])],
+      threshold: toDisplay(r.metric, r.threshold), recover_threshold: toDisplay(r.metric, r.recover_threshold),
+    }
+    : blank();
 }
 
 async function save() {
   const r = editing.value;
   const body = {
     name: r.name, metric: r.metric, comparator: r.comparator,
-    threshold: r.threshold === '' || r.threshold === null ? null : Number(r.threshold),
+    threshold: fromDisplay(r.metric, r.threshold),
     duration_min: Number(r.duration_min) || 0,
-    recover_threshold: r.recover_threshold === '' || r.recover_threshold === null ? null : Number(r.recover_threshold),
+    recover_threshold: fromDisplay(r.metric, r.recover_threshold),
     severity: r.severity, scope_type: r.scope_type, scope_ids: r.scope_ids,
     channels: r.channels, enabled: r.enabled,
     flap_limit: Number(r.flap_limit) || 5, flap_window_min: Number(r.flap_window_min) || 30,
@@ -90,7 +81,13 @@ async function toggle(r) {
 <template>
   <div class="row" style="justify-content: space-between">
     <h1>Alert rules</h1>
-    <button v-if="auth.isAdmin" class="primary" @click="edit(null)">New rule</button>
+    <div class="row">
+      <div class="seg">
+        <button :class="{ on: tab === 'rules' }" @click="tab = 'rules'">Rules</button>
+        <button :class="{ on: tab === 'packs' }" @click="tab = 'packs'">Rule packs (groups)</button>
+      </div>
+      <button v-if="auth.isAdmin && tab === 'rules'" class="primary" @click="edit(null)">New rule</button>
+    </div>
   </div>
   <div v-if="error" class="error-banner">{{ error }}</div>
   <div v-if="silentRules.length" class="notice">
@@ -99,15 +96,20 @@ async function toggle(r) {
     <span v-if="!channels.length"> Add a channel in <router-link to="/settings">Settings</router-link> first.</span>
   </div>
 
-  <div class="card">
+  <RulePacks v-if="tab === 'packs'" :channels="channels" :projects="projects" :servers="servers" @changed="load" />
+
+  <div v-if="tab === 'rules'" class="card">
     <table>
       <thead><tr>
         <th>Name</th><th>Condition</th><th>For</th><th>Severity</th><th>Scope</th><th>Channels</th><th>Enabled</th><th></th>
       </tr></thead>
       <tbody>
-        <tr v-for="r in rules" :key="r.id">
-          <td><b>{{ r.name }}</b></td>
-          <td class="mono">{{ r.metric }} {{ r.comparator }} {{ r.threshold }}<span v-if="r.recover_threshold !== null" class="muted"> (recover {{ r.recover_threshold }})</span></td>
+        <tr v-for="r in [...manualRules, ...packRules]" :key="r.id">
+          <td>
+            <b>{{ r.name }}</b>
+            <span v-if="r.pack_binding_id" class="packtag" title="Managed by a rule pack — edit it in the Rule packs tab">pack: {{ r.pack_name }}</span>
+          </td>
+          <td class="mono">{{ conditionText(r) }}<span v-if="r.recover_threshold !== null" class="muted"> (recover {{ toDisplay(r.metric, r.recover_threshold) }}{{ unitSuffix(r.metric) }})</span></td>
           <td class="num">{{ r.duration_min }} min</td>
           <td><span class="badge" :class="r.severity === 'critical' ? 'critical' : r.severity === 'warning' ? 'warning' : 'offline'">{{ r.severity }}</span></td>
           <td class="muted">{{ r.scope_type }}{{ r.scope_ids?.length ? ` (${r.scope_ids.length})` : '' }}</td>
@@ -121,7 +123,8 @@ async function toggle(r) {
           </td>
           <td><span class="badge" :class="r.enabled ? 'online' : 'offline'">{{ r.enabled ? 'on' : 'off' }}</span></td>
           <td>
-            <template v-if="auth.isAdmin">
+            <button v-if="r.pack_binding_id" class="sm" @click="tab = 'packs'">Open pack</button>
+            <template v-else-if="auth.isAdmin">
               <button class="sm" @click="edit(r)">Edit</button>
               <button class="sm" @click="toggle(r)">{{ r.enabled ? 'Disable' : 'Enable' }}</button>
               <button class="sm danger" @click="del(r)">Delete</button>
@@ -149,7 +152,8 @@ async function toggle(r) {
             <option v-for="c in ['>', '>=', '<', '<=', '==', '!=']" :key="c" :value="c">{{ c }}</option>
           </select>
         </label>
-        <label class="f">Threshold <input v-model="editing.threshold" type="number" step="any" style="width: 110px" /></label>
+        <label class="f">Threshold{{ unitSuffix(editing.metric) ? ` (${unitSuffix(editing.metric).trim()})` : '' }}
+          <input v-model="editing.threshold" type="number" step="any" style="width: 110px" /></label>
       </div>
       <div class="row">
         <label class="f">For (minutes) <input v-model="editing.duration_min" type="number" min="0" step="any" style="width: 110px" /></label>
@@ -207,6 +211,7 @@ async function toggle(r) {
   border: 1px solid color-mix(in oklab, var(--warning) 40%, var(--border));
   border-radius: 10px; padding: 9px 12px; margin-bottom: 12px; font-size: 13px;
 }
+.packtag { margin-left: 6px; font-size: 11px; padding: 1px 6px; border-radius: 6px; border: 1px solid var(--border); color: var(--muted, inherit); }
 .nochan { color: var(--warning); font-weight: 600; font-size: 12px; cursor: help; }
 .modal-wrap { position: fixed; inset: 0; background: rgba(0,0,0,0.45); display: grid; place-items: center; z-index: 40; }
 .modal { width: 640px; max-width: 94vw; max-height: 90vh; overflow: auto; display: flex; flex-direction: column; gap: 10px; }

@@ -22,6 +22,20 @@ const ruleBody = {
   },
 };
 
+// Rules materialised from a rule pack are edited through the pack; a direct
+// edit would be overwritten on the next sync, so refuse it with a pointer.
+async function packManaged(id, reply) {
+  const { rows } = await q(
+    `SELECT p.name FROM alert_rules r JOIN rule_pack_bindings b ON b.id = r.pack_binding_id
+     JOIN rule_packs p ON p.id = b.pack_id WHERE r.id = $1`, [id]);
+  if (!rows[0]) return false;
+  reply.code(409).send({
+    title: `This rule belongs to rule pack "${rows[0].name}" — edit it under Alert rules → Rule packs`,
+    status: 409,
+  });
+  return true;
+}
+
 export default async function alertRoutes(app) {
   // ---- Incidents ----
   app.get('/api/v1/alerts', { preHandler: requireRole('viewer') }, async (req) => {
@@ -84,7 +98,12 @@ export default async function alertRoutes(app) {
 
   // ---- Rules ----
   app.get('/api/v1/alert-rules', { preHandler: requireRole('viewer') }, async () => {
-    const { rows } = await q('SELECT * FROM alert_rules ORDER BY created_at');
+    const { rows } = await q(
+      `SELECT r.*, b.pack_id, p.name AS pack_name
+       FROM alert_rules r
+       LEFT JOIN rule_pack_bindings b ON b.id = r.pack_binding_id
+       LEFT JOIN rule_packs p ON p.id = b.pack_id
+       ORDER BY r.pack_binding_id NULLS FIRST, r.created_at`);
     return { rules: rows };
   });
 
@@ -102,6 +121,7 @@ export default async function alertRoutes(app) {
   });
 
   app.put('/api/v1/alert-rules/:id', { preHandler: requireRole('admin'), schema: { body: ruleBody } }, async (req, reply) => {
+    if (await packManaged(req.params.id, reply)) return reply;
     const b = req.body;
     const { rows } = await q(
       `UPDATE alert_rules SET name=$2, scope_type=$3, scope_ids=$4, metric=$5, comparator=$6, threshold=$7,
@@ -117,6 +137,7 @@ export default async function alertRoutes(app) {
   });
 
   app.delete('/api/v1/alert-rules/:id', { preHandler: requireRole('admin') }, async (req, reply) => {
+    if (await packManaged(req.params.id, reply)) return reply;
     const { rowCount } = await q('DELETE FROM alert_rules WHERE id = $1', [req.params.id]);
     if (!rowCount) return reply.code(404).send({ title: 'Not found', status: 404 });
     await audit(req, 'rule.delete', 'rule', req.params.id);

@@ -27,7 +27,11 @@ function renderText(p) {
     p.message || '',
     `server: ${p.server_id}${p.project ? `  ·  project: ${p.project} (${p.environment || '-'})` : ''}`,
   ];
-  if (p.metric) lines.push(`metric: ${p.metric} = ${p.value ?? '-'} (threshold ${p.comparator || ''} ${p.threshold ?? '-'})`);
+  if (p.metric) {
+    const v = p.value_display ?? p.value ?? '-';
+    const th = p.threshold_display ?? p.threshold ?? '-';
+    lines.push(`metric: ${p.metric} = ${v} (threshold ${p.comparator || ''} ${th})`);
+  }
   if (p.started_at) lines.push(`since: ${p.started_at}`);
   return lines.filter(Boolean).join('\n');
 }

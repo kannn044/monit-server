@@ -67,7 +67,7 @@ const SQL_DENY = /\b(insert|update|delete|drop|alter|create|truncate|grant|revok
 const SQL_TABLES = [
   'servers', 'projects', 'server_projects', 'incidents', 'alert_rules', 'rule_state',
   'expected_services', 'notification_log', 'notification_dead_letter', 'audit_log',
-  'system_metrics', 'metrics_1m', 'metrics_1h',
+  'system_metrics', 'metrics_1m', 'metrics_1h', 'metrics_io_1m', 'metrics_io_1h',
 ];
 
 /**
@@ -486,8 +486,8 @@ export const TOOLS = {
     schema: {
       name: 'run_sql',
       description: 'Run one read-only SELECT against the monitoring database when no other tool can answer the question. '
-        + `Tables: ${SQL_TABLES.join(', ')}. system_metrics has jsonb columns cpu, ram, load, disk, network, gpu, docker, pm2, http, databases. `
-        + 'metrics_1m/metrics_1h have bucket, server_id, cpu_total_pct, cpu_max_pct, ram_used_pct, ram_free_kb, ram_available_kb, load_1m/5m/15m, cores, uptime_s, disk_used_pct, disk_avail_kb, gpu_util_pct, gpu_mem_used_pct, net_rx_bytes, net_tx_bytes. '
+        + `Tables: ${SQL_TABLES.join(', ')}. system_metrics has jsonb columns cpu, ram, load, disk, network, gpu, docker, pm2, http, databases, diskio (cumulative per-disk counters: dev, read_bytes, write_bytes, reads, writes, io_ms). `
+        + 'metrics_1m/metrics_1h have bucket, server_id, cpu_total_pct, cpu_max_pct, ram_used_pct, ram_free_kb, ram_available_kb, load_1m/5m/15m, cores, uptime_s, disk_used_pct, disk_avail_kb, gpu_util_pct, gpu_mem_used_pct, net_rx_bytes, net_tx_bytes. metrics_io_1m/metrics_io_1h have bucket, server_id, disk_read_bytes, disk_write_bytes, disk_reads, disk_writes, net_errs, net_drops (all cumulative counters — difference consecutive buckets for a rate). '
         + 'Always constrain by time.',
       parameters: { type: 'object', properties: { sql: { type: 'string' } }, required: ['sql'] },
     },

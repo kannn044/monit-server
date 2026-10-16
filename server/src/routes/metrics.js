@@ -1,6 +1,6 @@
 import { q } from '../db/pool.js';
 import { requireRole } from '../lib/auth.js';
-import { extractMetric, METRIC_UNITS } from '../lib/metrics.js';
+import { extractMetric, METRIC_UNITS, RATE_METRICS } from '../lib/metrics.js';
 import { serversWithHealth } from './servers.js';
 
 // metric path → continuous-aggregate column
@@ -10,6 +10,15 @@ const CAGG_COL = {
   'disk.total_used_pct': 'disk_total_used_pct',
   'load.15m': 'load_15m', 'disk.used_pct': 'disk_used_pct', 'disk.avail_kb': 'disk_avail_kb',
   'gpu.util_pct': 'gpu_util_pct', 'gpu.mem_used_pct': 'gpu_mem_used_pct', 'uptime_s': 'uptime_s',
+};
+
+// rate metric → counter column in a rollup view (net_* in metrics_1m/1h,
+// the rest in metrics_io_1m/1h). disk.busy_pct has no rollup: raw range only.
+const RATE_CAGG = {
+  'net.rx_bps': ['metrics', 'net_rx_bytes'], 'net.tx_bps': ['metrics', 'net_tx_bytes'],
+  'net.errors_ps': ['metrics_io', 'net_errs'], 'net.drops_ps': ['metrics_io', 'net_drops'],
+  'disk.read_bps': ['metrics_io', 'disk_read_bytes'], 'disk.write_bps': ['metrics_io', 'disk_write_bytes'],
+  'disk.read_iops': ['metrics_io', 'disk_reads'], 'disk.write_iops': ['metrics_io', 'disk_writes'],
 };
 
 /**
@@ -62,28 +71,26 @@ export default async function metricsRoutes(app) {
     const id = req.params.id;
     let points = [];
 
-    const isNetRate = metric === 'net.rx_bps' || metric === 'net.tx_bps';
+    const isRate = RATE_METRICS.has(metric);
     if (bucket === 'raw') {
       const { rows } = await q(
-        `SELECT time, cpu, ram, load, uptime_s, disk, network, gpu, docker, pm2, http, databases
+        `SELECT time, cpu, ram, load, uptime_s, disk, network, gpu, docker, pm2, http, databases, diskio
          FROM system_metrics WHERE server_id = $1 AND time BETWEEN $2 AND $3
          ORDER BY time ASC LIMIT 5000`, [id, from.toISOString(), to.toISOString()]);
-      if (isNetRate) {
-        const field = metric === 'net.rx_bps' ? 'rx_bytes' : 'tx_bytes';
-        const counters = rows.map((r) => ({
-          t: r.time,
-          v: (Array.isArray(r.network) ? r.network : []).reduce((a, n) => a + (Number(n[field]) || 0), 0),
-        }));
-        points = counterToRate(counters);
+      if (isRate) {
+        // Same code path as the alert engine, so a chart and an alert never disagree.
+        points = rows.slice(1).map((r, i) => ({ t: r.time, v: extractMetric(metric, r, { prev: rows[i] }) }));
       } else {
         points = rows.map((r) => ({ t: r.time, v: extractMetric(metric, r) }));
       }
     } else {
       const view = bucket === '1m' ? 'metrics_1m' : 'metrics_1h';
-      if (isNetRate) {
-        const col = metric === 'net.rx_bps' ? 'net_rx_bytes' : 'net_tx_bytes';
+      if (isRate) {
+        const src = RATE_CAGG[metric];
+        if (!src) return reply.code(400).send({ title: `${metric} is only available for ranges up to 1 h (bucket=raw)`, status: 400 });
+        const rview = `${src[0]}_${bucket}`;
         const { rows } = await q(
-          `SELECT bucket AS t, ${col}::double precision AS v FROM ${view}
+          `SELECT bucket AS t, ${src[1]}::double precision AS v FROM ${rview}
            WHERE server_id = $1 AND bucket BETWEEN $2 AND $3 ORDER BY bucket ASC`, [id, from, to]);
         points = counterToRate(rows.map((r) => ({ t: r.t, v: Number(r.v) })), GAP_S[bucket]);
       } else {
@@ -102,7 +109,7 @@ export default async function metricsRoutes(app) {
 
   // Rich multi-series for the server-detail charts
   app.get('/api/v1/servers/:id/series', { preHandler: requireRole('viewer') }, async (req, reply) => {
-    // cpu | ram | disk | net | load | gpu (utilization) | gpuvram (VRAM)
+    // cpu | ram | disk | net | diskio | load | gpu (utilization) | gpuvram (VRAM)
     // Note: each kind returns series that share ONE unit — never mix % and bytes
     // on a single chart.
     const kind = req.query.kind || 'cpu';
@@ -115,7 +122,7 @@ export default async function metricsRoutes(app) {
     if (spanH <= 3) {
       // raw samples → per-core / per-mount / per-iface / per-gpu series
       const { rows } = await q(
-        `SELECT time, cpu, ram, load, disk, network, gpu FROM system_metrics
+        `SELECT time, cpu, ram, load, disk, network, gpu, diskio FROM system_metrics
          WHERE server_id = $1 AND time BETWEEN $2 AND $3 ORDER BY time ASC LIMIT 3000`,
         [id, from.toISOString(), to.toISOString()]);
       const series = {};
@@ -137,6 +144,11 @@ export default async function metricsRoutes(app) {
             push(`${n.iface} rx`, t, Number(n.rx_bytes) || 0);
             push(`${n.iface} tx`, t, Number(n.tx_bytes) || 0);
           }
+        } else if (kind === 'diskio') {
+          for (const d of r.diskio || []) {
+            push(`${d.dev} read`, t, Number(d.read_bytes) || 0);
+            push(`${d.dev} write`, t, Number(d.write_bytes) || 0);
+          }
         } else if (kind === 'gpu') {
           for (const g of r.gpu || []) push(`gpu${g.id}`, t, g.util_pct ?? null);
         } else if (kind === 'gpuvram') {
@@ -150,7 +162,7 @@ export default async function metricsRoutes(app) {
           push('cores', t, r.load?.cores ?? null);
         }
       }
-      if (kind === 'net') { // counters → rates
+      if (kind === 'net' || kind === 'diskio') { // counters → rates
         for (const name of Object.keys(series)) series[name] = counterToRate(series[name]);
       }
       return { server_id: id, kind, bucket: 'raw', series };
@@ -158,6 +170,20 @@ export default async function metricsRoutes(app) {
 
     // long ranges → aggregated single/dual series from caggs
     const view = spanH <= 48 ? 'metrics_1m' : 'metrics_1h';
+    if (kind === 'diskio') {
+      const ioView = spanH <= 48 ? 'metrics_io_1m' : 'metrics_io_1h';
+      const { rows: io } = await q(
+        `SELECT bucket AS t, disk_read_bytes, disk_write_bytes FROM ${ioView}
+         WHERE server_id = $1 AND bucket BETWEEN $2 AND $3 ORDER BY bucket ASC`, [id, from, to]);
+      const gap = GAP_S[spanH <= 48 ? '1m' : '1h'];
+      return {
+        server_id: id, kind, bucket: spanH <= 48 ? '1m' : '1h',
+        series: {
+          read: counterToRate(io.map((r) => ({ t: r.t, v: Number(r.disk_read_bytes) || 0 })), gap),
+          write: counterToRate(io.map((r) => ({ t: r.t, v: Number(r.disk_write_bytes) || 0 })), gap),
+        },
+      };
+    }
     const { rows } = await q(
       `SELECT bucket AS t, cpu_total_pct, ram_used_pct, disk_used_pct, disk_avail_kb,
               load_1m, load_5m, load_15m, cores, gpu_util_pct, gpu_mem_used_pct,

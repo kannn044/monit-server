@@ -23,12 +23,13 @@ const agentUrl = ref('');
 const error = ref('');
 let timer;
 
-const kinds = ['cpu', 'ram', 'disk', 'net', 'load', 'gpu', 'gpuvram'];
+const kinds = ['cpu', 'ram', 'disk', 'diskio', 'net', 'load', 'gpu', 'gpuvram'];
 // Each chart holds ONE unit — % and GB never share an axis.
 const kindMeta = {
   cpu: { title: 'CPU %', unit: 'percent', yMax: 100, ensemble: 'core ' },
   ram: { title: 'Memory (GB)', unit: '', yMax: null },
   disk: { title: 'Disk used % (per mount)', unit: 'percent', yMax: 100 },
+  diskio: { title: 'Disk read / write', unit: 'bytes/s', yMax: null },
   net: { title: 'Network I/O', unit: 'bytes/s', yMax: null },
   load: { title: 'Load average vs. core count', unit: '', yMax: null },
   gpu: { title: 'GPU utilization %', unit: 'percent', yMax: 100 },
@@ -82,7 +83,9 @@ const connDatabases = computed(() => Object.fromEntries(
   Object.entries(summary.value?.databases || {}).filter(([, d]) => d && d.reachable !== undefined)));
 
 const hasGpu = computed(() => Object.keys(charts.value.gpu || {}).length > 0 || (summary.value?.gpu || []).length > 0);
-const visibleKinds = computed(() => kinds.filter((k) => !k.startsWith('gpu') || hasGpu.value));
+// Disk I/O needs an agent new enough to report it; hide the empty chart otherwise.
+const hasDiskio = computed(() => Object.keys(charts.value.diskio || {}).length > 0 || !!summary.value?.diskio);
+const visibleKinds = computed(() => kinds.filter((k) => (!k.startsWith('gpu') || hasGpu.value) && (k !== 'diskio' || hasDiskio.value)));
 
 onMounted(() => {
   loadAgentUrl();
@@ -129,6 +132,14 @@ watch(id, () => { info.value = null; charts.value = {}; loadInfo(); loadCharts()
       <div class="stat"><div class="v">{{ fmt(summary.disk_used_pct, 'percent') }}</div><div class="l">Disk (worst mount)</div></div>
       <div class="stat"><div class="v">{{ summary.net ? fmt(summary.net.rx_bps, 'bytes/s') : '—' }}</div><div class="l">Net RX</div></div>
       <div class="stat"><div class="v">{{ summary.net ? fmt(summary.net.tx_bps, 'bytes/s') : '—' }}</div><div class="l">Net TX</div></div>
+      <template v-if="summary.diskio">
+        <div class="stat"><div class="v">{{ fmt(summary.diskio.read_bps, 'bytes/s') }}</div><div class="l">Disk read</div></div>
+        <div class="stat"><div class="v">{{ fmt(summary.diskio.write_bps, 'bytes/s') }}</div><div class="l">Disk write</div></div>
+        <div class="stat"><div class="v">{{ fmt(summary.diskio.busy_pct, 'percent') }}</div><div class="l">Disk busy</div></div>
+      </template>
+      <div v-if="summary.net && (summary.net.errors_ps || summary.net.drops_ps)" class="stat">
+        <div class="v">{{ fmt(summary.net.errors_ps) }} / {{ fmt(summary.net.drops_ps) }}</div><div class="l">Net err / drop per s</div>
+      </div>
       <div class="stat"><div class="v">{{ fmt(summary.load_1m) }}</div><div class="l">Load 1m</div></div>
       <div v-if="summary.gpu_util_pct !== null" class="stat"><div class="v">{{ fmt(summary.gpu_util_pct, 'percent') }}</div><div class="l">GPU util</div></div>
       <div v-if="summary.gpu_mem_used_pct !== null" class="stat"><div class="v">{{ fmt(summary.gpu_mem_used_pct, 'percent') }}</div><div class="l">VRAM used</div></div>

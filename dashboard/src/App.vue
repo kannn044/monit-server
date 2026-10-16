@@ -1,10 +1,14 @@
 <script setup>
-import { ref } from 'vue';
+import { ref, computed } from 'vue';
 import { useAuth } from './stores/auth.js';
 import { useRoute } from 'vue-router';
 import { api } from './api.js';
 const auth = useAuth();
 const route = useRoute();
+const pageTitle = computed(() => ({
+  '/': 'Fleet overview', '/incidents': 'Incidents', '/rules': 'Alert rules',
+  '/projects': 'Groups', '/chat': 'AI assistant', '/reports': 'Reports', '/settings': 'Settings',
+})[route.path] || (route.path.startsWith('/servers/') ? 'Server details' : 'Workspace'));
 
 // Every role can change its own password, so this lives in the sidebar rather
 // than on Settings, which only admins can open.
@@ -37,25 +41,33 @@ async function changePassword() {
 <template>
   <div v-if="route.path === '/login'"><router-view /></div>
   <div v-else class="layout">
-    <nav class="sidebar">
-      <div class="brand">mon<span>it</span></div>
-      <router-link class="navlink" to="/">Fleet</router-link>
-      <router-link class="navlink" to="/incidents">Incidents</router-link>
-      <router-link class="navlink" to="/rules">Alert rules</router-link>
-      <router-link class="navlink" to="/projects">Groups</router-link>
-      <router-link class="navlink" to="/chat">AI Chat</router-link>
-      <router-link class="navlink" to="/reports">Reports</router-link>
-      <router-link v-if="auth.isAdmin" class="navlink" to="/settings">Settings</router-link>
+    <aside class="sidebar">
+      <div class="brand"><span class="brand-mark">M</span><span class="brand-name">MONIT<span class="brand-accent">.OS</span></span></div>
+      <div class="nav-caption">MONITORING</div>
+      <nav class="nav-group">
+        <router-link class="navlink" to="/"><span class="nav-icon">◈</span><span>Fleet overview</span><span class="nav-arrow">›</span></router-link>
+        <router-link class="navlink" to="/incidents"><span class="nav-icon">◉</span><span>Incidents</span></router-link>
+        <router-link class="navlink" to="/rules"><span class="nav-icon">⌁</span><span>Alert rules</span></router-link>
+      </nav>
+      <div class="nav-caption">MANAGE</div>
+      <nav class="nav-group">
+        <router-link class="navlink" to="/projects"><span class="nav-icon">▦</span><span>Groups</span></router-link>
+        <router-link class="navlink" to="/reports"><span class="nav-icon">▤</span><span>Reports</span></router-link>
+        <router-link class="navlink" to="/chat"><span class="nav-icon">✳</span><span>AI assistant</span><span class="ai-tag">AI</span></router-link>
+        <router-link v-if="auth.isAdmin" class="navlink" to="/settings"><span class="nav-icon">⚙</span><span>Settings</span></router-link>
+      </nav>
+      <div class="sidebar-status"><span class="pulse-dot"></span><div><strong>System operational</strong><small>Data collection active</small></div></div>
       <div class="foot">
-        <div>{{ auth.user?.email }}</div>
-        <div class="muted">{{ auth.user?.role }}</div>
-        <div class="row" style="margin-top: 8px; gap: 6px">
-          <button class="sm" @click="openPw">Password</button>
-          <button class="sm" @click="auth.logout()">Sign out</button>
-        </div>
+        <div class="user-avatar">{{ (auth.user?.email || 'U').slice(0, 1).toUpperCase() }}</div>
+        <div class="user-info"><div class="user-email">{{ auth.user?.email }}</div><div class="muted">{{ auth.user?.role }}</div></div>
+        <button class="icon-button" title="Change password" @click="openPw">···</button>
+        <button class="sm signout" @click="auth.logout()">Sign out</button>
       </div>
-    </nav>
-    <main class="main"><router-view /></main>
+    </aside>
+    <main class="main">
+      <header class="topbar"><div class="crumb"><span>WORKSPACE</span><b>/</b>{{ pageTitle }}</div><div class="topbar-right"><span class="live-indicator"><i></i> Live monitoring</span><span class="topbar-divider"></span><span class="topbar-date">{{ new Date().toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' }) }}</span></div></header>
+      <div class="page-content"><router-view /></div>
+    </main>
 
     <div v-if="pwOpen" class="modal-wrap" @click.self="pwOpen = false">
       <form class="card modal" @submit.prevent="changePassword">

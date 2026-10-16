@@ -6,6 +6,7 @@ import Meter from '../components/Meter.vue';
 
 const data = ref(null);
 const error = ref('');
+const lastUpdated = ref(null);
 const groupFilter = ref('');
 const envFilter = ref('');
 const search = ref('');
@@ -40,6 +41,7 @@ const setGroupBy = (v) => { groupBy.value = v; save('groupby', v); };
 async function load() {
   try {
     data.value = await api('/api/v1/fleet/health');
+    lastUpdated.value = new Date();
     error.value = '';
   } catch (e) { error.value = e.message; }
 }
@@ -122,7 +124,7 @@ const sections = computed(() => {
 });
 
 const counts = computed(() => data.value?.counts || {});
-const attention = computed(() => (counts.value.critical || 0) + (counts.value.offline || 0));
+const attention = computed(() => (counts.value.critical || 0) + (counts.value.offline || 0) + (counts.value.warning || 0));
 const shown = computed(() => filtered.value.length);
 
 const KPIS = [
@@ -138,11 +140,11 @@ const pct = (v) => (v == null ? '—' : `${v.toFixed(0)}%`);
 </script>
 
 <template>
-  <div class="row" style="justify-content: space-between; align-items: baseline">
-    <h1 style="margin-bottom: 14px">Fleet</h1>
-    <span v-if="data" class="muted" style="font-size: 12px">
-      {{ attention ? `${attention} need attention` : 'all healthy' }} · updated {{ ago(new Date().toISOString()) }}
-    </span>
+  <div class="fleet-heading">
+    <div><div class="eyebrow"><span class="pulse-dot"></span> INFRASTRUCTURE MONITORING</div>
+      <h1>Fleet overview</h1><p>Live health and resource usage across your servers.</p>
+    </div>
+    <div v-if="data" class="sync-status"><span class="sync-dot"></span><div><strong>{{ attention ? `${attention} servers need attention` : 'All systems healthy' }}</strong><small>Auto refresh · {{ lastUpdated ? ago(lastUpdated.toISOString()) : 'syncing' }}</small></div></div>
   </div>
   <div v-if="error" class="error-banner">{{ error }}</div>
 
@@ -291,13 +293,21 @@ const pct = (v) => (v == null ? '—' : `${v.toFixed(0)}%`);
 </template>
 
 <style scoped>
+.fleet-heading { display: flex; justify-content: space-between; align-items: flex-end; gap: 18px; margin-bottom: 22px; }
+.fleet-heading h1 { margin: 5px 0 3px; font-size: 26px; }
+.fleet-heading p { margin: 0; color: var(--muted); font-size: 12px; }
+.eyebrow { display: flex; align-items: center; gap: 8px; color: #8293ad; font-size: 9px; letter-spacing: .14em; font-weight: 750; }
+.eyebrow .pulse-dot { width: 6px; height: 6px; }
+.sync-status { display: flex; gap: 10px; align-items: center; padding: 10px 13px; border: 1px solid var(--border); border-radius: 10px; background: rgba(16,29,46,.7); }
+.sync-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--good); box-shadow: 0 0 10px rgba(59,214,154,.6); }
+.sync-status strong, .sync-status small { display: block; }.sync-status strong { font-size: 11px; font-weight: 650; }.sync-status small { color: var(--muted); font-size: 10px; margin-top: 2px; }
 .stat .v.good { color: var(--good); }
 .stat .v.warning { color: var(--warning); }
 .stat .v.critical { color: var(--critical); }
 .stat .v.offline { color: var(--offline); }
 .stat.hot { border-color: color-mix(in oklab, var(--critical) 45%, transparent); }
 
-.toolbar { display: flex; gap: 8px; align-items: center; margin: 16px 0 12px; flex-wrap: wrap; }
+.toolbar { display: flex; gap: 8px; align-items: center; margin: 18px 0 14px; padding: 11px; flex-wrap: wrap; border: 1px solid var(--border); border-radius: 12px; background: rgba(14,22,37,.72); }
 .search { min-width: 160px; }
 .chk { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--ink-2); white-space: nowrap; }
 .chk input { width: auto; }
@@ -329,7 +339,7 @@ const pct = (v) => (v == null ? '—' : `${v.toFixed(0)}%`);
 .cardlink:hover { text-decoration: none; }
 
 .scard {
-  background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+  background: linear-gradient(145deg, #111d30, #0d1726); border: 1px solid var(--border); border-radius: 10px;
   padding: 9px 11px 10px; height: 100%;
   border-left: 3px solid var(--good);
   transition: border-color 0.15s ease, transform 0.15s ease, box-shadow 0.15s ease;
@@ -370,4 +380,5 @@ table.rows th { font-size: 11px; }
 
 .grid.two { grid-template-columns: 1.3fr 1fr; align-items: start; margin-top: 4px; }
 @media (max-width: 900px) { .grid.two { grid-template-columns: 1fr; } }
+@media (max-width: 680px) { .fleet-heading { align-items: flex-start; flex-direction: column; }.fleet-heading h1 { font-size: 23px; }.sync-status { width: 100%; }.toolbar .seg { max-width: 100%; overflow-x: auto; }.tally { gap: 5px; flex-wrap: wrap; }.ghead { flex-wrap: wrap; } }
 </style>

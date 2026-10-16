@@ -6,6 +6,10 @@
 #   ./update-agents.sh --plan          # show what would happen, touch nothing
 #   ./update-agents.sh                 # do it
 #   ./update-agents.sh --only a,b,c    # just these server IDs
+#   ./update-agents.sh --list --inventory deploy-agent-batch.tsv [--ssh-user root]
+#                                      # fill ssh logins from a server_id<TAB>ip file
+#   ./update-agents.sh --ask-pass ...  # password ssh (sshpass), one prompt for all hosts;
+#                                      # or export SSHPASS beforehand
 #
 # The list comes from the dashboard, so it cannot drift from what you are
 # monitoring. The ssh login cannot: the dashboard has never been told it, and
@@ -21,6 +25,7 @@ cd "$(dirname "$0")"
 LIST_FILE=${MONIT_AGENTS_FILE:-agents.txt}
 PARALLEL=${MONIT_PARALLEL:-4}
 ONLY=""; SKIP=""; PLAN=0; MAKE_LIST=0; FORCE=0; ASSUME_YES=0
+INVENTORY=""; SSH_USER=root; ASK_PASS=0
 
 info() { printf '\033[36m▸\033[0m %s\n' "$*"; }
 ok()   { printf '\033[32m✓\033[0m %s\n' "$*"; }
@@ -28,7 +33,7 @@ warn() { printf '\033[33m!\033[0m %s\n' "$*"; }
 bad()  { printf '\033[31m✗\033[0m %s\n' "$*"; }
 die()  { bad "$*"; exit 1; }
 
-usage() { sed -n '3,17p' "$0"; exit "${1:-0}"; }
+usage() { sed -n '3,21p' "$0"; exit "${1:-0}"; }
 
 while [ $# -gt 0 ]; do
   case $1 in
@@ -40,6 +45,9 @@ while [ $# -gt 0 ]; do
     --skip) SKIP=${2:-}; shift ;;
     -j) PARALLEL=${2:-4}; shift ;;
     -f) LIST_FILE=${2:-agents.txt}; shift ;;
+    --inventory) INVENTORY=${2:-}; shift ;;
+    --ssh-user) SSH_USER=${2:-root}; shift ;;
+    --ask-pass) ASK_PASS=1 ;;
     -h|--help) usage 0 ;;
     *) bad "unknown argument '$1'"; usage 2 ;;
   esac
@@ -47,6 +55,28 @@ while [ $# -gt 0 ]; do
 done
 
 command -v ssh >/dev/null 2>&1 || die "ssh is not installed on this host"
+
+# --- ssh: keys (default) or one shared password via sshpass -----------------
+# Keys: BatchMode=yes, so a host that wants a password fails fast instead of
+# hanging one of the parallel jobs on an invisible prompt.
+# Password: the fleet installed by deploy-agent-batch.sh uses one root password.
+# It is read once, kept only in this process's environment (SSHPASS, read by
+# `sshpass -e` and by deploy-agent.sh), and never written to a file or a log.
+if [ "$ASK_PASS" = 1 ] && [ -z "${SSHPASS:-}" ] && [ "$MAKE_LIST" = 0 ]; then
+  read -r -s -p "  ssh password (same for all hosts): " SSHPASS </dev/tty; echo
+  [ -n "$SSHPASS" ] || die "no password given"
+fi
+if [ -n "${SSHPASS:-}" ]; then
+  command -v sshpass >/dev/null 2>&1 || die "password ssh needs sshpass (yum install -y sshpass / apt install -y sshpass)"
+  export SSHPASS
+  export MONIT_SSH_ACCEPT_NEW=1   # deploy-agent.sh: accept a first-seen host key, refuse a changed one
+  RSSH() { sshpass -e ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \
+             -o PreferredAuthentications=password,keyboard-interactive,publickey -o NumberOfPasswordPrompts=1 "$@"; }
+  SSH_MODE="password (sshpass)"
+else
+  RSSH() { ssh -o ConnectTimeout=10 -o BatchMode=yes "$@"; }
+  SSH_MODE="keys only (BatchMode) — add --ask-pass for password login"
+fi
 command -v curl >/dev/null 2>&1 || die "curl is not installed on this host"
 
 # "missing" and "present but not executable" are different problems with
@@ -111,7 +141,9 @@ make_list() {
   # Keep any ssh logins already filled in, so refreshing the list is not
   # destructive — the whole point of the file is the part you typed.
   local tmp; tmp=$(mktemp)
-  MONIT_EXISTING=$LIST_FILE python3 - "$json" > "$tmp" <<'PY'
+  if [ -n "$INVENTORY" ] && [ ! -r "$INVENTORY" ]; then die "inventory $INVENTORY not readable"; fi
+  MONIT_EXISTING=$LIST_FILE MONIT_INVENTORY=$INVENTORY MONIT_SSH_USER=$SSH_USER \
+    python3 - "$json" > "$tmp" <<'PY'
 import json, os, sys, re
 rows = json.loads(sys.argv[1]).get('servers', [])
 known = {}
@@ -122,6 +154,16 @@ if path and os.path.exists(path):
         if not line: continue
         parts = line.split()
         if len(parts) >= 2: known[parts[0]] = parts[1]
+# server_id<TAB>ip inventory (deploy-agent-batch.tsv) — the dashboard has no
+# IP for hosts installed by that script, but the inventory does.
+inv = {}
+ipath = os.environ.get('MONIT_INVENTORY', '')
+user = os.environ.get('MONIT_SSH_USER', 'root')
+if ipath:
+    for line in open(ipath):
+        line = line.split('#', 1)[0].strip()
+        parts = line.split()
+        if len(parts) >= 2: inv[parts[0]] = f"{user}@{parts[1]}"
 print("# server_id            ssh_target            # health / last seen")
 print("#")
 print("# Fill in ssh_target as user@host, e.g. adminmop@10.1.0.222")
@@ -132,7 +174,7 @@ w = max([len(r['id']) for r in rows] + [20])
 for r in sorted(rows, key=lambda r: r['id']):
     if r.get('archived_at'): continue
     sid = r['id']
-    tgt = known.get(sid) or (f"root@{r['ip']}" if r.get('ip') else "")
+    tgt = known.get(sid) or inv.get(sid) or (f"{user}@{r['ip']}" if r.get('ip') else "")
     note = f"{r.get('health','?')}"
     if r.get('last_seen'): note += f", last seen {r['last_seen'][:19].replace('T',' ')}Z"
     if tgt:
@@ -154,7 +196,8 @@ PY
 [ -f "$LIST_FILE" ] || { warn "$LIST_FILE does not exist yet — building it"; make_list; exit 0; }
 
 # --- read the list -----------------------------------------------------------
-declare -a IDS TARGETS
+declare -a IDS=() TARGETS=()
+N_HOSTS=0
 in_csv() { case ",$1," in *",$2,"*) return 0 ;; *) return 1 ;; esac; }
 
 while read -r sid target _rest; do
@@ -164,13 +207,15 @@ while read -r sid target _rest; do
   case $target in '<user>@<host>') warn "$sid still says <user>@<host> — skipped"; continue ;; esac
   [ -n "$ONLY" ] && ! in_csv "$ONLY" "$sid" && continue
   [ -n "$SKIP" ] && in_csv "$SKIP" "$sid" && continue
-  IDS+=("$sid"); TARGETS+=("$target")
+  IDS+=("$sid"); TARGETS+=("$target"); N_HOSTS=$((N_HOSTS + 1))
 done < <(sed 's/#.*$//' "$LIST_FILE")
 
-[ "${#IDS[@]}" -gt 0 ] || die "nothing to do — no usable lines in $LIST_FILE"
+# A counter, not ${#IDS[@]}: bash < 4.4 (RHEL/CentOS 7) treats an empty array
+# as unbound under set -u, which used to print an error and carry on.
+[ "$N_HOSTS" -gt 0 ] || die "nothing to do — no usable lines in $LIST_FILE (fill in the ssh logins, or use --list --inventory)"
 
 LOCAL_SUM=$(sha256sum agent/monit-agent.sh | cut -d' ' -f1)
-info "${#IDS[@]} host(s); local agent ${LOCAL_SUM:0:12}…; $PARALLEL at a time"
+info "$N_HOSTS host(s); ssh: $SSH_MODE; local agent ${LOCAL_SUM:0:12}…; $PARALLEL at a time"
 echo
 
 RUNDIR=$(mktemp -d /tmp/monit-update.XXXXXX)
@@ -182,16 +227,16 @@ trap 'rm -rf "$RUNDIR"' EXIT
 do_host() {
   local sid=$1 target=$2 logf="$RUNDIR/$1.log" res="$RUNDIR/$1.res"
   local remote_sum
-  remote_sum=$(ssh -o ConnectTimeout=10 -o BatchMode=yes "$target" \
+  remote_sum=$(RSSH "$target" \
       'sha256sum /opt/monit/monit-agent.sh 2>/dev/null | cut -d" " -f1' 2>>"$logf" | tr -d '\r')
 
   if [ -z "$remote_sum" ]; then
     # Either ssh failed, or the agent is not installed there. Tell them apart —
     # one is a credentials problem, the other means this host was never onboarded.
-    if ssh -o ConnectTimeout=10 -o BatchMode=yes "$target" true 2>>"$logf"; then
+    if RSSH "$target" true 2>>"$logf"; then
       echo "MISSING no agent installed at /opt/monit — use deploy-agent.sh to install it" > "$res"
     else
-      echo "UNREACHABLE ssh to $target failed (see log; BatchMode means keys only)" > "$res"
+      echo "UNREACHABLE ssh to $target failed — ${SSH_MODE} (see log)" > "$res"
     fi
     return
   fi
@@ -212,7 +257,7 @@ do_host() {
     # cron mode is a legitimate install, so "no systemd unit" is not a failure —
     # look for the cron job before calling it broken.
     local active
-    active=$(ssh -o ConnectTimeout=10 -o BatchMode=yes "$target" '
+    active=$(RSSH "$target" '
         if command -v systemctl >/dev/null 2>&1 \
            && systemctl list-unit-files monit-agent.service >/dev/null 2>&1; then
           systemctl is-active monit-agent 2>/dev/null || echo inactive

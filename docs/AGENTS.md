@@ -150,7 +150,7 @@ IDs and IP addresses; do not put SSH or dashboard passwords in it.
 ```bash
 cd /opt/monit-server
 ./deploy-agent-batch.sh --dry-run
-./deploy-agent-batch.sh -U http://10.1.1.171:8080 -e admin@example.com
+./deploy-agent-batch.sh -U http://10.1.1.171:8080 -g hdc-mysql8 -E Prod -e admin@example.com
 ```
 
 The wrapper prompts once for the dashboard password and once for the shared
@@ -158,11 +158,14 @@ root SSH password, checks existing and archived IDs, skips them without
 rotating their keys, then deploys up to five hosts at a time. It accepts new
 SSH host keys on first contact (trust-on-first-use); a changed key still fails.
 Per-host output is kept in a mode-700 directory under `/tmp`.
+After deployment, the wrapper creates the group if needed and moves all active
+inventory servers into it. A server can belong to one group, so this replaces
+any previous group membership.
 If any hosts fail, retry only those entries with the printed log directory:
 
 ```bash
 ./deploy-agent-batch.sh -U http://10.1.1.171:8080 -e admin@example.com \
-  --retry-failed-from /tmp/monit-agent-batch.ABC123
+  -g hdc-mysql8 -E Prod --retry-failed-from /tmp/monit-agent-batch.ABC123
 ```
 
 This explicit retry can reissue a key for a server that failed in the prior

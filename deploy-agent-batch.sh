@@ -74,7 +74,7 @@ if [[ "$DRY_RUN" = 1 ]]; then exit 0; fi
 
 for cmd in ssh rsync curl python3; do command -v "$cmd" >/dev/null 2>&1 || die "$cmd is required on this server"; done
 command -v sshpass >/dev/null 2>&1 || die "sshpass is required for password-based SSH (install it once on this server)"
-[[ -x ./deploy-agent.sh ]] || die "./deploy-agent.sh is missing or not executable"
+[[ -f ./deploy-agent.sh && -r ./deploy-agent.sh ]] || die "./deploy-agent.sh is missing or not readable"
 
 # Match deploy-agent.sh's own local API port selection without sourcing .env.
 APP_PORT_RAW=""
@@ -169,9 +169,9 @@ else
       (
         rc=0
         if [[ "${PENDING_RETRY[$i]}" == 1 ]]; then
-          MONIT_SSH_ACCEPT_NEW=1 ./deploy-agent.sh "root@$ip" -i "$id" -a -e "$ADMIN_EMAIL" -U "$API_URL" -y >"$log" 2>&1 || rc=$?
+          MONIT_SSH_ACCEPT_NEW=1 bash ./deploy-agent.sh "root@$ip" -i "$id" -a -e "$ADMIN_EMAIL" -U "$API_URL" -y >"$log" 2>&1 || rc=$?
         else
-          MONIT_SSH_ACCEPT_NEW=1 ./deploy-agent.sh "root@$ip" -i "$id" -a -N -e "$ADMIN_EMAIL" -U "$API_URL" -y >"$log" 2>&1 || rc=$?
+          MONIT_SSH_ACCEPT_NEW=1 bash ./deploy-agent.sh "root@$ip" -i "$id" -a -N -e "$ADMIN_EMAIL" -U "$API_URL" -y >"$log" 2>&1 || rc=$?
         fi
         printf '%s\n' "$rc" > "$codefile"
       ) &

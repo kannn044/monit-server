@@ -141,6 +141,37 @@ to it and reports what came back — a dashboard page instead of the API is the
 usual mistake, and it is named as such. Every install command generated after
 that carries the right `-U`.
 
+### Batch deploy from an IP inventory
+
+For a batch of root-access hosts with password authentication, use the batch
+wrapper and its tab-separated inventory. The inventory contains only server
+IDs and IP addresses; do not put SSH or dashboard passwords in it.
+
+```bash
+cd /opt/monit-server
+./deploy-agent-batch.sh --dry-run
+./deploy-agent-batch.sh -U http://10.1.1.171:8080 -e admin@example.com
+```
+
+The wrapper prompts once for the dashboard password and once for the shared
+root SSH password, checks existing and archived IDs, skips them without
+rotating their keys, then deploys up to five hosts at a time. It accepts new
+SSH host keys on first contact (trust-on-first-use); a changed key still fails.
+Per-host output is kept in a mode-700 directory under `/tmp`.
+If any hosts fail, retry only those entries with the printed log directory:
+
+```bash
+./deploy-agent-batch.sh -U http://10.1.1.171:8080 -e admin@example.com \
+  --retry-failed-from /tmp/monit-agent-batch.ABC123
+```
+
+This explicit retry can reissue a key for a server that failed in the prior
+batch, then installs that key on the target.
+
+`sshpass` is required on the deployment host for password-based SSH. Add rows
+to `deploy-agent-batch.tsv` as `server_id<TAB>ip`; for example
+`hdc-mysql8-15<TAB>10.1.3.2`.
+
 **Values go in flags, never positionally.** `./deploy-agent.sh host api-server sk_…`
 is rejected rather than quietly ignoring the ID and key.
 

@@ -8,6 +8,7 @@
 #
 #   -i ID     server ID to register/use (default: the target's hostname)
 #   -k KEY    API key; omit to be prompted, or use -a to create one for you
+#   -N        with -a, refuse to rotate a key if the server ID already exists
 #   -a        register the server on the dashboard and take the key from it,
 #             so there is no key to copy by hand (needs a dashboard admin)
 #   -e EMAIL  admin email for -a; the password comes from $MONIT_ADMIN_PASSWORD
@@ -30,14 +31,15 @@ cd "$(dirname "$0")"
 TARGET=${1:-}; shift || true
 [ -n "$TARGET" ] || { sed -n '3,25p' "$0"; exit 2; }
 
-SERVER_ID=""; API_KEY=""; API_URL=""; MODE="loop"; UPDATE_ONLY=0; ASSUME_YES=0; AUTO_REG=0
+SERVER_ID=""; API_KEY=""; API_URL=""; MODE="loop"; UPDATE_ONLY=0; ASSUME_YES=0; AUTO_REG=0; NO_ROTATE=0
 ADMIN_EMAIL=""; ACTION=""
 
-while getopts "i:k:U:m:e:uaySEXh" opt; do
+while getopts "i:k:U:m:e:uaySEXhN" opt; do
   case $opt in
     i) SERVER_ID=$OPTARG ;; k) API_KEY=$OPTARG ;; U) API_URL=${OPTARG%/} ;;
     m) MODE=$OPTARG ;;     u) UPDATE_ONLY=1 ;;  a) AUTO_REG=1 ;;
     e) ADMIN_EMAIL=$OPTARG ;;
+    N) NO_ROTATE=1 ;;
     S) ACTION=stop ;;      E) ACTION=start ;;   X) ACTION=remove ;;
     y) ASSUME_YES=1 ;;
     h) sed -n '3,25p' "$0"; exit 0 ;;
@@ -82,15 +84,26 @@ command -v ssh   >/dev/null 2>&1 || die "ssh is not installed on this host"
 # means typing it five or six times.
 CTL_DIR=$(mktemp -d /tmp/monit-deploy.XXXXXX)
 CTL="$CTL_DIR/ctl"
+SSH_BIN=(ssh)
+if [ -n "${SSHPASS:-}" ]; then
+  command -v sshpass >/dev/null 2>&1 || die "SSHPASS is set but sshpass is not installed (install sshpass on this deployment host)"
+  SSH_BIN=(sshpass -e ssh)
+fi
+SSH_RSH="${SSH_BIN[*]}"
 cleanup() {
-  ssh -o ControlPath="$CTL" -O exit "$TARGET" 2>/dev/null || true
+  "${SSH_BIN[@]}" -o ControlPath="$CTL" -O exit "$TARGET" 2>/dev/null || true
   rm -rf "$CTL_DIR"
 }
 trap cleanup EXIT
 
 SSH_OPTS=(-o ControlMaster=auto -o ControlPath="$CTL" -o ControlPersist=300 -o ConnectTimeout=15)
-rsh()  { ssh "${SSH_OPTS[@]}" "$TARGET" "$@"; }        # no tty
-rsht() { ssh "${SSH_OPTS[@]}" -t "$TARGET" "$@"; }     # tty, so sudo can prompt
+if [ "${MONIT_SSH_ACCEPT_NEW:-0}" = 1 ]; then
+  # Batch first-contact uses OpenSSH's TOFU mode; changed keys still fail closed.
+  SSH_OPTS+=(-o StrictHostKeyChecking=accept-new)
+fi
+SSH_RSH+=" ${SSH_OPTS[*]}"
+rsh()  { "${SSH_BIN[@]}" "${SSH_OPTS[@]}" "$TARGET" "$@"; }        # no tty
+rsht() { "${SSH_BIN[@]}" "${SSH_OPTS[@]}" -t "$TARGET" "$@"; }     # tty, so sudo can prompt
 
 rsh true || die "cannot ssh to $TARGET — check the host, user and your key/password"
 ok "ssh to $TARGET works"
@@ -249,6 +262,7 @@ if [ "$AUTO_REG" = 1 ] && [ -z "$API_KEY" ]; then
          -d "{\"id\":\"$SERVER_ID\",\"name\":\"$SERVER_ID\"}")
   API_KEY=$(printf '%s' "$RESP" | sed -n 's/.*"api_key":"\([^"]*\)".*/\1/p')
   if [ -z "$API_KEY" ]; then
+    [ "$NO_ROTATE" = 0 ] || die "could not register '$SERVER_ID' (it may already exist); key rotation was disabled"
     warn "'$SERVER_ID' is already registered; rotating its key"
     API_KEY=$(curl -s -X POST "$LOCAL_URL/api/v1/servers/$SERVER_ID/keys/rotate" \
               -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' -d '{}' \
@@ -263,7 +277,7 @@ fi
 # lands somewhere always writable and is installed from there with sudo.
 info "copying agent → $TARGET:$STAGE/"
 rsh "mkdir -p '$STAGE'"
-rsync -az --delete -e "ssh ${SSH_OPTS[*]}" \
+rsync -az --delete -e "$SSH_RSH" \
   agent/monit-agent.sh agent/monit-agent.service agent/install.sh \
   agent/monit-config.sh agent/monit-pm2.sh agent/check-ndb.sh agent/agent.conf.example \
   "$TARGET:$STAGE/"
